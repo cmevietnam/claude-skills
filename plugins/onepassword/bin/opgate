@@ -7,8 +7,10 @@
 # the secret in a vault. So secrets only ever travel to
 #   * the environment of a child process   (run, exec)
 #   * the macOS clipboard                  (copy)
-#   * a git-ignored file                   (inject)
+#   * a git-ignored regular file           (inject)
 # There is deliberately no `opgate read`.
+#
+# What this does NOT do: stop a determined caller. See references/security-model.md.
 set -euo pipefail
 
 OPGATE_BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -23,33 +25,52 @@ usage() {
 opgate — Touch ID-gated access to 1Password secrets
 
   opgate run    [-f FILE] -- CMD...     chạy CMD với secrets nạp vào env (mask sẵn)
-  opgate exec   REF|VAR=REF -- CMD...   nạp đúng một secret cho một lệnh
+  opgate exec   VAR=op://… -- CMD...    nạp đúng một secret cho một lệnh
   opgate inject -i TPL -o OUT           render template ra file (bắt buộc gitignored)
-  opgate copy   REF [--seconds N]       secret -> clipboard, tự xoá sau N giây (mặc định 90)
-  opgate put    ITEM FIELD              ghi một secret VÀO 1Password (đọc từ stdin)
+  opgate copy   op://… [--seconds N]    secret -> clipboard, tự xoá sau N giây (mặc định 90)
+  opgate put    ITEM FIELD [--multiline] ghi một secret VÀO 1Password (đọc từ stdin)
 
   opgate list   [-f FILE]               liệt kê tên biến + ref (không bao giờ in giá trị)
   opgate doctor [--test-gate]           kiểm tra toàn bộ setup
   opgate audit  [-n N]                  xem nhật ký truy cập
-  opgate build                          build lại binary Touch ID gate
+  opgate build                          build lại binary Touch ID gate + ghi hash
 
 Không có `opgate read` — cố ý. Xem references/security-model.md.
+Mỗi lệnh chạm vào secret đều hỏi Touch ID; không có cache, không có cách tắt.
 
-Env: OPGATE_VAULT (Dev) · OPGATE_TTL (0 = hỏi mỗi lần) · OPGATE_GATE (touchid|sudo|none)
-     OPGATE_ENV_FILE (.env.op)
+Env: OPGATE_VAULT (Dev) · OPGATE_ENV_FILE (.env.op) · OPGATE_ALLOW_PASSWORD (1 để
+     cho phép dùng mật khẩu máy thay vân tay)
 USAGE
 }
 
-# A short, readable rendering of the command for the Touch ID sheet.
+# A short, readable rendering of the command for the Touch ID sheet. Arguments are
+# bracketed so a value containing spaces cannot masquerade as two arguments, and
+# newlines are flattened so nothing can be pushed out of view.
 cmd_summary() {
-  local s="$*"
-  (( ${#s} > 70 )) && s="${s:0:67}…"
-  printf '%s' "$s"
+  local out="" a
+  for a in "$@"; do
+    a=${a//$'\n'/ }; a=${a//$'\t'/ }
+    out+="[$a]"
+  done
+  (( ${#out} > 90 )) && out="${out:0:87}…"
+  printf '%s' "$out"
 }
 
 require_op() {
   command -v op >/dev/null 2>&1 \
     || die "1Password CLI chưa có. Cài: brew install --cask 1password-cli"
+}
+require_jq() {
+  command -v jq >/dev/null 2>&1 \
+    || die "opgate put cần jq. Cài: brew install jq"
+}
+
+# Where a path really lands, after resolving `..` and any symlinked parent.
+resolved_path() {
+  local p="$1" dir base
+  dir=$(dirname -- "$p"); base=$(basename -- "$p")
+  dir=$(cd -- "$dir" 2>/dev/null && pwd -P) || die "thư mục không tồn tại: $(dirname -- "$p")"
+  printf '%s/%s' "$dir" "$base"
 }
 
 # --- subcommands ------------------------------------------------------------
@@ -58,7 +79,7 @@ cmd_list() {
   local file=""
   while (( $# )); do
     case "$1" in
-      -f|--env-file) file="${2:?-f cần đường dẫn}"; shift 2 ;;
+      -f|--env-file) [[ $# -ge 2 ]] || die "-f cần một đường dẫn"; file="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) die "opgate list: tham số lạ '$1'" ;;
     esac
@@ -68,8 +89,8 @@ cmd_list() {
   printf '%s\n' "$file"
   local n=0 name value
   # Only op:// references are safe to print. A literal value is, by definition, the
-  # thing we are trying to keep out of the transcript — show that it exists, not what
-  # it is.
+  # thing we are trying to keep out of the transcript — show that it exists, not
+  # what it is.
   while IFS=$'\t' read -r name value; do
     [[ -n "$name" ]] || continue
     if [[ "$value" == op://* ]]; then
@@ -78,8 +99,7 @@ cmd_list() {
       printf '  %s = <giá trị literal, không in>\n' "$name"
     fi
     n=$((n + 1))
-  done < <(sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' -- "$file" \
-            | sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)=[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\2\t\3/p')
+  done < <(env_file_pairs "$file")
 
   local literals; literals=$(env_file_literals "$file" || true)
   if [[ -n "$literals" ]]; then
@@ -109,8 +129,15 @@ cmd_run() {
   while IFS= read -r v; do [[ -n "$v" ]] && vars+=("$v"); done < <(env_file_vars "$file")
   (( ${#vars[@]} )) || die "$file không khai báo biến nào"
 
-  gate_require "run" "$(IFS=,; printf '%s' "${vars[*]}")" \
-    "$(project_name) → chạy \"$(cmd_summary "${CMD[@]}")\" với $(summarize_list "${vars[@]}")"
+  # A literal in this file is not a vault secret, so `op run` will not mask it if
+  # the child prints it. You should know that before approving.
+  local literals; literals=$(env_file_literals "$file" || true)
+  [[ -n "$literals" ]] && warn "$(basename -- "$file") có giá trị literal ($(printf '%s ' $literals)) — op run KHÔNG che được chúng"
+
+  # The env file is named in the prompt: two projects, or a staging file, otherwise
+  # look identical at the moment you are deciding.
+  gate_require "run" "$(basename -- "$file"): $(IFS=,; printf '%s' "${vars[*]}")" \
+    "$(project_name)/$(basename -- "$file") → chạy $(cmd_summary "${CMD[@]}") với $(summarize_list "${vars[@]}")"
 
   # 1Password masks these values in the child's stdout/stderr by default. Never
   # pass --no-masking here.
@@ -136,14 +163,15 @@ cmd_exec() {
     name="${spec%%=*}"; ref="${spec#*=}"
   elif [[ "$spec" == op://* ]]; then
     ref="$spec"; name="${ref##*/}"
-    [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
-      || die "không suy ra được tên biến từ '$ref' — dùng dạng VAR=op://..."
   else
     die "opgate exec: '$spec' không phải secret reference (mong đợi op://... hoặc VAR=op://...)"
   fi
+  require_safe_var_name "$name"
 
-  gate_require "exec" "$name" \
-    "$(project_name) → chạy \"$(cmd_summary "${CMD[@]}")\" với $name"
+  # The full reference goes on the sheet, not just the variable name:
+  # DATABASE_URL=op://Prod/admin/root and a dev reference look identical otherwise.
+  gate_require "exec" "$name=$ref" \
+    "$(project_name) → chạy $(cmd_summary "${CMD[@]}") với $name = $ref"
 
   export "$name=$ref"
   exec op run -- "${CMD[@]}"
@@ -154,8 +182,8 @@ cmd_inject() {
   local tpl="" out="" force=0
   while (( $# )); do
     case "$1" in
-      -i|--in-file)  tpl="${2:?-i cần đường dẫn}"; shift 2 ;;
-      -o|--out-file) out="${2:?-o cần đường dẫn}"; shift 2 ;;
+      -i|--in-file)  [[ $# -ge 2 ]] || die "-i cần một đường dẫn"; tpl="$2"; shift 2 ;;
+      -o|--out-file) [[ $# -ge 2 ]] || die "-o cần một đường dẫn"; out="$2"; shift 2 ;;
       --force) force=1; shift ;;
       -h|--help) usage; exit 0 ;;
       *) die "opgate inject: tham số lạ '$1'" ;;
@@ -163,6 +191,22 @@ cmd_inject() {
   done
   [[ -n "$tpl" && -n "$out" ]] || die "opgate inject cần cả -i TEMPLATE và -o OUTPUT"
   [[ -f "$tpl" ]] || die "không có template: $tpl"
+
+  # Where the write really lands, not what the argument looks like. `--force` does
+  # NOT relax these: a device node, FIFO or symlink target is how a "file" write
+  # becomes a write to the transcript or to somewhere you did not name.
+  local real; real=$(resolved_path "$out")
+  case "$real" in
+    /dev/*|/proc/*)
+      die "từ chối ghi vào $real — đó không phải file, secret sẽ đi thẳng ra stdout/stderr hoặc thiết bị.
+       Cần secret cho một lệnh thì dùng: opgate run -- <cmd>" ;;
+  esac
+  if [[ -L "$out" ]]; then
+    die "$out là symlink — từ chối, đích thật có thể nằm ngoài chỗ bạn nghĩ (trỏ tới $(readlink -- "$out"))"
+  fi
+  if [[ -e "$real" && ! -f "$real" ]]; then
+    die "$real tồn tại nhưng không phải file thường (FIFO, socket, thiết bị?) — từ chối ghi"
+  fi
 
   # Rendering secrets to disk is the one operation here that leaves plaintext
   # behind, so refuse unless git is already set up to ignore the result.
@@ -177,13 +221,19 @@ cmd_inject() {
 
   local -a vars=(); local v
   while IFS= read -r v; do [[ -n "$v" ]] && vars+=("$v"); done < <(env_file_vars "$tpl")
+  # A JSON/YAML template holds op:// references that are not VAR= lines, so fall
+  # back to counting references rather than claiming "(none)" on the prompt.
+  local refcount; refcount=$(grep -o 'op://[^"'"'"' 	]*' -- "$tpl" 2>/dev/null | wc -l | tr -d ' ')
+  local scope
+  if (( ${#vars[@]} )); then scope=$(summarize_list "${vars[@]}")
+  else scope="$refcount tham chiếu op://"; fi
 
-  gate_require "inject" "$(IFS=,; printf '%s' "${vars[*]}")" \
-    "$(project_name) → ghi secret ra file $(basename -- "$out"): $(summarize_list "${vars[@]}")"
+  gate_require "inject" "$(basename -- "$tpl") -> $real" \
+    "$(project_name) → ghi secret ra file $(basename -- "$real"): $scope"
 
-  ( umask 077; op inject -i "$tpl" -o "$out" -f )
-  chmod 600 "$out" 2>/dev/null || true
-  info "đã ghi $out (chmod 600) — xoá khi dùng xong"
+  ( umask 077; op inject -i "$tpl" -o "$real" -f )
+  chmod 600 "$real" 2>/dev/null || true
+  info "đã ghi $real (chmod 600) — xoá khi dùng xong"
 }
 
 cmd_copy() {
@@ -192,7 +242,8 @@ cmd_copy() {
   local ref="" seconds=90
   while (( $# )); do
     case "$1" in
-      --seconds) seconds="${2:?--seconds cần số}"; shift 2 ;;
+      --seconds) [[ $# -ge 2 ]] || die "--seconds cần một số"
+                 require_int "$2" "--seconds"; seconds="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       op://*) ref="$1"; shift ;;
       *) die "opgate copy: tham số lạ '$1'" ;;
@@ -201,63 +252,93 @@ cmd_copy() {
   [[ -n "$ref" ]] || die "opgate copy cần một secret reference op://..."
 
   gate_require "copy" "$ref" \
-    "$(project_name) → chép ${ref##*/} vào clipboard trong ${seconds}s"
+    "$(project_name) → chép $ref vào clipboard trong ${seconds}s"
 
   op read --no-newline "$ref" | pbcopy
+
+  # Hash what we just placed, once. An earlier version re-read the vault after the
+  # delay to compare — a second, ungated secret access, which is exactly what this
+  # tool exists to prevent, and which also failed to clear the clipboard whenever
+  # the session had expired by then.
+  local placed; placed=$(pbpaste 2>/dev/null | /usr/bin/shasum -a 256 | cut -d' ' -f1)
   info "đã chép ${ref##*/} vào clipboard; sẽ tự xoá sau ${seconds}s"
+  warn "clipboard manager hoặc Universal Clipboard có thể vẫn giữ bản sao"
 
   # Clear only if the clipboard still holds what we put there, so we never wipe
-  # something the user copied in the meantime.
+  # something you copied in the meantime.
   ( sleep "$seconds"
-    if [[ "$(pbpaste 2>/dev/null | /usr/bin/shasum -a 256)" == "$(op read --no-newline "$ref" 2>/dev/null | /usr/bin/shasum -a 256)" ]]; then
+    if [[ "$(pbpaste 2>/dev/null | /usr/bin/shasum -a 256 | cut -d' ' -f1)" == "$placed" ]]; then
       printf '' | pbcopy
     fi ) >/dev/null 2>&1 &
   disown 2>/dev/null || true
 }
 
 cmd_put() {
-  require_op
-  local item="${1:-}" field="${2:-}"
-  [[ -n "$item" && -n "$field" ]] || die "cú pháp: opgate put <ITEM> <FIELD>  (giá trị đọc từ stdin)"
+  require_op; require_jq
+  local item="" field="" multiline=0
+  while (( $# )); do
+    case "$1" in
+      --multiline) multiline=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) if   [[ -z "$item"  ]]; then item="$1";  shift
+         elif [[ -z "$field" ]]; then field="$1"; shift
+         else die "opgate put: tham số lạ '$1'"; fi ;;
+    esac
+  done
+  [[ -n "$item" && -n "$field" ]] || die "cú pháp: opgate put <ITEM> <FIELD> [--multiline]  (giá trị đọc từ stdin)"
 
   local value
-  if [[ -t 0 ]]; then
-    printf 'Giá trị cho %s/%s (ẩn): ' "$item" "$field" >&2
-    IFS= read -rs value; printf '\n' >&2
+  if [[ ! -t 0 ]]; then
+    # Piped input is taken whole: a PEM key or JSON blob must not be truncated at
+    # the first newline. Only one trailing newline is stripped.
+    value=$(cat; printf x); value="${value%x}"; value="${value%$'\n'}"
+  elif (( multiline )); then
+    printf 'Dán giá trị cho %s/%s rồi Ctrl-D:\n' "$item" "$field" >&2
+    value=$(cat; printf x); value="${value%x}"; value="${value%$'\n'}"
   else
-    IFS= read -r value || true
+    printf 'Giá trị cho %s/%s (ẩn, một dòng; dùng --multiline cho nhiều dòng): ' "$item" "$field" >&2
+    IFS= read -rs value; printf '\n' >&2
   fi
   [[ -n "$value" ]] || die "giá trị rỗng, không ghi gì"
 
   gate_require "put" "$item/$field" \
     "$(project_name) → lưu $field vào item \"$item\" trong vault $OPGATE_VAULT"
 
-  # The value goes in over stdin or through a 0600 file in a private directory —
-  # never as a command argument, which `op` itself warns is visible to other
-  # processes and shell history.
-  local tmp; tmp=$(mktemp -d "${TMPDIR:-/tmp}/opgate-put.XXXXXX")
-  chmod 700 "$tmp"
-  trap 'rm -rf -- "$tmp"' RETURN
+  # Does the item exist? stdout is discarded so the existing secrets never land in
+  # a shell variable; only op's error text is captured. A failure that is not
+  # "no such item" must not be mistaken for one, or we would create a duplicate
+  # item on a transient network or authorization error.
+  local probe_err="" exists=1
+  probe_err=$(op item get "$item" --vault "$OPGATE_VAULT" --format json </dev/null 2>&1 >/dev/null) || exists=0
+  if (( ! exists )); then
+    case "$probe_err" in
+      *"isn't an item"*|*"could not find"*|*"no item matching"*|*"not found"*) ;;
+      *) die "không truy vấn được item \"$item\": $probe_err" ;;
+    esac
+  fi
 
-  # `op` reads a piped stdin as a template, and ours is still the pipe the value
-  # arrived on — so every `op` call below gets stdin detached explicitly.
-  if op item get "$item" --vault "$OPGATE_VAULT" --format json >"$tmp/item.json" 2>/dev/null </dev/null; then
-    jq --arg f "$field" --arg v "$value" '
-      .fields = ((.fields // []) | map(select(.label != $f)))
-              + [{ id: $f, type: "CONCEALED", label: $f, value: $v }]
-    ' "$tmp/item.json" >"$tmp/new.json"
-    op item edit "$item" --vault "$OPGATE_VAULT" --template "$tmp/new.json" </dev/null >/dev/null
+  # The value reaches jq through a file descriptor, never through argv — `op` warns
+  # in its own help that command arguments are visible to other processes, and the
+  # same is true of jq. Nothing is written to disk at any point: the item JSON is
+  # piped straight from `op item get` into `op item edit`.
+  if (( exists )); then
+    op item edit "$item" --vault "$OPGATE_VAULT" --template <(
+      op item get "$item" --vault "$OPGATE_VAULT" --format json </dev/null \
+        | jq --rawfile v <(printf '%s' "$value") --arg f "$field" '
+            .fields = ((.fields // []) | map(select(.label != $f)))
+                    + [{ id: $f, type: "CONCEALED", label: $f, value: $v }]'
+    ) </dev/null >/dev/null
     info "đã cập nhật $field trên item \"$item\""
   else
     # Fields must be top level (no section) so the reference stays
     # op://<vault>/<item>/<VAR>. notesPlain is part of the stock Secure Note
     # template; omitting it makes `op` reject the template.
-    jq -n --arg t "$item" --arg f "$field" --arg v "$value" '
-      { title: $t, category: "SECURE_NOTE",
-        fields: [ { id: "notesPlain", type: "STRING", purpose: "NOTES", label: "notesPlain", value: "" },
-                  { id: $f, type: "CONCEALED", label: $f, value: $v } ] }
-    ' >"$tmp/new.json"
-    op item create --vault "$OPGATE_VAULT" --template "$tmp/new.json" </dev/null >/dev/null
+    op item create --vault "$OPGATE_VAULT" --template <(
+      jq -n --rawfile v <(printf '%s' "$value") --arg t "$item" --arg f "$field" '
+        { title: $t, category: "SECURE_NOTE",
+          fields: [ { id: "notesPlain", type: "STRING", purpose: "NOTES", label: "notesPlain", value: "" },
+                    { id: $f, type: "CONCEALED", label: $f, value: $v } ] }'
+    ) </dev/null >/dev/null
     info "đã tạo item \"$item\" với field $field"
   fi
   info "reference: op://$OPGATE_VAULT/$item/$field"
@@ -267,7 +348,7 @@ cmd_audit() {
   local n=20
   while (( $# )); do
     case "$1" in
-      -n) n="${2:?-n cần số}"; shift 2 ;;
+      -n) [[ $# -ge 2 ]] || die "-n cần một số"; require_int "$2" "-n"; n="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) die "opgate audit: tham số lạ '$1'" ;;
     esac
@@ -295,10 +376,16 @@ cmd_doctor() {
     bad "chưa có 1Password CLI → brew install --cask 1password-cli"; fail=1
   fi
 
+  if command -v jq >/dev/null 2>&1; then
+    ok "jq $(jq --version 2>/dev/null)"
+  else
+    bad "chưa có jq (opgate put cần nó) → brew install jq"; fail=1
+  fi
+
   if command -v op >/dev/null 2>&1; then
-    if op vault list --format json >/dev/null 2>&1; then
+    if op vault list --format json </dev/null >/dev/null 2>&1; then
       ok "op ủy quyền được (desktop app integration)"
-      if op vault get "$OPGATE_VAULT" --format json >/dev/null 2>&1; then
+      if op vault get "$OPGATE_VAULT" --format json </dev/null >/dev/null 2>&1; then
         ok "vault \"$OPGATE_VAULT\" tồn tại"
       else
         bad "chưa có vault \"$OPGATE_VAULT\" → op vault create $OPGATE_VAULT"; fail=1
@@ -308,21 +395,19 @@ cmd_doctor() {
     fi
   fi
 
-  if [[ "$OPGATE_GATE" == "none" ]]; then
-    bad "OPGATE_GATE=none — approval đang TẮT, mọi truy cập secret không được bảo vệ"; fail=1
-  elif [[ "$OPGATE_GATE" == "sudo" ]]; then
-    ok "gate = sudo (fallback pam_tid)"
-  elif [[ -x "$OPGATE_GATE_BIN" ]]; then
-    ok "gate binary: $OPGATE_GATE_BIN"
+  if [[ -x "$OPGATE_GATE_BIN" ]]; then
+    local vrc=0; _verify_gate_binary >/dev/null 2>&1 || vrc=$?
+    if (( vrc == 2 )); then
+      bad "gate binary khác hash đã ghi lúc build → xác nhận rồi chạy: opgate build"; fail=1
+    else
+      ok "gate binary: $OPGATE_GATE_BIN"
+    fi
   else
     bad "chưa build gate binary → opgate build"; fail=1
   fi
 
-  if (( OPGATE_TTL > 0 )); then
-    warn "OPGATE_TTL=$OPGATE_TTL — approval được tái dùng trong ${OPGATE_TTL}s; đặt 0 để hỏi mỗi lần"
-  else
-    ok "OPGATE_TTL=0 — hỏi mỗi lần truy cập"
-  fi
+  [[ "${OPGATE_ALLOW_PASSWORD:-}" =~ ^(1|true|yes)$ ]] \
+    && warn "OPGATE_ALLOW_PASSWORD bật — mật khẩu máy được chấp nhận thay vân tay"
 
   local file=""
   if file=$(resolve_env_file "" 2>/dev/null); then

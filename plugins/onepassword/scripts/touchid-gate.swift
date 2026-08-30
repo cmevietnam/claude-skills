@@ -70,20 +70,32 @@ context.evaluatePolicy(policy, localizedReason: localizedReason) { success, erro
     failure = error
     semaphore.signal()
 }
-semaphore.wait()
+
+// A lost callback would otherwise hang the calling shell forever. Ten minutes is
+// far longer than any real person needs and still bounded.
+if semaphore.wait(timeout: .now() + 600) == .timedOut {
+    FileHandle.standardError.write(Data("touchid-gate: timed out waiting for a decision\n".utf8))
+    exit(2)
+}
 
 if approved { exit(0) }
 
-if let error = failure as NSError? {
-    // These two mean "the human said no", everything else means the prompt never got
-    // a fair chance to run — worth distinguishing so `opgate doctor` can advise.
+if let error = failure as NSError?, error.domain == LAErrorDomain {
+    // Only these mean the human declined. systemCancel (another app came forward)
+    // and appCancel (the context was invalidated) are the prompt never getting a
+    // fair chance, so they must read as "unavailable" — otherwise a passing app
+    // switch is recorded in the audit log as your refusal.
     let denied = error.code == LAError.userCancel.rawValue
               || error.code == LAError.userFallback.rawValue
               || error.code == LAError.authenticationFailed.rawValue
-              || error.code == LAError.appCancel.rawValue
-              || error.code == LAError.systemCancel.rawValue
     FileHandle.standardError.write(Data("touchid-gate: \(error.localizedDescription)\n".utf8))
     exit(denied ? 1 : 2)
+}
+
+if let error = failure {
+    // Not an LAError at all — we cannot claim this was a refusal.
+    FileHandle.standardError.write(Data("touchid-gate: unexpected error — \(error.localizedDescription)\n".utf8))
+    exit(2)
 }
 
 exit(1)

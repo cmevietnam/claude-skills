@@ -3,19 +3,23 @@
 # Sourced by bin/opgate, scripts/build-gate.sh and scripts/lib/gate.sh.
 
 # --- paths ------------------------------------------------------------------
-OPGATE_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/opgate"
-OPGATE_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}/opgate"
-OPGATE_GATE_BIN="$OPGATE_DATA_HOME/bin/touchid-gate"
+# Deliberately NOT honouring XDG_DATA_HOME: the gate binary's location must not be
+# redirectable through the environment, or anything that can set a variable can
+# point us at a fake gate that exits 0.
+OPGATE_HOME="$HOME/.local/share/opgate"
+OPGATE_STATE_HOME="$HOME/.local/state/opgate"
+OPGATE_GATE_BIN="$OPGATE_HOME/bin/touchid-gate"
+OPGATE_GATE_SUM="$OPGATE_HOME/bin/touchid-gate.sha256"
 OPGATE_AUDIT_LOG="$OPGATE_STATE_HOME/access.log"
 
 # --- configuration knobs ----------------------------------------------------
 # OPGATE_VAULT   : 1Password vault holding project secrets      (default: Dev)
-# OPGATE_TTL     : seconds an approval is reused; 0 = ask every time (default: 0)
-# OPGATE_GATE    : touchid | sudo | none                        (default: touchid)
 # OPGATE_ENV_FILE: default secret-reference file                (default: .env.op)
+#
+# There is no knob to weaken or skip the gate. An earlier version had
+# OPGATE_GATE=none and a sudo fallback; both were removable by anything that could
+# set an environment variable, which is exactly the thing being guarded against.
 OPGATE_VAULT="${OPGATE_VAULT:-Dev}"
-OPGATE_TTL="${OPGATE_TTL:-0}"
-OPGATE_GATE="${OPGATE_GATE:-touchid}"
 OPGATE_ENV_FILE_DEFAULT="${OPGATE_ENV_FILE:-.env.op}"
 
 # --- output -----------------------------------------------------------------
@@ -34,6 +38,30 @@ ok()   { printf '  %s✔%s %s\n' "$_c_green" "$_c_reset" "$*" >&2; }
 bad()  { printf '  %s✘%s %s\n' "$_c_red" "$_c_reset" "$*" >&2; }
 die()  { printf '%sopgate:%s %s\n' "$_c_red" "$_c_reset" "$*" >&2; exit 1; }
 
+# --- validation -------------------------------------------------------------
+
+require_int() { # <value> <what>
+  [[ "$1" =~ ^[0-9]+$ ]] || die "$2 phải là số nguyên, nhận được '$1'"
+}
+
+# Environment variables that change how this script or its children resolve
+# programs and libraries. Binding a secret to one of these turns `opgate exec`
+# into an arbitrary-code-execution primitive.
+OPGATE_UNSAFE_VARS='^(PATH|IFS|BASH_ENV|ENV|SHELL|LD_[A-Z_]*|DYLD_[A-Z_]*|OPGATE_[A-Z_]*)$'
+
+require_safe_var_name() { # <name>
+  [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+    || die "'$1' không phải tên biến môi trường hợp lệ"
+  [[ "$1" =~ $OPGATE_UNSAFE_VARS ]] \
+    && die "từ chối gán secret cho \$$1 — biến này đổi cách phân giải chương trình/thư viện"
+  return 0
+}
+
+# Audit fields are tab-separated; a tab or newline inside one would forge a record.
+sanitize_field() {
+  printf '%s' "$1" | tr '\t\n\r' '   ' | cut -c1-200
+}
+
 # --- helpers ----------------------------------------------------------------
 
 # Name used in the Touch ID prompt and the audit log, so you can tell at a glance
@@ -44,7 +72,8 @@ project_name() {
   basename -- "$root"
 }
 
-# Best effort: who is driving this shell. Used for the audit log only.
+# Best effort: who is driving this shell. Audit log only — an agent can set
+# OPGATE_CALLER, so never treat this as an authenticated identity.
 detect_caller() {
   if [[ -n "${OPGATE_CALLER:-}" ]]; then printf '%s' "$OPGATE_CALLER"; return; fi
   if [[ -n "${CLAUDE_PLUGIN_ROOT:-}${CLAUDECODE:-}" ]]; then printf 'claude'; return; fi
@@ -62,7 +91,7 @@ resolve_env_file() {
     if   [[ -f "$PWD/$OPGATE_ENV_FILE_DEFAULT" ]]; then candidate="$PWD/$OPGATE_ENV_FILE_DEFAULT"
     elif [[ -f "$root/$OPGATE_ENV_FILE_DEFAULT" ]]; then candidate="$root/$OPGATE_ENV_FILE_DEFAULT"
     else
-      die "no $OPGATE_ENV_FILE_DEFAULT found in $PWD or $root — pass -f <file>, or create one (see: opgate help setup)"
+      die "no $OPGATE_ENV_FILE_DEFAULT found in $PWD or $root — pass -f <file>, or create one (see references/project-setup.md)"
     fi
   fi
   [[ -f "$candidate" ]] || die "no such file: $candidate"
@@ -71,11 +100,23 @@ resolve_env_file() {
 
 # Variable names declared in a secret-reference file. Names only — a caller that
 # wants values must go through the gate.
+#
+# `op run` tolerates whitespace around `=`; an earlier version of this pattern did
+# not, so `ADMIN_TOKEN = op://...` was resolved by op but omitted from the approval
+# prompt. Under-reporting scope on the prompt is worse than failing outright, so
+# this accepts the same shapes op does.
 env_file_vars() {
   local file="$1"
-  # Skip blanks and comments; take the LHS of the first '='.
   sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' -- "$file" \
-    | sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)=.*/\2/p'
+    | sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*=.*/\2/p'
+}
+
+# `VAR<TAB>value` for each entry, so callers can distinguish op:// references from
+# literals without re-implementing the parser.
+env_file_pairs() {
+  local file="$1"
+  sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' -- "$file" \
+    | sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*=[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\2	\3/p'
 }
 
 # Entries that hold a literal value AND whose name looks like a secret. A plain
@@ -85,9 +126,7 @@ OPGATE_SECRETY_NAME='(SECRET|TOKEN|_KEY|^KEY|APIKEY|API_KEY|PASSWORD|PASSWD|PWD|
 
 env_file_literals() {
   local file="$1"
-  sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' -- "$file" \
-    | sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)=\(.*\)/\2 \3/p' \
-    | awk '$2 !~ /^"?op:\/\// { print $1 }' \
+  env_file_pairs "$file" | awk -F'\t' '$2 !~ /^op:\/\// { print $1 }' \
     | grep -E "$OPGATE_SECRETY_NAME" || true
 }
 

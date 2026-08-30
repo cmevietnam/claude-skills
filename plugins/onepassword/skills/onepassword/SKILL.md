@@ -38,7 +38,7 @@ process con, clipboard, hoặc một file đã được git ignore.
 | `opgate exec VAR=op://… -- <cmd>` | Chỉ cần đúng một secret. |
 | `opgate copy op://…` | Người dùng cần tự dán secret vào đâu đó. Vào clipboard, tự xoá sau 90s. |
 | `opgate inject -i tpl -o out` | Công cụ bắt buộc phải có file thật. Từ chối ghi nếu `out` chưa được git ignore. |
-| `opgate put <ITEM> <FIELD>` | Đưa một secret **vào** 1Password. Đọc giá trị từ stdin, không qua argv. |
+| `opgate put <ITEM> <FIELD>` | Đưa một secret **vào** 1Password. Đọc giá trị từ stdin. Thêm `--multiline` cho PEM key / JSON nhiều dòng. |
 | `opgate doctor` | Có gì đó không chạy. Kiểm tra toàn bộ setup và in cách sửa. |
 | `opgate audit -n 20` | Xem gần đây đã truy cập secret nào. |
 
@@ -54,8 +54,12 @@ opgate run -- npm run dev    # chạy; Touch ID hiện một lần lúc khởi �
 **Một lệnh dùng đúng một secret**:
 
 ```bash
-opgate exec DATABASE_URL=op://Dev/cme-api/DATABASE_URL -- psql "$DATABASE_URL" -c '\dt'
+opgate exec DATABASE_URL=op://Dev/cme-api/DATABASE_URL -- \
+  sh -c 'psql "$DATABASE_URL" -c "\dt"'
 ```
+
+`sh -c '…'` là bắt buộc: viết `-- psql "$DATABASE_URL"` sẽ để shell **bên ngoài**
+expand biến trước khi opgate kịp nạp secret, và psql nhận chuỗi rỗng.
 
 **Thiếu một biến**: thêm dòng `VAR=op://Dev/<project>/VAR` vào `.env.op`, rồi bảo
 người dùng chạy `opgate put <project> VAR` để nhập giá trị. Đừng tự hỏi họ giá trị
@@ -66,7 +70,8 @@ qua chat — nó sẽ nằm trong transcript.
 đó để "xem có gì".
 
 **Lệnh trả về exit 77**: người dùng đã từ chối ở sheet Touch ID. Đó là câu trả lời
-"không" — dừng lại và hỏi, đừng thử lại hay tìm đường vòng.
+"không" — dừng lại và hỏi, đừng thử lại hay tìm đường vòng. Exit 78 nghĩa là không
+hiện được prompt (hoặc gate binary bị thay đổi) — chạy `opgate doctor`.
 
 ## Quy ước lưu trữ
 

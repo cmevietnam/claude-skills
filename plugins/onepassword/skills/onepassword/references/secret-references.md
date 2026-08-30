@@ -36,6 +36,11 @@ một file rò rỉ.
 `opgate` tìm `.env.op` ở thư mục hiện tại rồi tới gốc git repo. Dùng file khác thì
 `-f`, hoặc đặt `OPGATE_ENV_FILE`.
 
+Khoảng trắng quanh dấu `=` được chấp nhận (`ADMIN_TOKEN = op://…`), khớp với cách
+`op run` phân giải. Điều này quan trọng về mặt bảo mật chứ không chỉ tiện: nếu parser
+của `opgate` bỏ sót một dòng mà `op run` vẫn phân giải, thì sheet Touch ID sẽ **báo
+thiếu** phạm vi bạn đang approve.
+
 ## Lỗi thường gặp
 
 **`could not resolve item`** — sai tên vault/item/field, hoặc item nằm ở vault khác.

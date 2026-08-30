@@ -34,11 +34,17 @@ opgate put cme-api JWT_SECRET
 Từ một `.env` có sẵn, vẫn nên làm từng dòng một cách có ý thức:
 
 ```bash
-# đọc tên biến, nhập lại giá trị bằng tay
-awk -F= '/^[A-Za-z_]/ {print $1}' .env | while read -r v; do
-  printf 'Nhập giá trị cho %s: ' "$v"
-  opgate put cme-api "$v"
+# `for` chứ không phải `... | while read`: opgate put đọc giá trị từ stdin, nên
+# một vòng lặp có pipe sẽ khiến nó nuốt luôn tên biến kế tiếp làm giá trị secret.
+for v in $(awk -F= '/^[A-Za-z_]/ {print $1}' .env); do
+  opgate put cme-api "$v"       # tự hiện prompt ẩn cho từng biến
 done
+```
+
+Giá trị nhiều dòng (PEM key, service-account JSON) cần `--multiline`:
+
+```bash
+opgate put cme-api GOOGLE_SA_JSON --multiline < service-account.json
 ```
 
 Với secret cần rotate (key đã từng nằm trong git, trong settings file, trong log):
