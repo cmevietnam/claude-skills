@@ -34,6 +34,9 @@ process con, clipboard, hoặc một file đã được git ignore.
 | Lệnh | Dùng khi |
 |---|---|
 | `opgate list` | Xem project có secret gì. **Không hiện giá trị**, không cần Touch ID — cứ gọi thoải mái. |
+| `opgate scan` | Tìm mọi `.env` trong project và secret nhúng trong file cấu hình. Chạy được cả khi 1Password đang khoá. Không in giá trị. |
+| `opgate import <file>` | Đưa một file `.env` vào vault và sinh `.env.op`. Một lần Touch ID cho cả file. |
+| `opgate items -p <project>` | Liệt kê item của một project trong vault (lọc theo tag). |
 | `opgate run -- <cmd>` | Lệnh chủ đạo. Chạy `<cmd>` với toàn bộ secrets nạp vào env. 1Password tự mask giá trị trong output. |
 | `opgate exec VAR=op://… -- <cmd>` | Chỉ cần đúng một secret. |
 | `opgate copy op://…` | Người dùng cần tự dán secret vào đâu đó. Vào clipboard, tự xoá sau 90s. |
@@ -65,9 +68,17 @@ expand biến trước khi opgate kịp nạp secret, và psql nhận chuỗi r�
 người dùng chạy `opgate put <project> VAR` để nhập giá trị. Đừng tự hỏi họ giá trị
 qua chat — nó sẽ nằm trong transcript.
 
-**Thấy `.env` plaintext trong repo**: nói với người dùng, đề xuất chuyển sang
-`.env.op`. Xem `references/project-setup.md` cho quy trình đầy đủ. Đừng tự đọc file
-đó để "xem có gì".
+**Thấy `.env` plaintext trong repo**: chạy `opgate scan` — nó liệt kê file, đếm
+biến và đề xuất tên item, không đọc giá trị nào ra ngoài. Rồi đề xuất
+`opgate import <file>`. Đừng tự `cat` file đó để "xem có gì".
+
+`opgate import` hỏi bạn về những biến nó không chắc, và câu hỏi chỉ mô tả **hình
+dạng** giá trị (`30 ký tự · thường/HOA/ký hiệu`) chứ không in giá trị. Nếu chạy
+không có terminal, nó **dừng lại** thay vì đoán — trừ khi có `--yes`.
+
+**Cách nhóm**: mỗi file env thành một item, đặt tên `<project>-<thư mục>-<môi
+trường>` (`cme-api`, `cme-web-production`), tất cả mang tag `project:<tên>`. Nhóm
+bằng tag chứ không chỉ bằng cách đặt tên, nên lọc được trong app lẫn CLI.
 
 **Lệnh trả về exit 77**: người dùng đã từ chối ở sheet Touch ID. Đó là câu trả lời
 "không" — dừng lại và hỏi, đừng thử lại hay tìm đường vòng. Exit 78 nghĩa là không

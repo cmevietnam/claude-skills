@@ -19,6 +19,10 @@ OPGATE_SCRIPT_DIR=$(cd -- "$OPGATE_BIN_DIR/../scripts" && pwd)
 source "$OPGATE_SCRIPT_DIR/lib/common.sh"
 # shellcheck source=../scripts/lib/gate.sh
 source "$OPGATE_SCRIPT_DIR/lib/gate.sh"
+# shellcheck source=../scripts/lib/classify.sh
+source "$OPGATE_SCRIPT_DIR/lib/classify.sh"
+# shellcheck source=../scripts/lib/scan.sh
+source "$OPGATE_SCRIPT_DIR/lib/scan.sh"
 
 usage() {
   cat >&2 <<'USAGE'
@@ -29,6 +33,10 @@ opgate — Touch ID-gated access to 1Password secrets
   opgate inject -i TPL -o OUT           render template ra file (bắt buộc gitignored)
   opgate copy   op://… [--seconds N]    secret -> clipboard, tự xoá sau N giây (mặc định 90)
   opgate put    ITEM FIELD [--multiline] ghi một secret VÀO 1Password (đọc từ stdin)
+
+  opgate scan   [PATH]                  tìm .env và secret nhúng trong project (không in giá trị)
+  opgate import FILE [--yes]            đưa một file .env vào vault + sinh .env.op
+  opgate items  [-p PROJECT]            liệt kê item trong vault theo project
 
   opgate list   [-f FILE]               liệt kê tên biến + ref (không bao giờ in giá trị)
   opgate doctor [--test-gate]           kiểm tra toàn bộ setup
@@ -63,6 +71,17 @@ require_op() {
 require_jq() {
   command -v jq >/dev/null 2>&1 \
     || die "opgate put cần jq. Cài: brew install jq"
+}
+
+# Run a command with a hard time limit. macOS ships no `timeout(1)`, and every
+# `op` call can block forever while 1Password is locked.
+with_timeout() { # <seconds> <cmd...>
+  local secs="$1"; shift
+  "$@" & local pid=$!
+  ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 & local watcher=$!
+  local rc=0; wait "$pid" 2>/dev/null || rc=$?
+  kill -9 "$watcher" 2>/dev/null
+  return $rc
 }
 
 # Where a path really lands, after resolving `..` and any symlinked parent.
@@ -444,6 +463,300 @@ cmd_doctor() {
   printf '\n' >&2; info "tất cả ổn"
 }
 
+# Parse one env file into the parallel arrays IMP_NAMES / IMP_VALUES.
+# bash 3.2 has no associative arrays, hence two arrays kept in step.
+parse_env_file() { # <file>
+  local file="$1" line name value
+  IMP_NAMES=(); IMP_VALUES=()
+  # `|| [[ -n "$line" ]]` keeps the final line when the file has no trailing
+  # newline — dropping it would silently skip the last variable.
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*= ]] || continue
+
+    name="${line%%=*}"
+    name="${name#"${name%%[![:space:]]*}"}"      # ltrim
+    name="${name%"${name##*[![:space:]]}"}"      # rtrim
+    name="${name#export }"
+    name="${name%"${name##*[![:space:]]}"}"
+
+    value="${line#*=}"
+    value="${value#"${value%%[![:space:]]*}"}"   # ltrim
+    # Strip one matching pair of surrounding quotes.
+    if   [[ "$value" == \"*\" && ${#value} -ge 2 ]]; then value="${value:1:${#value}-2}"
+    elif [[ "$value" == \'*\' && ${#value} -ge 2 ]]; then value="${value:1:${#value}-2}"
+    else value="${value%"${value##*[![:space:]]}"}"
+    fi
+
+    IMP_NAMES+=("$name"); IMP_VALUES+=("$value")
+  done < "$file"
+}
+
+cmd_scan() {
+  local target="" env_only=0
+  while (( $# )); do
+    case "$1" in
+      --env-only) env_only=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) target="$1"; shift ;;
+    esac
+  done
+  local root
+  if [[ -n "$target" ]]; then root=$(cd -- "$target" && pwd -P)
+  else root=$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' "$PWD"); fi
+  local project; project=$(basename -- "$root")
+
+  printf 'project: %s\n%s\n\n' "$project" "$root"
+
+  local -a envfiles=(); local f
+  while IFS= read -r f; do [[ -n "$f" ]] && envfiles+=("$f"); done < <(find_env_files "$root")
+
+  # Best effort, time-boxed: a locked 1Password makes `op` block indefinitely, and
+  # scan must still be useful with no vault access at all.
+  local vault_titles=""
+  vault_titles=$(with_timeout 5 op item list --vault "$OPGATE_VAULT" --format json 2>/dev/null \
+                 | jq -r '.[].title' 2>/dev/null) || vault_titles=""
+  [[ -n "$vault_titles" ]] || info "không đọc được vault (khoá hoặc chưa cấu hình) — bỏ qua cột trạng thái"
+
+  if (( ${#envfiles[@]} == 0 )); then
+    printf 'không tìm thấy file .env nào\n'
+  else
+    printf 'file env (%d):\n' "${#envfiles[@]}"
+    local i n v kind s c pl em item rel
+    for f in ${envfiles[@]+"${envfiles[@]}"}; do
+      rel="${f#"$root"/}"
+      item=$(item_name_for "$f" "$project" "$root")
+      parse_env_file "$f"
+      s=0; c=0; pl=0; em=0
+      for (( i = 0; i < ${#IMP_NAMES[@]}; i++ )); do
+        kind=$(classify_var "${IMP_NAMES[$i]}" "${IMP_VALUES[$i]}")
+        case "$kind" in
+          secret|ambiguous) s=$((s+1)) ;;
+          config) c=$((c+1)) ;;
+          placeholder) pl=$((pl+1)) ;;
+          empty) em=$((em+1)) ;;
+        esac
+      done
+      printf '  %-40s -> op://%s/%s/<VAR>' "$rel" "$OPGATE_VAULT" "$item"
+      if [[ -z "$vault_titles" ]]; then
+        printf '\n'
+      elif printf '%s' "$vault_titles" | grep -qxF "$item"; then
+        printf '  [đã có trong vault]\n'
+      else
+        printf '  [chưa có]\n'
+      fi
+      printf '     %d cần vault · %d config · %d placeholder · %d rỗng\n' "$s" "$c" "$pl" "$em"
+    done
+    printf '\n  đưa vào vault:  opgate import <file>\n'
+  fi
+
+  (( env_only )) && return 0
+
+  printf '\nsecret nhúng trong file khác:\n'
+  local hits=0 cf ln label
+  while IFS= read -r cf; do
+    [[ -n "$cf" ]] || continue
+    while IFS=$'\t' read -r ln label; do
+      [[ -n "$ln" ]] || continue
+      printf '  %s:%s\t%s\n' "${cf#"$root"/}" "$ln" "$label"
+      hits=$((hits + 1))
+    done < <(scan_embedded "$cf")
+  done < <(find_config_files "$root")
+
+  if (( hits == 0 )); then
+    printf '  không thấy gì\n'
+  else
+    printf '\n  %d chỗ. Đây là giá trị nằm trong file cấu hình hoặc source, không phải\n' "$hits"
+    printf '  biến môi trường — `opgate import` KHÔNG tự sửa được vì phải đổi code.\n'
+    printf '  Nếu là credential thật thì rotate; opgate chỉ nói chỗ, không in giá trị.\n'
+  fi
+}
+
+cmd_import() {
+  require_op; require_jq
+  local file="" project="" item="" assume_yes=0 dry=0
+  while (( $# )); do
+    case "$1" in
+      -p|--project) [[ $# -ge 2 ]] || die "--project cần một tên"; project="$2"; shift 2 ;;
+      --item)       [[ $# -ge 2 ]] || die "--item cần một tên"; item="$2"; shift 2 ;;
+      -y|--yes)     assume_yes=1; shift ;;
+      --dry-run)    dry=1; shift ;;
+      -h|--help)    usage; exit 0 ;;
+      *) [[ -z "$file" ]] || die "opgate import: chỉ nhận một file"; file="$1"; shift ;;
+    esac
+  done
+  [[ -n "$file" ]] || die "cú pháp: opgate import <file .env> [--project NAME] [--item NAME] [--yes]"
+  [[ -f "$file" ]] || die "không có file: $file"
+  file=$(resolved_path "$file")
+
+  local root; root=$(git rev-parse --show-toplevel 2>/dev/null || dirname -- "$file")
+  [[ -n "$project" ]] || project=$(basename -- "$root")
+  [[ -n "$item" ]] || item=$(item_name_for "$file" "$project" "$root")
+
+  parse_env_file "$file"
+  (( ${#IMP_NAMES[@]} )) || die "$file không có biến nào"
+
+  # Decide what goes to the vault. Ambiguous entries are settled by you, and the
+  # question shows the SHAPE of the value, never the value: deciding does not
+  # require seeing it, and printing it would put it in the transcript.
+  local -a vault_idx=() literal_idx=() ambiguous_idx=()
+  local i name kind ans
+  for (( i = 0; i < ${#IMP_NAMES[@]}; i++ )); do
+    name="${IMP_NAMES[$i]}"
+    kind=$(classify_var "$name" "${IMP_VALUES[$i]}")
+    case "$kind" in
+      secret)  vault_idx+=("$i") ;;
+      config|placeholder|empty) literal_idx+=("$i") ;;
+      ambiguous) ambiguous_idx+=("$i") ;;
+    esac
+  done
+
+  # An ambiguous variable is a judgement call, so it is yours. `--yes` sends them
+  # all to the vault, which is the safe direction: a config value in the vault
+  # costs a round trip, a secret left in a committable file costs a rotation.
+  if (( ${#ambiguous_idx[@]} )); then
+    if (( assume_yes )); then
+      # Checked before --dry-run so that `--yes --dry-run` previews the real plan
+      # rather than a list of questions it would never ask.
+      for i in ${ambiguous_idx[@]+"${ambiguous_idx[@]}"}; do vault_idx+=("$i"); done
+      ambiguous_idx=()
+    elif (( dry )); then
+      : # listed separately below; a dry run must not prompt
+    elif [[ -t 0 ]]; then
+      printf '\n%d biến không phân loại được chắc chắn. Giá trị KHÔNG được in ra —\n' "${#ambiguous_idx[@]}" >&2
+      printf 'chỉ mô tả hình dạng, vì in ra là đưa nó vào transcript.\n\n' >&2
+      for i in ${ambiguous_idx[@]+"${ambiguous_idx[@]}"}; do
+        printf '  %s — %s\n' "${IMP_NAMES[$i]}" "$(describe_value "${IMP_VALUES[$i]}")" >&2
+        printf '    đưa vào vault? [Y/n] ' >&2
+        # Read from stdin, which the `-t 0` above proved is a terminal. Reading
+        # /dev/tty instead looked equivalent and was not: it opens successfully in
+        # an agent session with a controlling terminal nobody is watching, returns
+        # EOF immediately, and every ambiguous variable silently defaulted to yes.
+        IFS= read -r ans || ans=y
+        case "$ans" in [nN]*) literal_idx+=("$i") ;; *) vault_idx+=("$i") ;; esac
+      done
+    else
+      # No terminal to ask on — an agent running this unattended. Refuse rather
+      # than guess: guessing wrong either leaks a secret into a committable file
+      # or quietly vaults something that did not need it.
+      printf '\n' >&2
+      for i in ${ambiguous_idx[@]+"${ambiguous_idx[@]}"}; do
+        printf '  %s — %s\n' "${IMP_NAMES[$i]}" "$(describe_value "${IMP_VALUES[$i]}")" >&2
+      done
+      die "${#ambiguous_idx[@]} biến ở trên cần bạn quyết, nhưng không có terminal để hỏi.
+       Chạy lại trong terminal, hoặc thêm --yes để đưa tất cả chúng vào vault."
+    fi
+  fi
+
+  local -a vault_names=()
+  for i in ${vault_idx[@]+"${vault_idx[@]}"}; do vault_names+=("${IMP_NAMES[$i]}"); done
+
+  printf '\n%s\n' "$file" >&2
+  printf '  vault  : %s -> op://%s/%s/<VAR>\n' "${#vault_idx[@]} biến" "$OPGATE_VAULT" "$item" >&2
+  printf '  literal: %s giữ nguyên trong .env.op\n' "${#literal_idx[@]} biến" >&2
+  (( ${#ambiguous_idx[@]} )) && printf '  chờ hỏi: %s\n' "${#ambiguous_idx[@]} biến" >&2
+
+  if (( dry )); then
+    printf '\n  --dry-run: không ghi gì\n' >&2
+    for i in ${vault_idx[@]+"${vault_idx[@]}"}; do printf '    vault     %s\n' "${IMP_NAMES[$i]}" >&2; done
+    for i in ${ambiguous_idx[@]+"${ambiguous_idx[@]}"}; do
+      printf '    sẽ hỏi   %s — %s\n' "${IMP_NAMES[$i]}" "$(describe_value "${IMP_VALUES[$i]}")" >&2
+    done
+    for i in ${literal_idx[@]+"${literal_idx[@]}"}; do printf '    literal   %s\n' "${IMP_NAMES[$i]}" >&2; done
+    return 0
+  fi
+  (( ${#vault_idx[@]} )) || die "không có biến nào cần đưa vào vault"
+
+  # One approval for the whole file. Per-variable prompts would mean dozens of
+  # Touch ID sheets for a real project, and a control you turn off is worth less
+  # than one you keep. The sheet lists every variable being written.
+  gate_require "import" "$item: $(IFS=,; printf '%s' "${vault_names[*]}")" \
+    "$(project_name) → nhập $(basename -- "$file") vào item \"$item\": $(summarize_list "${vault_names[@]}")"
+
+  # Merge with an existing item so re-importing does not drop fields added
+  # elsewhere. A failure that is not "no such item" must not be read as one.
+  local fields_json probe_err="" exists=1
+  probe_err=$(op item get "$item" --vault "$OPGATE_VAULT" --format json </dev/null 2>&1 >/dev/null) || exists=0
+  if (( exists )); then
+    fields_json=$(op item get "$item" --vault "$OPGATE_VAULT" --format json </dev/null | jq '.fields // []')
+  else
+    case "$probe_err" in
+      *"isn't an item"*|*"could not find"*|*"no item matching"*|*"not found"*) ;;
+      *) die "không truy vấn được item \"$item\": $probe_err" ;;
+    esac
+    fields_json='[{"id":"notesPlain","type":"STRING","purpose":"NOTES","label":"notesPlain","value":""}]'
+  fi
+
+  # Values reach jq over a file descriptor, never argv.
+  for i in ${vault_idx[@]+"${vault_idx[@]}"}; do
+    fields_json=$(printf '%s' "$fields_json" \
+      | jq --arg f "${IMP_NAMES[$i]}" --rawfile v <(printf '%s' "${IMP_VALUES[$i]}") \
+          'map(select(.label != $f)) + [{id: $f, type: "CONCEALED", label: $f, value: $v}]')
+  done
+
+  local tags="opgate,project:$project"
+  if (( exists )); then
+    op item edit "$item" --vault "$OPGATE_VAULT" --tags "$tags" --template <(
+      printf '%s' "$fields_json" | jq --arg t "$item" '{title: $t, category: "SECURE_NOTE", fields: .}'
+    ) </dev/null >/dev/null
+    info "cập nhật item \"$item\" (${#vault_idx[@]} biến)"
+  else
+    op item create --vault "$OPGATE_VAULT" --tags "$tags" --template <(
+      printf '%s' "$fields_json" | jq --arg t "$item" '{title: $t, category: "SECURE_NOTE", fields: .}'
+    ) </dev/null >/dev/null
+    info "tạo item \"$item\" (${#vault_idx[@]} biến), tag: $tags"
+  fi
+
+  # Write .env.op next to the original.
+  local opfile; opfile="$(dirname -- "$file")/.env.op"
+  {
+    printf '# sinh bởi `opgate import` từ %s\n' "$(basename -- "$file")"
+    printf '# commit được: chỉ chứa op:// reference và giá trị không bí mật.\n'
+    printf '# chạy: opgate run -- <lệnh>\n\n'
+    for (( i = 0; i < ${#IMP_NAMES[@]}; i++ )); do
+      local in_vault=0 j
+      for j in ${vault_idx[@]+"${vault_idx[@]}"}; do [[ "$j" == "$i" ]] && in_vault=1; done
+      if (( in_vault )); then
+        printf '%s=op://%s/%s/%s\n' "${IMP_NAMES[$i]}" "$OPGATE_VAULT" "$item" "${IMP_NAMES[$i]}"
+      else
+        printf '%s=%s\n' "${IMP_NAMES[$i]}" "${IMP_VALUES[$i]}"
+      fi
+    done
+  } > "$opfile"
+  info "ghi $opfile"
+
+  # Keep the original. Deleting it is your call, made after you have confirmed the
+  # app still runs — a missed variable with no backup is unrecoverable.
+  local backup_dir="$OPGATE_HOME/backups"
+  mkdir -p -- "$backup_dir"
+  local backup="$backup_dir/${item}-$(date +%Y%m%d-%H%M%S).env"
+  ( umask 077; cp -- "$file" "$backup" )
+  info "sao lưu bản gốc: $backup"
+
+  if ! git check-ignore -q -- "$file" 2>/dev/null; then
+    warn "$(basename -- "$file") CHƯA được git ignore — thêm vào .gitignore trước khi commit"
+  fi
+  info "kiểm tra:  opgate run -f $opfile -- <lệnh>"
+  info "xoá bản gốc sau khi chắc chắn mọi thứ chạy: rm $file"
+}
+
+cmd_items() {
+  require_op
+  local project=""
+  while (( $# )); do
+    case "$1" in
+      -p|--project) [[ $# -ge 2 ]] || die "-p cần một tên"; project="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "opgate items: tham số lạ '$1'" ;;
+    esac
+  done
+  [[ -n "$project" ]] || project=$(project_name)
+  printf 'vault %s · tag project:%s\n' "$OPGATE_VAULT" "$project"
+  op item list --vault "$OPGATE_VAULT" --tags "project:$project" </dev/null 2>&1
+}
+
 # --- dispatch ---------------------------------------------------------------
 
 sub="${1:-help}"; shift || true
@@ -454,6 +767,9 @@ case "$sub" in
   copy)   cmd_copy   "$@" ;;
   put)    cmd_put    "$@" ;;
   list)   cmd_list   "$@" ;;
+  scan)   cmd_scan   "$@" ;;
+  import) cmd_import "$@" ;;
+  items)  cmd_items  "$@" ;;
   audit)  cmd_audit  "$@" ;;
   doctor) cmd_doctor "$@" ;;
   build)  bash "$OPGATE_SCRIPT_DIR/build-gate.sh" ;;

@@ -1,8 +1,9 @@
 # Đưa một project lên 1Password
 
-Làm một lần cho mỗi project. Quy trình này cố ý **không** tự động hoá bằng script:
-mỗi secret cần một quyết định của con người về việc nó có nên tồn tại hay không,
-và một số trong đó nên được rotate thay vì chép nguyên sang chỗ mới.
+Làm một lần cho mỗi project. `opgate scan` và `opgate import` lo phần cơ học, còn
+hai quyết định vẫn là của bạn và không tự động hoá được: biến nào thật sự là bí mật,
+và secret nào nên **rotate** thay vì chép nguyên sang chỗ mới. Bất cứ giá trị nào
+từng nằm trong git, trong log, hay trong một settings file thì coi như đã lộ.
 
 ## 0. Chuẩn bị một lần cho cả máy
 
@@ -11,72 +12,83 @@ op vault create Dev          # nếu chưa có
 opgate doctor                # phải xanh hết trước khi đi tiếp
 ```
 
-## 1. Liệt kê các biến cần có
-
-Lấy **tên biến** từ `.env.example` nếu có — không cần mở `.env` thật:
+## 1. Xem project có gì
 
 ```bash
-grep -oE '^[A-Za-z_][A-Za-z0-9_]*' .env.example | sort -u
+opgate scan
 ```
 
-Nếu không có `.env.example`, lấy tên biến từ code (`process.env.X`, `os.Getenv("X")`,
-`os.environ["X"]`) thay vì đọc `.env`.
+Liệt kê mọi `.env`, đếm biến theo phân loại, đề xuất tên item — và báo cả secret
+nằm trong file cấu hình hoặc source. Không đọc giá trị nào ra ngoài, và chạy được
+cả khi 1Password đang khoá.
 
-## 2. Đưa từng giá trị vào vault
-
-Người dùng tự chạy, giá trị đi qua stdin nên không nằm trong shell history hay argv:
+## 2. Import từng file
 
 ```bash
-opgate put cme-api DATABASE_URL     # nhập giá trị ở prompt ẩn
-opgate put cme-api JWT_SECRET
+opgate import api/.env
 ```
 
-Từ một `.env` có sẵn, vẫn nên làm từng dòng một cách có ý thức:
+Một lần Touch ID cho cả file; sheet liệt kê mọi biến sắp được ghi. Việc nó làm:
+
+- tạo/cập nhật item `<project>-<thư mục>-<môi trường>` trong vault `Dev`, tag
+  `opgate` và `project:<tên>`
+- sinh `.env.op` cạnh file gốc: secret thành `op://` ref, biến không bí mật giữ
+  nguyên literal
+- sao lưu bản gốc vào `~/.local/share/opgate/backups/` (chmod 600)
+- **không** xoá bản gốc
+
+Biến nó không chắc thì nó hỏi, và câu hỏi chỉ mô tả hình dạng giá trị chứ không in
+giá trị. Không có terminal thì nó dừng thay vì đoán — `--yes` để đưa hết những ca
+mơ hồ vào vault.
+
+Xem trước mà không ghi gì: `opgate import api/.env --dry-run`.
+
+Với secret cần rotate (key đã từng nằm trong git, trong settings file, trong log):
+**tạo key mới ở nhà cung cấp trước**, sửa `.env`, rồi mới import.
+
+### Thêm một biến lẻ về sau
 
 ```bash
-# `for` chứ không phải `... | while read`: opgate put đọc giá trị từ stdin, nên
-# một vòng lặp có pipe sẽ khiến nó nuốt luôn tên biến kế tiếp làm giá trị secret.
-for v in $(awk -F= '/^[A-Za-z_]/ {print $1}' .env); do
-  opgate put cme-api "$v"       # tự hiện prompt ẩn cho từng biến
-done
-```
-
-Giá trị nhiều dòng (PEM key, service-account JSON) cần `--multiline`:
-
-```bash
+opgate put cme-api NEW_TOKEN                    # prompt ẩn
 opgate put cme-api GOOGLE_SA_JSON --multiline < service-account.json
 ```
 
-Với secret cần rotate (key đã từng nằm trong git, trong settings file, trong log):
-**tạo key mới ở nhà cung cấp trước**, rồi mới `opgate put` giá trị mới.
+Rồi thêm dòng `NEW_TOKEN=op://Dev/cme-api/NEW_TOKEN` vào `.env.op`.
 
-## 3. Tạo `.env.op`
+## 3. Kiểm tra `.env.op`
 
-File này commit được — nó chỉ chứa reference, không chứa giá trị:
+`import` đã sinh file này cạnh file gốc. Nó commit được — secret là `op://` ref,
+biến không bí mật giữ nguyên literal:
 
 ```
+NODE_ENV=development
 DATABASE_URL=op://Dev/cme-api/DATABASE_URL
 JWT_SECRET=op://Dev/cme-api/JWT_SECRET
-REDIS_URL=op://Dev/cme-api/REDIS_URL
 ```
 
-Kiểm tra:
+Xác nhận trước khi bỏ bản gốc:
 
 ```bash
-opgate list                                       # tên + ref, không có giá trị
-opgate run -- sh -c 'echo "${DATABASE_URL:+ok}"'  # in "ok" nếu biến tới nơi
+opgate list -f api/.env.op                    # tên + ref, không có giá trị
+opgate run -f api/.env.op -- npm run dev      # app phải chạy được
 ```
+
+`opgate list` cảnh báo nếu còn biến nào mang tên kiểu secret mà vẫn là literal —
+đó là dấu hiệu phân loại sai, và là thứ duy nhất có thể biến `.env.op` từ file
+commit được thành file rò rỉ.
 
 ## 4. Dọn plaintext
 
+`import` đã sao lưu bản gốc vào `~/.local/share/opgate/backups/` và **không** xoá
+nó. Sau khi chắc chắn app chạy được bằng `.env.op`:
+
 ```bash
 git check-ignore .env || echo ".env" >> .gitignore
-mv .env ~/.local/share/opgate/backup-$(basename "$PWD")-$(date +%Y%m%d).env
-chmod 600 ~/.local/share/opgate/backup-*.env
+rm api/.env
 ```
 
-Giữ backup vài ngày cho tới khi chắc chắn mọi thứ chạy, rồi xoá. **Không xoá `.env`
-ngay** — nếu bỏ sót một biến thì không có đường quay lại.
+Đừng xoá sớm. Nếu sót một biến mà không còn bản gốc thì không có đường quay lại —
+đó là lý do `import` giữ nguyên file thay vì tự dọn.
 
 Nếu `.env` từng bị commit thì giá trị vẫn nằm trong lịch sử git; thêm vào
 `.gitignore` không xoá nó. Những secret đó phải rotate.

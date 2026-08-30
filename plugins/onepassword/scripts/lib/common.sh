@@ -126,7 +126,15 @@ OPGATE_SECRETY_NAME='(SECRET|TOKEN|_KEY|^KEY|APIKEY|API_KEY|PASSWORD|PASSWD|PWD|
 
 env_file_literals() {
   local file="$1"
-  env_file_pairs "$file" | awk -F'\t' '$2 !~ /^op:\/\// { print $1 }' \
+  # Empty values and obvious placeholders are excluded: warning that
+  # `TODO_KEY=changeme` is "a secret in a committable file" is noise, and noise is
+  # how a warning stops being read.
+  env_file_pairs "$file" \
+    | awk -F'\t' '
+        $2 ~ /^op:\/\// { next }
+        $2 == "" { next }
+        tolower($2) ~ /^(changeme|change-me|x+|y+|todo|tbd|your[-_a-z]*|replace[-_a-z]*|example|placeholder|dummy|<.*>|\$\{.*\})$/ { next }
+        { print $1 }' \
     | grep -E "$OPGATE_SECRETY_NAME" || true
 }
 

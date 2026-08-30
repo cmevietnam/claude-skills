@@ -45,6 +45,9 @@ Yêu cầu: macOS có Touch ID, 1Password 8 với **Settings ▸ Developer ▸ I
 ## Dùng
 
 ```bash
+opgate scan                   # tìm .env + secret nhúng trong cả project
+opgate import api/.env        # đưa một file vào vault, sinh .env.op
+opgate items -p cme           # xem project có những item nào trong vault
 opgate list                   # project có secret gì (không hiện giá trị)
 opgate run -- npm run dev     # chạy app với secrets nạp vào env
 opgate copy op://Dev/x/API_KEY
@@ -54,11 +57,38 @@ opgate audit -n 20            # gần đây đã truy cập gì
 
 Yêu cầu thêm: `jq` (`brew install jq`) cho `opgate put`. `opgate doctor` kiểm tra.
 
-Chạy lại bộ test của hook bất cứ lúc nào — không cần vault, không cần mạng:
+Ba bộ test chạy được bất cứ lúc nào — không cần vault, không cần mạng, không cần
+vân tay:
 
 ```bash
-bash plugins/onepassword/scripts/test-guards.sh
+bash plugins/onepassword/scripts/test-guards.sh    # hai PreToolUse hook
+bash plugins/onepassword/scripts/test-classify.sh  # phân loại secret / config
+bash plugins/onepassword/scripts/test-scan.sh      # quét + đặt tên item
 ```
+
+## Đưa một project lên vault
+
+```bash
+opgate scan                    # xem có gì, không đọc giá trị ra ngoài
+opgate import api/.env         # một lần Touch ID cho cả file
+opgate run -f api/.env.op -- npm run dev
+```
+
+`import` tạo item `<project>-<thư mục>-<môi trường>` (ví dụ `cme-api`,
+`cme-web-production`) mang tag `opgate` và `project:<tên>`, sinh `.env.op` cạnh file
+gốc, và sao lưu bản gốc vào `~/.local/share/opgate/backups/`. Nó **không xoá** bản
+gốc — xoá là việc của bạn, sau khi đã chắc app còn chạy.
+
+Biến không bí mật (`NODE_ENV`, `PORT`, `API_URL`) ở lại `.env.op` dạng literal, nên
+file đó vẫn commit được và vault không đầy rác. Biến không phân loại được chắc chắn
+thì `import` hỏi bạn, và câu hỏi chỉ mô tả hình dạng giá trị — `30 ký tự ·
+thường/HOA/ký hiệu` — chứ không in giá trị. Không có terminal thì nó dừng thay vì
+đoán, trừ khi bạn thêm `--yes`.
+
+`opgate scan` cũng báo secret nằm **trong file cấu hình hoặc source** (AWS key trong
+một `settings.local.json`, JWT trong một file JSON). Nó chỉ báo `file:dòng` và loại
+credential, không in giá trị, và không tự sửa — sửa những chỗ đó cần đổi code, và
+nếu là credential thật thì việc đầu tiên là rotate.
 
 Xem `skills/onepassword/references/project-setup.md` để đưa một project từ `.env`
 plaintext lên 1Password.
