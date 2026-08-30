@@ -75,7 +75,9 @@ biến và đề xuất tên item, không đọc giá trị nào ra ngoài. Rồ
 
 `opgate import` hỏi bạn về những biến nó không chắc, và câu hỏi chỉ mô tả **hình
 dạng** giá trị (`30 ký tự · thường/HOA/ký hiệu`) chứ không in giá trị. Nếu chạy
-không có terminal, nó **dừng lại** thay vì đoán — trừ khi có `--yes`.
+không có terminal, nó **dừng lại** thay vì đoán — trừ khi có `--yes`. Nó cũng dừng
+khi file có BOM, nháy không đóng, hoặc `$VAR` ngoài nháy đơn — đừng "sửa" bằng cách
+bỏ qua, hãy báo người dùng sửa file.
 
 **Cách nhóm**: mỗi file env thành một item, đặt tên `<project>-<thư mục>-<môi
 trường>` (`cme-api`, `cme-web-production`), tất cả mang tag `project:<tên>`. Nhóm

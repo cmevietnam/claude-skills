@@ -9,7 +9,7 @@
 payload=$(cat)
 
 case "$payload" in
-  *.env*|*.pem*|*.p12*|*.pfx*|*.jks*|*.key*|*id_rsa*|*id_ed25519*|*id_ecdsa*|*.netrc*|*.pgpass*|*.npmrc*|*credential*) ;;
+  *.env*|*.pem*|*.p12*|*.pfx*|*.jks*|*.key*|*id_rsa*|*id_ed25519*|*id_ecdsa*|*.netrc*|*.pgpass*|*.npmrc*|*credential*|*/opgate/backups/*) ;;
   *) exit 0 ;;
 esac
 
@@ -46,8 +46,9 @@ case "$base" in
 esac
 
 secret=0
+case "$file_path" in */opgate/backups/*.env) secret=1 ;; esac
 case "$base" in
-  .env|.env.*|.netrc|.pgpass|.npmrc) secret=1 ;;
+  .env|.env.*|.envrc|.netrc|.pgpass|.npmrc|.git-credentials) secret=1 ;;
   *.pem|*.p12|*.pfx|*.jks|*.key)     secret=1 ;;
   id_rsa*|id_ed25519*|id_ecdsa*)     secret=1 ;;
   credentials|credentials.json)      secret=1 ;;

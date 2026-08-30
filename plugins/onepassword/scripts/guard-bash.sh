@@ -76,28 +76,37 @@ while IFS= read -r tok; do
   [[ -n "$tok" ]] && tokens+=("$tok")
   # The trailing newline matters: without it `read` discards the final token, which
   # is almost always the filename — `cat .env` would then look like just `cat`.
-done < <(printf '%s\n' "$command_line" | tr ' \t\n"'"'"'`;|&()<>{}=,' '\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n')
+done < <(printf '%s\n' "$command_line" | tr ' \t\n"'"'"'`;|&()<>{}' '\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n')
 
-base_of() { printf '%s' "${1##*/}"; }
+# Inline ${t##*/} everywhere: a $(...) per token forked twice per token and took
+# 8 s on a 6000-token heredoc, past the 10 s hook timeout, so the guard silently
+# did not run at all on exactly the commands most likely to hide something.
 
 # --- 1. direct `op` calls that can surface a secret value -------------------
 # Find an `op` invocation (bare or by path), then look at what follows it. Listing
 # metadata is fine; anything that resolves a secret is not.
-saw_op=0 danger=0 saw_noun=0
+saw_op=0 danger=0 noun="" since=0
 for t in ${tokens[@]+"${tokens[@]}"}; do
-  b=$(base_of "$t")
+  b="${t##*/}"
+  if (( saw_op )); then
+    since=$((since + 1))
+    # Look at most 6 tokens past `op` — enough for `op --account work --format
+    # json read`. Prose that mentions op and read further apart is not an
+    # invocation. Adjacent prose ("docs: op read") still trips it; documented.
+    (( since > 6 )) && { saw_op=0; noun=""; }
+  fi
   if (( saw_op )); then
     case "$b" in
       read|inject|run) danger=1; break ;;
-      # `--reveal` prints concealed values whatever the subcommand is.
-      --reveal)        danger=1; break ;;
-      item|document)   saw_noun=1 ;;
-      # `op item --format json get app` puts flags between the noun and the verb,
-      # so requiring them to be adjacent missed a command that prints secrets.
-      get)             (( saw_noun )) && { danger=1; break; } ;;
+      --reveal|--raw)  danger=1; break ;;   # prints a value/token whatever the subcommand
+      item|document|connect|service-account|account) noun="$b" ;;
+      get)    [[ "$noun" == item || "$noun" == document ]] && { danger=1; break; } ;;
+      share)  [[ "$noun" == item ]] && { danger=1; break; } ;;      # prints a bearer link
+      create) [[ "$noun" == service-account ]] && { danger=1; break; } ;;  # prints a token
+      token)  [[ "$noun" == connect ]] && { danger=1; break; } ;;   # `connect token create`
     esac
   fi
-  [[ "$b" == "op" ]] && { saw_op=1; saw_noun=0; }
+  [[ "$b" == "op" ]] && { saw_op=1; noun=""; since=0; }
 done
 
 if (( danger )); then
@@ -105,14 +114,16 @@ if (( danger )); then
 fi
 
 # --- 2. shell-reading a plaintext secret file -------------------------------
-readers_re='^(cat|bat|head|tail|less|more|strings|xxd|od|nl|dd|base64|cut|paste|tr|grep|egrep|fgrep|rg|ag|awk|sed|printenv|python|python3|perl|ruby|node|deno|bun|php)$'
+readers_re='^(cat|bat|head|tail|less|more|strings|xxd|od|nl|dd|base64|cut|paste|tr|sort|uniq|diff|cmp|cp|tee|source|\.|grep|egrep|fgrep|rg|ag|awk|sed|printenv|python|python3|perl|ruby|node|deno|bun|php)$'
 # `.env`, `.env.production`, `.env.production.local`, and the `.env*` glob form.
-secret_re='^(\.env[A-Za-z0-9_.*-]*|\.netrc|\.pgpass|\.npmrc|credentials(\.json)?|id_rsa[^/]*|id_ed25519[^/]*|id_ecdsa[^/]*|[^/]*\.(pem|p12|pfx|jks|key))$'
+secret_re='^(\.env[A-Za-z0-9_.*-]*|\.envrc|\.netrc|\.pgpass|\.npmrc|\.git-credentials|credentials(\.json)?|id_rsa[^/]*|id_ed25519[^/]*|id_ecdsa[^/]*|[^/]*\.(pem|p12|pfx|jks|key))$'
 safe_re='\.(example|sample|tpl|template|op|pub|md|lock|ts|js|json5)$'
 
 saw_reader=0 saw_secret=0
 for t in ${tokens[@]+"${tokens[@]}"}; do
-  b=$(base_of "$t")
+  # `dd if=.env`, `--file=.env`: the filename sits after a `key=` prefix.
+  [[ "$t" =~ ^[A-Za-z_-]+=(.+)$ ]] && t="${BASH_REMATCH[1]}"
+  b="${t##*/}"
   [[ "$b" =~ $readers_re ]] && saw_reader=1
   if [[ "$b" =~ $secret_re ]] && ! [[ "$b" =~ $safe_re ]]; then saw_secret=1; fi
 done

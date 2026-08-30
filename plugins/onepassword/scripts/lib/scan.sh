@@ -17,19 +17,23 @@ scan_prune_args() {
 # does not get run.
 SCAN_MAX_SIZE="${SCAN_MAX_SIZE:-1024k}"
 
-# A path containing a colon would be mis-split when parsing `grep -n` output as
-# file:line, and a mis-split could put file CONTENT where a line number belongs.
-# Dropping those few paths is cheaper than risking that.
-_drop_colon_paths() { grep -v ':' || true; }
+# Paths containing a newline or a colon are pruned inside find itself. A newline
+# would split one path into two list entries; a colon would be mis-split when
+# `grep -n` output is parsed as file:line, and a mis-split could put file CONTENT
+# where a line number belongs. With those gone, a newline-delimited list is safe.
+#
+# Built inline in each caller: the newline pattern cannot travel through a
+# newline-delimited helper — it did once, arrived as `-path '*'`, and pruned every
+# file in the tree.
+SCAN_NL_GLOB=$(printf '*\n*x'); SCAN_NL_GLOB="${SCAN_NL_GLOB%x}"
 
 # env files belonging to a project, excluding the committable template forms.
 find_env_files() { # <root>
   local root="$1"; local -a prune=(); local a
   while IFS= read -r a; do prune+=("$a"); done < <(scan_prune_args)
-  find "$root" \( "${prune[@]}" \) -prune -o \
+  find "$root" \( "${prune[@]}" \) -prune -o \( -path "$SCAN_NL_GLOB" -o -path '*:*' \) -prune -o \
        -type f \( -name '.env' -o -name '.env.*' \) -print 2>/dev/null \
     | grep -Ev '\.(example|sample|tpl|template|op)$' \
-    | _drop_colon_paths \
     | sort
 }
 
@@ -39,7 +43,7 @@ find_env_files() { # <root>
 find_config_files() { # <root>
   local root="$1"; local -a prune=(); local a
   while IFS= read -r a; do prune+=("$a"); done < <(scan_prune_args)
-  find "$root" \( "${prune[@]}" \) -prune -o \
+  find "$root" \( "${prune[@]}" \) -prune -o \( -path "$SCAN_NL_GLOB" -o -path '*:*' \) -prune -o \
        -type f -size "-$SCAN_MAX_SIZE" \( \
             -name '*.json' -o -name '*.yaml' -o -name '*.yml' -o -name '*.toml' \
          -o -name '*.ini'  -o -name '*.conf' -o -name '*.cfg'  -o -name '*.properties' \
@@ -51,7 +55,6 @@ find_config_files() { # <root>
          -o -name '*.rs'   -o -name '*.tpl'  -o -name '*.tmpl' -o -name 'Dockerfile*' \
        \) -print 2>/dev/null \
     | grep -Ev '(package-lock|yarn\.lock|pnpm-lock|composer\.lock|go\.sum|Cargo\.lock|\.min\.(js|css)$)' \
-    | _drop_colon_paths \
     | sort
 }
 
@@ -94,15 +97,25 @@ scan_embedded_list() {
   local label flags pattern
   while IFS=$'\t' read -r label flags pattern; do
     [[ -n "$label" && -n "$pattern" ]] || continue
-    local -a gflags=(-nEI)
+    local -a gflags=(-nHEI)
     [[ "$flags" == *i* ]] && gflags+=(-i)
-    # /dev/null keeps grep in multi-file mode so it always prefixes the filename.
-    # cut leaves only file:line — the matched text never leaves the pipeline.
+    # The framing `file:line:content` is what `cut` relies on to drop content.
+    # macOS grep honours GREP_OPTIONS, and `GREP_OPTIONS=-h` removed the filename
+    # so the "line" field became the matched line — a credential on stdout. So:
+    # -H is explicit, the variable is cleared, and /dev/null keeps multi-file mode.
+    #
+    # The content filter runs INSIDE the pipeline, before cut: it sees the line,
+    # stdout never does. It drops the usual non-secrets that match the generic
+    # assignment pattern — reads from the environment, template expansions, and
+    # op:// references themselves.
     { tr '\n' '\0' < "$list" \
-        | xargs -0 grep "${gflags[@]}" -- "$pattern" /dev/null 2>/dev/null || true; } \
+        | GREP_OPTIONS= xargs -0 grep "${gflags[@]}" -- "$pattern" /dev/null 2>/dev/null || true; } \
+      | { GREP_OPTIONS= grep -Ev 'process\.env|os\.environ|getenv\(|ENV\[|\$\{|\$[A-Z_]+|op://|headers\.|\.get\(' || true; } \
       | cut -d: -f1,2 \
       | while IFS=: read -r f ln; do
-          [[ -n "$f" && -n "$ln" && "$f" != /dev/null ]] && printf '%s\t%s\t%s\n' "$f" "$ln" "$label"
+          [[ -n "$f" && -n "$ln" && "$f" != /dev/null ]] || continue
+          [[ "$ln" =~ ^[0-9]+$ ]] || continue   # never emit anything that is not a line number
+          printf '%s\t%s\t%s\n' "$f" "$ln" "$label"
         done
   done < <(scan_patterns)
   rm -f "$list"

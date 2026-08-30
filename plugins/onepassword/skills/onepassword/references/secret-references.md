@@ -36,10 +36,19 @@ một file rò rỉ.
 `opgate` tìm `.env.op` ở thư mục hiện tại rồi tới gốc git repo. Dùng file khác thì
 `-f`, hoặc đặt `OPGATE_ENV_FILE`.
 
-Khoảng trắng quanh dấu `=` được chấp nhận (`ADMIN_TOKEN = op://…`), khớp với cách
-`op run` phân giải. Điều này quan trọng về mặt bảo mật chứ không chỉ tiện: nếu parser
-của `opgate` bỏ sót một dòng mà `op run` vẫn phân giải, thì sheet Touch ID sẽ **báo
-thiếu** phạm vi bạn đang approve.
+Parser của `opgate` được đo đối chiếu với `op run` 2.34.1 (xem `test-parser.sh`)
+chứ không viết theo "spec dotenv", vì thứ duy nhất quan trọng là khớp với `op`. Nếu
+parser bỏ sót một dòng mà `op run` vẫn phân giải, sheet Touch ID sẽ **báo thiếu**
+phạm vi bạn đang approve. Những điểm đã đo:
+
+- khoảng trắng quanh `=` được chấp nhận; tên có thể bắt đầu bằng số
+- `export` bị bỏ kể cả khi dính liền tên (`exportHIDDEN=1` → `HIDDEN`), có cảnh báo
+- ngoài nháy: `#` bắt đầu comment
+- nháy đơn: giữ nguyên tuyệt đối, có thể nhiều dòng
+- nháy kép: chỉ `\n`, `\"`, `\\` được giải mã; `\t` giữ nguyên **hai** ký tự
+- `$VAR` / `${VAR}` ngoài nháy đơn: `op` expand → `opgate` **từ chối** (xem trên)
+- BOM, nháy không đóng, NUL: `op` từ chối cả file → `opgate` cũng từ chối
+- tên trùng: giá trị cuối thắng, sheet chỉ hiện tên một lần
 
 ## Lỗi thường gặp
 

@@ -45,11 +45,11 @@ t NOT_A_KEY  '-----BEGIN RSA PRIVATE KEY-----'           secret
 
 echo "placeholder và rỗng"
 t API_KEY   ''             empty
-t API_KEY   'changeme'     placeholder
-t API_KEY   'your-key-here' placeholder
+t API_KEY   'changeme'     secret
+t API_KEY   'your-key-here' secret
 t API_KEY   '<your-token>' placeholder
 t API_KEY   '${FROM_CI}'   placeholder
-t SOME_VAR  'TODO'         placeholder
+t SOME_VAR  'TODO'         ambiguous
 
 echo "mơ hồ — phải hỏi người dùng"
 t MAILER_FROM  'noreply@example.com many words here'  ambiguous
@@ -59,7 +59,7 @@ echo "URL công khai không phải secret"
 t API_URL   'https://api.example.com'  config
 t SITE_URL  'https://example.com/path' config
 t BASE_URL  'http://localhost:8080/v1' config
-t CDN_URL   'https://cdn.example.com/assets/main.css' config
+t CDN_URL   'https://cdn.example.com/assets/main.css' ambiguous
 
 echo "URL mang credential trong path VẪN là secret"
 t NOTIFY_URL 'https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX' secret
@@ -91,15 +91,51 @@ t NODE_ENV     'prod'     config
 t PORT         '8080'     config
 
 echo "placeholder chỉ còn những dấu hiệu không thể nhầm"
-t API_KEY  'changeme'      placeholder
+t API_KEY  'changeme'      secret
 t API_KEY  '<your-token>'  placeholder
 t API_KEY  '${FROM_CI}'    placeholder
-t API_KEY  'your-key-here' placeholder
-t API_KEY  'TODO'          placeholder
+t API_KEY  'your-key-here' secret
+t API_KEY  'TODO'          secret
 t API_KEY  'secret'        secret
 t API_KEY  'test'          secret
 t API_KEY  'dummy'         secret
 t API_KEY  'example'       secret
+
+echo "VÒNG 3: wildcard allowlist đã bỏ — chỉ tên khớp chính xác mới thành config"
+t PUBLIC_PASSCODE     '1234'                         secret
+t NEXT_PUBLIC_PINCODE '1234'                         secret
+t PUBLIC_HMAC         'deadbeef'                     secret
+t PUBLIC_ADMIN_PASSCODE 'correct-horse-battery-staple' secret
+t MAX_KEYS            'abc'                          ambiguous
+t MIN_SOMETHING       'x'                            ambiguous
+t SMTP_HOSTNAME       'mail.example.com'             ambiguous
+t PUBLIC_THING        'hello'                        ambiguous
+t NEXT_PUBLIC_SITE_URL 'https://x.example'           config
+t AWS_REGION          'ap-southeast-1'               config
+t DB_PORT             '5432'                         config
+
+echo "VÒNG 3: không còn demotion theo hình dạng URL"
+t MAGIC_LINK  'https://x.example/login?code=hunter2'   secret
+t CALLBACK    'https://x.example/cb?session=abc'       secret
+t SOME_URL    'https://x.example/docs'                 ambiguous
+
+echo "VÒNG 3: giá trị op:// là reference, không vault lại"
+t ALREADY  'op://Dev/app/KEY'   reference
+t WEIRD    'op://hunter2'       reference
+
+echo "VÒNG 3: is_op_ref chỉ nhận cú pháp hợp lệ"
+r() { if is_op_ref "$1"; then got=valid; else got=invalid; fi
+  if [[ "$got" == "$2" ]]; then pass=$((pass+1)); printf '  ok   %-30s %s\n' "$(printf %s "$1" | tr '\n' '|')" "$got"
+  else fail=$((fail+1)); printf '  FAIL %-30s %s (want %s)\n' "$(printf %s "$1" | tr '\n' '|')" "$got" "$2"; fi; }
+r 'op://Dev/app/KEY'          valid
+r 'op://Dev/app/sec/KEY'      valid
+r 'op://My Vault/an item/F'   valid
+r 'op://hunter2'              invalid
+r 'op://Dev/app'              invalid
+r 'op://Dev/app/a/b/c'        invalid
+r "$(printf 'op://bad\nhunter2')" invalid
+r 'op://Dev/app/K"EY'         invalid
+r 'op://Dev//KEY'             invalid
 
 echo "describe_value không được lộ giá trị"
 for v in 'sk_live_abcdefghijklmnopqrst' 'postgres://u:p@h/db' $'multi\nline'; do

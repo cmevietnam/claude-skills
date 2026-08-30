@@ -34,8 +34,14 @@ chmod 755 "$out"
 
 # Recorded so gate.sh can notice the binary being swapped. Tamper-evidence, not
 # tamper-proofing — the file sits in a directory you own.
-/usr/bin/shasum -a 256 <"$out" | cut -d' ' -f1 > "$OPGATE_GATE_SUM"
-chmod 400 "$OPGATE_GATE_SUM"
+# The old hash file is 0400, so writing over it fails — which made every rebuild
+# after a source change leave binary and hash mismatched, every gated command
+# exit 78 with a TAMPER line, and the prescribed fix (`opgate build`) fail the
+# same way. Write a fresh file and move it into place instead.
+/usr/bin/shasum -a 256 <"$out" | cut -d' ' -f1 > "$tmp/sum"
+chmod 400 "$tmp/sum"
+rm -f -- "$OPGATE_GATE_SUM"
+mv -f -- "$tmp/sum" "$OPGATE_GATE_SUM"
 
 info "built $out"
 info "sha256 $(cut -d' ' -f1 <"$OPGATE_GATE_SUM")"

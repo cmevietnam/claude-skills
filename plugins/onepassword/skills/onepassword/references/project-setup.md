@@ -44,7 +44,13 @@ khác. `--force` bỏ qua các chốt đó.
 
 Biến nó không chắc thì nó hỏi, và câu hỏi chỉ mô tả hình dạng giá trị chứ không in
 giá trị. Không có terminal thì nó dừng thay vì đoán — `--yes` để đưa hết những ca
-mơ hồ vào vault.
+mơ hồ vào vault. Chỉ tên nằm trong allowlist khớp chính xác (`NODE_ENV`, `PORT`,
+`API_URL`…) mới tự động ở lại dạng literal; bạn sẽ được hỏi khá nhiều ở lần đầu.
+
+`import` **từ chối** file mà `op run` cũng từ chối, thay vì đoán: BOM ở đầu, dấu
+nháy không đóng, byte NUL. Nó cũng từ chối giá trị chứa `$VAR` ngoài nháy đơn —
+`op run` sẽ expand nó còn vault thì không, nên import sẽ đổi nghĩa giá trị. Bọc
+trong nháy đơn nếu muốn giữ nguyên chữ `$`.
 
 Xem trước mà không ghi gì: `opgate import api/.env --dry-run`.
 

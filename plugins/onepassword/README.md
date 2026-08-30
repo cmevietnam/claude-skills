@@ -4,10 +4,20 @@ Truy cập secrets của project từ 1Password. Mỗi lần `opgate` đọc ho�
 macOS hiện sheet Touch ID và nói rõ project nào đang xin biến nào để chạy lệnh gì.
 Không approve thì lệnh không chạy.
 
-Nói chính xác: gate bảo vệ **truy cập vault**. `opgate scan` và `opgate import
---dry-run` vẫn đọc file `.env` plaintext trên đĩa mà không hỏi — file đó vốn đã nằm
-đó và ai đọc file cũng đọc được, nên chặn ở đây không thêm gì. Điểm khác biệt là
-chúng không **in** giá trị ra đâu cả.
+Nói chính xác: gate bảo vệ việc **đọc hoặc ghi giá trị secret trong vault**. Những
+thứ không qua gate, cố ý:
+
+- `scan`, `import --dry-run`: đọc file `.env` plaintext trên đĩa. File đó vốn nằm
+  sẵn và `cat` cũng đọc được; chặn ở đây không thêm gì. Chúng không **in** giá trị.
+- `scan`, `items`, `doctor`, và bước kiểm tra trước khi `import`/`put` hỏi vân tay:
+  đọc **metadata** vault (tên item, category, tag) qua `op item list` — không có
+  giá trị field nào trong đó. `import` còn đọc riêng field `opgate_source` (một
+  đường dẫn) để phát hiện hai file trùng tên item. Toàn bộ giá trị secret chỉ được
+  đọc **sau** khi bạn approve.
+
+Ngoài ra `op run` tự resolve mọi biến `op://` đã có sẵn trong môi trường (ví dụ
+`export GITHUB_TOKEN=op://…` trong `.zshrc`). `opgate run`/`exec` liệt kê chúng
+trên sheet dưới nhãn "từ môi trường" để bạn biết chúng cũng được resolve.
 
 **Phạm vi, nói thẳng:** đây là *kiểm soát hợp tác* cộng lớp chống tai nạn, không phải
 sandbox. Nó ràng buộc những ai gọi `opgate`. 1Password ủy quyền cho `op` theo phiên
@@ -63,13 +73,15 @@ opgate audit -n 20            # gần đây đã truy cập gì
 Yêu cầu thêm: `jq` (`brew install jq`) cho `opgate put` và `opgate import`.
 `opgate doctor` kiểm tra.
 
-Ba bộ test chạy được bất cứ lúc nào — không cần vault, không cần mạng, không cần
-vân tay:
+Bốn bộ test, không cần vân tay. Ba bộ đầu không cần vault; `test-parser.sh` có
+thêm phần **đối chiếu trực tiếp với `op run`** — chạy khi 1Password đang mở, tự bỏ
+qua khi khoá:
 
 ```bash
-bash plugins/onepassword/scripts/test-guards.sh    # hai PreToolUse hook
+bash plugins/onepassword/scripts/test-guards.sh    # ba PreToolUse hook
 bash plugins/onepassword/scripts/test-classify.sh  # phân loại secret / config
 bash plugins/onepassword/scripts/test-scan.sh      # quét + đặt tên item
+bash plugins/onepassword/scripts/test-parser.sh    # parser dotenv vs op run
 ```
 
 ## Đưa một project lên vault
@@ -91,11 +103,15 @@ plaintext thứ hai chỉ nới rộng vùng lộ chứ không thêm an toàn. C
 `opgate`), khi hai file khác nhau cùng suy ra một tên item, và khi file `.op` đích
 đang được sinh từ nguồn khác. `--force` bỏ qua các chốt đó.
 
-Biến không bí mật (`NODE_ENV`, `PORT`, `API_URL`) ở lại `.env.op` dạng literal, nên
-file đó vẫn commit được và vault không đầy rác. Biến không phân loại được chắc chắn
-thì `import` hỏi bạn, và câu hỏi chỉ mô tả hình dạng giá trị — `30 ký tự ·
-thường/HOA/ký hiệu` — chứ không in giá trị. Không có terminal thì nó dừng thay vì
-đoán, trừ khi bạn thêm `--yes`.
+Chỉ biến có **tên nằm trong một allowlist khớp chính xác** (`NODE_ENV`, `PORT`,
+`LOG_LEVEL`, `API_URL`…) mới ở lại file `.op` dạng literal. Không có wildcard, và
+không có quy tắc nào xét *giá trị* để hạ một biến xuống literal — ba vòng review
+liên tiếp đã phá ba phiên bản có quy tắc như vậy (`DB_PASS=hunter2` từng thành
+"config", `PUBLIC_PASSCODE` từng khớp `PUBLIC_*`). Mọi biến khác mà không nhận ra
+là secret thì `import` **hỏi bạn**, và câu hỏi chỉ mô tả hình dạng giá trị —
+`30 ký tự · thường/HOA/ký hiệu` — chứ không in giá trị. Không có terminal thì nó
+dừng thay vì đoán, trừ khi bạn thêm `--yes` (đưa hết vào vault). Bạn sẽ được hỏi
+nhiều hơn; đó là cái giá của việc file `.op` thật sự commit được.
 
 `opgate scan` cũng báo secret nằm **trong file cấu hình hoặc source** (AWS key trong
 một `settings.local.json`, JWT trong một file JSON). Nó chỉ báo `file:dòng` và loại
@@ -135,10 +151,15 @@ bị gỡ.
 
 Plugin cài hai `PreToolUse` hook:
 
-- **Bash** — chặn `op read` / `op item get` / `op run` gọi trực tiếp (kể cả qua
-  `bash -c`), và hỏi trước khi `cat`/`grep` một file secret plaintext.
-- **Read** — hỏi trước khi tool Read mở `.env`, `*.pem`, `id_rsa`, `.netrc`… Bỏ qua
-  `.env.example`, `.env.op`, `*.pub`.
+- **Bash** — chặn `op read` / `op item get` / `op run` / `--reveal` / `--raw` /
+  `op item share` / `op service-account create` / `op connect token create` gọi
+  trực tiếp (kể cả qua `bash -c`), và hỏi trước khi `cat`/`grep`/`sort`/`diff`/
+  `cp`/`source` một file secret plaintext.
+- **Read** — hỏi trước khi tool Read mở `.env`, `.envrc`, `*.pem`, `id_rsa`,
+  `.netrc`, `.git-credentials`… Bỏ qua `.env.example`, `.env.op`, `*.pub`.
+- **Grep** — hỏi khi Grep trỏ thẳng vào một file secret. Grep cả thư mục thì
+  **không** bị hỏi (quá ồn), và nó vẫn đọc được `.env` bên trong — xem
+  `security-model.md`.
 
 Hook là lớp **chống tai nạn**, không phải sandbox. Lớp bảo vệ thật là Touch ID gate.
 Chi tiết: `skills/onepassword/references/security-model.md`.

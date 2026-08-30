@@ -19,10 +19,20 @@ hỏi một broker mà agent không cấu hình lại, thay thế hay đi vòng 
 Vậy nên phát biểu đúng là: **mỗi lần `opgate` đọc hoặc ghi vault đều cần Touch ID
 của bạn.** Không phải "mọi truy cập secret trên máy này đều cần Touch ID".
 
-Hai lệnh cố ý không qua gate: `opgate scan` và `opgate import --dry-run` đọc file
-`.env` plaintext trên đĩa. Gate chúng lại không thêm gì — file đó đã nằm sẵn ở đó và
-`cat` cũng đọc được. Điều quan trọng là chúng không in giá trị ra đâu cả; `import`
-chỉ hỏi Touch ID ở bước thật sự ghi vào vault.
+Những gì cố ý không qua gate, và tại sao:
+
+- `scan`, `import --dry-run` đọc file `.env` plaintext trên đĩa. File đó nằm sẵn và
+  `cat` cũng đọc được; gate không thêm gì. Chúng không in giá trị.
+- `scan`, `items`, `doctor` đọc **metadata** vault (tên item, category, tag) qua
+  `op item list`. Không có giá trị field nào trong đó.
+- `import` và `put`, **trước** khi hỏi vân tay, cũng đọc metadata để từ chối sớm
+  (item không thuộc opgate, hai file trùng tên item). `import` đọc thêm đúng một
+  field `opgate_source` — một đường dẫn. Lý do: từ chối *sau* khi bạn đã chạm vân
+  tay là phí đúng thứ thiết kế này tiêu dè sẻn nhất. Toàn bộ giá trị secret của
+  item chỉ được đọc **sau** approve.
+
+Một reviewer đã chỉ ra đúng rằng phiên bản trước đọc **toàn bộ** item — mọi giá trị
+concealed — vào biến shell trước khi bạn kịp nói không. Giờ thì không.
 
 ## Hai vấn đề đang được giải
 
@@ -76,6 +86,19 @@ Liệt kê ở đây thay vì để bạn tự phát hiện sau.
   Không phải khiếm khuyết của `opgate`, nhưng bạn nên biết.
 - **Giá trị literal trong `.env.op`** không phải secret do 1Password phân giải, nên
   `op run` không che chúng. `opgate list`, `run` và `doctor` đều cảnh báo.
+- **Biến `op://` sẵn có trong môi trường** (`export X=op://…` trong shell profile)
+  được `op run` resolve trong *mọi* lần chạy. `run`/`exec` liệt kê chúng trên sheet
+  nhưng không chặn — chúng là của bạn.
+- **Masking của `op run` so khớp chuỗi chính xác.** `env | base64` trong lệnh con
+  đưa secret ra ngoài ở dạng mã hoá mà masking không nhận ra. Đây là giới hạn của
+  1Password, và là lý do "hãy đọc lệnh trên sheet" không phải lời khuyên suông.
+- **Tool Grep chạy trên cả thư mục** đọc được `.env` bên trong mà không bị hook
+  hỏi. Hook Grep chỉ bắt khi Grep trỏ thẳng vào file secret; hỏi trên mọi Grep
+  thư mục sẽ quá ồn để ai còn đọc.
+
+**Tokenizer của hook** khớp theo token, không hiểu ngữ cảnh: `git commit -m
+"docs: op read"` sẽ bị chặn nhầm vì hai token đứng cạnh nhau. Cửa sổ là 6 token sau
+`op`, nên prose nhắc tới `op` và `read` xa nhau thì qua. Chấp nhận.
 
 **Đã vá, nhưng chỉ là gờ giảm tốc:**
 

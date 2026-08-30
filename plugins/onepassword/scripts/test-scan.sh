@@ -85,5 +85,32 @@ mkdir -p "$tmp/p/api"
 got=$(find_env_files "$tmp/p" | wc -l | tr -d ' ')
 eq "chỉ file env thật" "$got" "2"
 
+echo "VÒNG 3: GREP_OPTIONS=-h không được làm lộ nội dung"
+secret='ghp_yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy'
+printf 'tok=%s\n' "$secret" > "$tmp/g.json"
+out=$(GREP_OPTIONS=-h bash -c 'set -euo pipefail; source "'"$dir"'/lib/scan.sh"; printf "%s\n" "'"$tmp"'/g.json" | scan_embedded_list')
+case "$out" in
+  *"$secret"*) bad_ "GREP_OPTIONS=-h làm lộ giá trị: $(printf '%s' "$out" | cut -c1-40)…" ;;
+  *) ok_ "GREP_OPTIONS=-h: output vẫn chỉ file/dòng/nhãn" ;;
+esac
+out=$(GREP_OPTIONS=-h bash -c 'source "'"$dir"'/lib/scan.sh"; printf "%s\n" "'"$tmp"'/g.json" | scan_embedded_list | cut -f2')
+eq "trường 2 là số dòng, không phải nội dung" "$out" "1"
+
+echo "VÒNG 3: giảm nhiễu — đọc từ env / template / op:// không bị báo"
+for line in 'const token = req.headers.authorization' 'secret = process.env.JWT_SECRET_VALUE' 'password: ${POSTGRES_PASSWORD_FROM_ENV}' 'secret: op://Dev/app/DB_SECRET' 'api_key = os.environ.get("API_KEY_FROM_ENV")'; do
+  printf '%s\n' "$line" > "$tmp/noise"
+  got=$(set -euo pipefail; scan_embedded "$tmp/noise" | wc -l | tr -d ' ')
+  eq "bỏ qua: $(printf '%s' "$line" | cut -c1-40)" "$got" "0"
+done
+printf 'api_key = "aaaaaaaaaaaaaaaaaaaaaaaa"\n' > "$tmp/real"
+got=$(set -euo pipefail; scan_embedded "$tmp/real" | wc -l | tr -d ' ')
+eq "nhưng gán thật vẫn bị báo" "$got" "1"
+
+echo "VÒNG 3: tên file có newline không làm hỏng danh sách"
+mkdir -p "$tmp/nl"; printf 'x=1\n' > "$tmp/nl/a.json"
+printf 'tok=ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' > "$tmp/nl/$(printf 'b\nc').json" 2>/dev/null || true
+got=$(find_config_files "$tmp/nl" | wc -l | tr -d ' ')
+eq "file có newline bị bỏ, file thường còn" "$got" "1"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
