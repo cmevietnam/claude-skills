@@ -1,0 +1,10 @@
+{
+  "name": "onepassword",
+  "description": "Truy cập secrets từ 1Password với Touch ID gate mỗi lần dùng, và giữ giá trị secret không lọt vào transcript của model.",
+  "version": "0.1.0",
+  "author": { "name": "hieuvo" },
+  "homepage": "https://github.com/hieuvo/claude-skills",
+  "repository": "https://github.com/hieuvo/claude-skills",
+  "license": "MIT",
+  "keywords": ["1password", "secrets", "security", "touchid", "env"]
+}

@@ -1,0 +1,5 @@
+.DS_Store
+# Không bao giờ commit secret đã render
+.env
+.env.local
+*.env.local

@@ -1,0 +1,27 @@
+{
+  "description": "Giữ giá trị secret không lọt vào transcript: chặn gọi `op` trực tiếp, hỏi trước khi đọc file secret plaintext.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/guard-bash.sh",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/guard-read.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

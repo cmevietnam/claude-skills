@@ -1,0 +1,379 @@
+#!/usr/bin/env bash
+# opgate — reach 1Password secrets from an agent session, one Touch ID at a time.
+#
+# Design rule, and the reason this wrapper exists at all: a secret value must never
+# reach the agent's stdout. Anything printed there lands in the conversation
+# transcript and is shipped to a model provider, which defeats the point of keeping
+# the secret in a vault. So secrets only ever travel to
+#   * the environment of a child process   (run, exec)
+#   * the macOS clipboard                  (copy)
+#   * a git-ignored file                   (inject)
+# There is deliberately no `opgate read`.
+set -euo pipefail
+
+OPGATE_BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+OPGATE_SCRIPT_DIR=$(cd -- "$OPGATE_BIN_DIR/../scripts" && pwd)
+# shellcheck source=../scripts/lib/common.sh
+source "$OPGATE_SCRIPT_DIR/lib/common.sh"
+# shellcheck source=../scripts/lib/gate.sh
+source "$OPGATE_SCRIPT_DIR/lib/gate.sh"
+
+usage() {
+  cat >&2 <<'USAGE'
+opgate — Touch ID-gated access to 1Password secrets
+
+  opgate run    [-f FILE] -- CMD...     chạy CMD với secrets nạp vào env (mask sẵn)
+  opgate exec   REF|VAR=REF -- CMD...   nạp đúng một secret cho một lệnh
+  opgate inject -i TPL -o OUT           render template ra file (bắt buộc gitignored)
+  opgate copy   REF [--seconds N]       secret -> clipboard, tự xoá sau N giây (mặc định 90)
+  opgate put    ITEM FIELD              ghi một secret VÀO 1Password (đọc từ stdin)
+
+  opgate list   [-f FILE]               liệt kê tên biến + ref (không bao giờ in giá trị)
+  opgate doctor [--test-gate]           kiểm tra toàn bộ setup
+  opgate audit  [-n N]                  xem nhật ký truy cập
+  opgate build                          build lại binary Touch ID gate
+
+Không có `opgate read` — cố ý. Xem references/security-model.md.
+
+Env: OPGATE_VAULT (Dev) · OPGATE_TTL (0 = hỏi mỗi lần) · OPGATE_GATE (touchid|sudo|none)
+     OPGATE_ENV_FILE (.env.op)
+USAGE
+}
+
+# A short, readable rendering of the command for the Touch ID sheet.
+cmd_summary() {
+  local s="$*"
+  (( ${#s} > 70 )) && s="${s:0:67}…"
+  printf '%s' "$s"
+}
+
+require_op() {
+  command -v op >/dev/null 2>&1 \
+    || die "1Password CLI chưa có. Cài: brew install --cask 1password-cli"
+}
+
+# --- subcommands ------------------------------------------------------------
+
+cmd_list() {
+  local file=""
+  while (( $# )); do
+    case "$1" in
+      -f|--env-file) file="${2:?-f cần đường dẫn}"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "opgate list: tham số lạ '$1'" ;;
+    esac
+  done
+  file=$(resolve_env_file "$file")
+
+  printf '%s\n' "$file"
+  local n=0 name value
+  # Only op:// references are safe to print. A literal value is, by definition, the
+  # thing we are trying to keep out of the transcript — show that it exists, not what
+  # it is.
+  while IFS=$'\t' read -r name value; do
+    [[ -n "$name" ]] || continue
+    if [[ "$value" == op://* ]]; then
+      printf '  %s = %s\n' "$name" "$value"
+    else
+      printf '  %s = <giá trị literal, không in>\n' "$name"
+    fi
+    n=$((n + 1))
+  done < <(sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' -- "$file" \
+            | sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)=[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\2\t\3/p')
+
+  local literals; literals=$(env_file_literals "$file" || true)
+  if [[ -n "$literals" ]]; then
+    warn "các biến sau chứa giá trị literal chứ không phải op:// ref — đó là secret plaintext trong file lẽ ra commit được:"
+    printf '        %s\n' $literals >&2
+  fi
+  (( n > 0 )) || warn "không có biến nào trong $file"
+}
+
+cmd_run() {
+  require_op
+  local file=""; local -a CMD=()
+  while (( $# )); do
+    case "$1" in
+      -f|--env-file) [[ $# -ge 2 ]] || die "opgate run: -f cần một đường dẫn"
+                     file="$2"; shift 2 ;;
+      -h|--help)     usage; exit 0 ;;
+      --)            shift; CMD=("$@"); break ;;
+      -*)            die "opgate run: tham số lạ '$1' (cú pháp: opgate run [-f FILE] -- CMD...)" ;;
+      *)             CMD=("$@"); break ;;
+    esac
+  done
+  (( ${#CMD[@]} )) || die "opgate run: thiếu lệnh cần chạy — ví dụ: opgate run -- npm run dev"
+  file=$(resolve_env_file "$file")
+
+  local -a vars=(); local v
+  while IFS= read -r v; do [[ -n "$v" ]] && vars+=("$v"); done < <(env_file_vars "$file")
+  (( ${#vars[@]} )) || die "$file không khai báo biến nào"
+
+  gate_require "run" "$(IFS=,; printf '%s' "${vars[*]}")" \
+    "$(project_name) → chạy \"$(cmd_summary "${CMD[@]}")\" với $(summarize_list "${vars[@]}")"
+
+  # 1Password masks these values in the child's stdout/stderr by default. Never
+  # pass --no-masking here.
+  exec op run --env-file="$file" -- "${CMD[@]}"
+}
+
+cmd_exec() {
+  require_op
+  local spec=""; local -a CMD=()
+  while (( $# )); do
+    case "$1" in
+      -h|--help) usage; exit 0 ;;
+      --)        shift; CMD=("$@"); break ;;
+      *)         if [[ -z "$spec" ]]; then spec="$1"; shift
+                 else CMD=("$@"); break; fi ;;
+    esac
+  done
+  [[ -n "$spec" ]] || die "opgate exec: thiếu secret reference — ví dụ: opgate exec DB=op://Dev/app/DB -- psql"
+  (( ${#CMD[@]} )) || die "opgate exec: thiếu lệnh cần chạy"
+
+  local name ref
+  if [[ "$spec" == *=op://* ]]; then
+    name="${spec%%=*}"; ref="${spec#*=}"
+  elif [[ "$spec" == op://* ]]; then
+    ref="$spec"; name="${ref##*/}"
+    [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+      || die "không suy ra được tên biến từ '$ref' — dùng dạng VAR=op://..."
+  else
+    die "opgate exec: '$spec' không phải secret reference (mong đợi op://... hoặc VAR=op://...)"
+  fi
+
+  gate_require "exec" "$name" \
+    "$(project_name) → chạy \"$(cmd_summary "${CMD[@]}")\" với $name"
+
+  export "$name=$ref"
+  exec op run -- "${CMD[@]}"
+}
+
+cmd_inject() {
+  require_op
+  local tpl="" out="" force=0
+  while (( $# )); do
+    case "$1" in
+      -i|--in-file)  tpl="${2:?-i cần đường dẫn}"; shift 2 ;;
+      -o|--out-file) out="${2:?-o cần đường dẫn}"; shift 2 ;;
+      --force) force=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "opgate inject: tham số lạ '$1'" ;;
+    esac
+  done
+  [[ -n "$tpl" && -n "$out" ]] || die "opgate inject cần cả -i TEMPLATE và -o OUTPUT"
+  [[ -f "$tpl" ]] || die "không có template: $tpl"
+
+  # Rendering secrets to disk is the one operation here that leaves plaintext
+  # behind, so refuse unless git is already set up to ignore the result.
+  if ! git check-ignore -q -- "$out" 2>/dev/null; then
+    if (( force )); then
+      warn "$out KHÔNG được git ignore — đang ghi vì có --force. Đừng commit file này."
+    else
+      die "$out chưa được git ignore. Thêm nó vào .gitignore trước, hoặc dùng --force nếu bạn chắc.
+       Cân nhắc \`opgate run\` thay thế — nó không ghi secret xuống đĩa."
+    fi
+  fi
+
+  local -a vars=(); local v
+  while IFS= read -r v; do [[ -n "$v" ]] && vars+=("$v"); done < <(env_file_vars "$tpl")
+
+  gate_require "inject" "$(IFS=,; printf '%s' "${vars[*]}")" \
+    "$(project_name) → ghi secret ra file $(basename -- "$out"): $(summarize_list "${vars[@]}")"
+
+  ( umask 077; op inject -i "$tpl" -o "$out" -f )
+  chmod 600 "$out" 2>/dev/null || true
+  info "đã ghi $out (chmod 600) — xoá khi dùng xong"
+}
+
+cmd_copy() {
+  require_op
+  command -v pbcopy >/dev/null 2>&1 || die "opgate copy cần pbcopy (macOS)"
+  local ref="" seconds=90
+  while (( $# )); do
+    case "$1" in
+      --seconds) seconds="${2:?--seconds cần số}"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      op://*) ref="$1"; shift ;;
+      *) die "opgate copy: tham số lạ '$1'" ;;
+    esac
+  done
+  [[ -n "$ref" ]] || die "opgate copy cần một secret reference op://..."
+
+  gate_require "copy" "$ref" \
+    "$(project_name) → chép ${ref##*/} vào clipboard trong ${seconds}s"
+
+  op read --no-newline "$ref" | pbcopy
+  info "đã chép ${ref##*/} vào clipboard; sẽ tự xoá sau ${seconds}s"
+
+  # Clear only if the clipboard still holds what we put there, so we never wipe
+  # something the user copied in the meantime.
+  ( sleep "$seconds"
+    if [[ "$(pbpaste 2>/dev/null | /usr/bin/shasum -a 256)" == "$(op read --no-newline "$ref" 2>/dev/null | /usr/bin/shasum -a 256)" ]]; then
+      printf '' | pbcopy
+    fi ) >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
+cmd_put() {
+  require_op
+  local item="${1:-}" field="${2:-}"
+  [[ -n "$item" && -n "$field" ]] || die "cú pháp: opgate put <ITEM> <FIELD>  (giá trị đọc từ stdin)"
+
+  local value
+  if [[ -t 0 ]]; then
+    printf 'Giá trị cho %s/%s (ẩn): ' "$item" "$field" >&2
+    IFS= read -rs value; printf '\n' >&2
+  else
+    IFS= read -r value || true
+  fi
+  [[ -n "$value" ]] || die "giá trị rỗng, không ghi gì"
+
+  gate_require "put" "$item/$field" \
+    "$(project_name) → lưu $field vào item \"$item\" trong vault $OPGATE_VAULT"
+
+  # The value goes in over stdin or through a 0600 file in a private directory —
+  # never as a command argument, which `op` itself warns is visible to other
+  # processes and shell history.
+  local tmp; tmp=$(mktemp -d "${TMPDIR:-/tmp}/opgate-put.XXXXXX")
+  chmod 700 "$tmp"
+  trap 'rm -rf -- "$tmp"' RETURN
+
+  # `op` reads a piped stdin as a template, and ours is still the pipe the value
+  # arrived on — so every `op` call below gets stdin detached explicitly.
+  if op item get "$item" --vault "$OPGATE_VAULT" --format json >"$tmp/item.json" 2>/dev/null </dev/null; then
+    jq --arg f "$field" --arg v "$value" '
+      .fields = ((.fields // []) | map(select(.label != $f)))
+              + [{ id: $f, type: "CONCEALED", label: $f, value: $v }]
+    ' "$tmp/item.json" >"$tmp/new.json"
+    op item edit "$item" --vault "$OPGATE_VAULT" --template "$tmp/new.json" </dev/null >/dev/null
+    info "đã cập nhật $field trên item \"$item\""
+  else
+    # Fields must be top level (no section) so the reference stays
+    # op://<vault>/<item>/<VAR>. notesPlain is part of the stock Secure Note
+    # template; omitting it makes `op` reject the template.
+    jq -n --arg t "$item" --arg f "$field" --arg v "$value" '
+      { title: $t, category: "SECURE_NOTE",
+        fields: [ { id: "notesPlain", type: "STRING", purpose: "NOTES", label: "notesPlain", value: "" },
+                  { id: $f, type: "CONCEALED", label: $f, value: $v } ] }
+    ' >"$tmp/new.json"
+    op item create --vault "$OPGATE_VAULT" --template "$tmp/new.json" </dev/null >/dev/null
+    info "đã tạo item \"$item\" với field $field"
+  fi
+  info "reference: op://$OPGATE_VAULT/$item/$field"
+}
+
+cmd_audit() {
+  local n=20
+  while (( $# )); do
+    case "$1" in
+      -n) n="${2:?-n cần số}"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "opgate audit: tham số lạ '$1'" ;;
+    esac
+  done
+  [[ -f "$OPGATE_AUDIT_LOG" ]] || { info "chưa có nhật ký ($OPGATE_AUDIT_LOG)"; return 0; }
+  printf 'TIME\tSTATUS\tCALLER\tPROJECT\tACTION\tDETAIL\n'
+  tail -n "$n" -- "$OPGATE_AUDIT_LOG"
+}
+
+cmd_doctor() {
+  local test_gate=0 fail=0
+  while (( $# )); do
+    case "$1" in
+      --test-gate) test_gate=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "opgate doctor: tham số lạ '$1'" ;;
+    esac
+  done
+
+  info "kiểm tra setup"
+
+  if command -v op >/dev/null 2>&1; then
+    ok "1Password CLI $(op --version 2>/dev/null)"
+  else
+    bad "chưa có 1Password CLI → brew install --cask 1password-cli"; fail=1
+  fi
+
+  if command -v op >/dev/null 2>&1; then
+    if op vault list --format json >/dev/null 2>&1; then
+      ok "op ủy quyền được (desktop app integration)"
+      if op vault get "$OPGATE_VAULT" --format json >/dev/null 2>&1; then
+        ok "vault \"$OPGATE_VAULT\" tồn tại"
+      else
+        bad "chưa có vault \"$OPGATE_VAULT\" → op vault create $OPGATE_VAULT"; fail=1
+      fi
+    else
+      bad "op không ủy quyền được → mở 1Password, Settings ▸ Developer ▸ Integrate with 1Password CLI, rồi unlock app"; fail=1
+    fi
+  fi
+
+  if [[ "$OPGATE_GATE" == "none" ]]; then
+    bad "OPGATE_GATE=none — approval đang TẮT, mọi truy cập secret không được bảo vệ"; fail=1
+  elif [[ "$OPGATE_GATE" == "sudo" ]]; then
+    ok "gate = sudo (fallback pam_tid)"
+  elif [[ -x "$OPGATE_GATE_BIN" ]]; then
+    ok "gate binary: $OPGATE_GATE_BIN"
+  else
+    bad "chưa build gate binary → opgate build"; fail=1
+  fi
+
+  if (( OPGATE_TTL > 0 )); then
+    warn "OPGATE_TTL=$OPGATE_TTL — approval được tái dùng trong ${OPGATE_TTL}s; đặt 0 để hỏi mỗi lần"
+  else
+    ok "OPGATE_TTL=0 — hỏi mỗi lần truy cập"
+  fi
+
+  local file=""
+  if file=$(resolve_env_file "" 2>/dev/null); then
+    local count; count=$(env_file_vars "$file" | grep -c . || true)
+    ok "$file — $count biến"
+    local literals; literals=$(env_file_literals "$file" || true)
+    if [[ -n "$literals" ]]; then
+      bad "giá trị literal (không phải op:// ref) trong $file: $(printf '%s ' $literals)"; fail=1
+    fi
+  else
+    warn "project này chưa có $OPGATE_ENV_FILE_DEFAULT (xem references/project-setup.md)"
+  fi
+
+  local root; root=$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' "$PWD")
+  local -a plaintext=()
+  local f
+  for f in "$root"/.env "$root"/.env.local "$root"/*/.env; do
+    [[ -f "$f" ]] && plaintext+=("${f#"$root"/}")
+  done
+  if (( ${#plaintext[@]} )); then
+    warn "còn .env plaintext trong repo: $(printf '%s ' "${plaintext[@]}")"
+  fi
+
+  if (( test_gate )); then
+    info "đang thử prompt xác thực — chạm vân tay để xác nhận…"
+    if gate_require "doctor" "self-test" "$(project_name) → opgate doctor self-test"; then
+      ok "prompt xác thực hoạt động"
+    fi
+  fi
+
+  if (( fail )); then
+    printf '\n' >&2; warn "có mục chưa đạt (xem ✘ ở trên)"; return 1
+  fi
+  printf '\n' >&2; info "tất cả ổn"
+}
+
+# --- dispatch ---------------------------------------------------------------
+
+sub="${1:-help}"; shift || true
+case "$sub" in
+  run)    cmd_run    "$@" ;;
+  exec)   cmd_exec   "$@" ;;
+  inject) cmd_inject "$@" ;;
+  copy)   cmd_copy   "$@" ;;
+  put)    cmd_put    "$@" ;;
+  list)   cmd_list   "$@" ;;
+  audit)  cmd_audit  "$@" ;;
+  doctor) cmd_doctor "$@" ;;
+  build)  bash "$OPGATE_SCRIPT_DIR/build-gate.sh" ;;
+  read)   die "opgate không có lệnh \`read\` — cố ý. In secret ra stdout sẽ đưa nó vào transcript của model.
+       Dùng \`opgate run -- <cmd>\` (nạp vào env), \`opgate copy <ref>\` (clipboard), hoặc \`opgate inject\` (file gitignored)." ;;
+  help|-h|--help) usage ;;
+  *) printf 'opgate: không rõ lệnh "%s"\n\n' "$sub" >&2; usage; exit 64 ;;
+esac
