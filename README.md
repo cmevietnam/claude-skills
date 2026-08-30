@@ -22,6 +22,7 @@ claude --plugin-dir ./plugins/onepassword
 | Plugin | Làm gì |
 |---|---|
 | [`onepassword`](plugins/onepassword) | Truy cập secrets từ 1Password với Touch ID gate mỗi lần dùng, và giữ giá trị secret không lọt vào transcript của model. |
+| [`linode`](plugins/linode) | Làm việc với Linode trong ranh giới tag của project: resource tạo ra luôn mang tag project, và mọi thao tác ghi lên resource của project khác đều bị chặn. |
 
 ## Thêm một skill mới
 

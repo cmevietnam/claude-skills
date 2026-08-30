@@ -1,0 +1,29 @@
+{
+  "description": "Giữ mọi thao tác Linode trong ranh giới tag của project: chặn lệnh ghi lên resource không thuộc project, và ghi sổ sở hữu cho loại resource không gắn tag được.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/guard-linode.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/record-owned.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
