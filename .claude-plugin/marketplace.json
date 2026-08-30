@@ -15,7 +15,7 @@
       "source": "./plugins/onepassword",
       "displayName": "1Password (Touch ID-gated)",
       "description": "Truy cập secrets từ 1Password với Touch ID gate mỗi lần dùng, và giữ giá trị secret không lọt vào transcript của model.",
-      "version": "0.2.0",
+      "version": "0.5.0",
       "author": {
         "name": "hieuvo"
       },
@@ -47,6 +47,25 @@
         "infrastructure",
         "tags",
         "guardrails"
+      ]
+    },
+    {
+      "name": "review",
+      "source": "./plugins/review",
+      "displayName": "Review đối kháng",
+      "description": "Quy trình review bằng nhiều model Claude độc lập, tái hiện từng finding trước khi tin, biến input tấn công thành test. Kèm script chẩn đoán sub-agent im lặng hay treo.",
+      "version": "0.1.0",
+      "author": {
+        "name": "hieuvo"
+      },
+      "license": "MIT",
+      "category": "development",
+      "keywords": [
+        "review",
+        "adversarial",
+        "subagent",
+        "testing",
+        "verification"
       ]
     }
   ]

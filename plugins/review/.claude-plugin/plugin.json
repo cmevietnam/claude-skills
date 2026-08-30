@@ -1,0 +1,10 @@
+{
+  "name": "review",
+  "description": "Quy trình review đối kháng bằng nhiều model Claude độc lập: chạy reviewer, tái hiện từng finding trước khi tin, biến input tấn công thành test. Kèm script chẩn đoán sub-agent im lặng hay treo thật.",
+  "version": "0.1.0",
+  "author": { "name": "hieuvo" },
+  "homepage": "https://github.com/hieuvo/claude-skills",
+  "repository": "https://github.com/hieuvo/claude-skills",
+  "license": "MIT",
+  "keywords": ["review", "adversarial", "subagent", "testing", "verification"]
+}
