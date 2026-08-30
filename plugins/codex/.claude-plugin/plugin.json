@@ -1,0 +1,10 @@
+{
+  "name": "codex",
+  "description": "Run OpenAI's Codex CLI non-interactively as a second opinion, and report every finding it returns to the user verbatim before touching any code.",
+  "version": "0.1.0",
+  "author": { "name": "hieuvo" },
+  "homepage": "https://github.com/hieuvo/claude-skills",
+  "repository": "https://github.com/hieuvo/claude-skills",
+  "license": "MIT",
+  "keywords": ["codex", "openai", "review", "second-opinion", "cli"]
+}

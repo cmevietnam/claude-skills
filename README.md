@@ -24,6 +24,7 @@ claude --plugin-dir ./plugins/onepassword
 | [`onepassword`](plugins/onepassword) | Truy cập secrets từ 1Password với Touch ID gate mỗi lần dùng, và giữ giá trị secret không lọt vào transcript của model. |
 | [`linode`](plugins/linode) | Work with Linode inside the project's tag boundary: resources are created with the project tag, and writes to another project's resources are refused. |
 | [`review`](plugins/review) | Quy trình review đối kháng bằng nhiều model Claude độc lập, và script chẩn đoán sub-agent im lặng hay treo thật. |
+| [`codex`](plugins/codex) | Run OpenAI's Codex CLI as a second opinion, and require every finding to reach the user verbatim before any code is changed. |
 
 ## Thêm một skill mới
 
