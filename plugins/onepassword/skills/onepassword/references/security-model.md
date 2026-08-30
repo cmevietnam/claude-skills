@@ -16,8 +16,13 @@ gọi thẳng `/opt/homebrew/bin/op` và bỏ qua toàn bộ công cụ này. É
 hỏi một broker mà agent không cấu hình lại, thay thế hay đi vòng được, và môi trường
 đó phải chặn agent thấy `op` — đó là một kiến trúc khác, không phải một bản vá.
 
-Vậy nên phát biểu đúng là: **mỗi lần `opgate` chạm vào secret đều cần Touch ID của
-bạn.** Không phải "mọi truy cập secret trên máy này đều cần Touch ID".
+Vậy nên phát biểu đúng là: **mỗi lần `opgate` đọc hoặc ghi vault đều cần Touch ID
+của bạn.** Không phải "mọi truy cập secret trên máy này đều cần Touch ID".
+
+Hai lệnh cố ý không qua gate: `opgate scan` và `opgate import --dry-run` đọc file
+`.env` plaintext trên đĩa. Gate chúng lại không thêm gì — file đó đã nằm sẵn ở đó và
+`cat` cũng đọc được. Điều quan trọng là chúng không in giá trị ra đâu cả; `import`
+chỉ hỏi Touch ID ở bước thật sự ghi vào vault.
 
 ## Hai vấn đề đang được giải
 

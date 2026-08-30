@@ -22,7 +22,7 @@ trap 'rm -rf -- "$tmp"' EXIT
 echo "bảng pattern"
 n=0
 while IFS=$'\t' read -r l f pat; do [[ -n "$l" && -n "$pat" ]] && n=$((n + 1)); done < <(scan_patterns)
-eq "parse được đủ pattern" "$n" "11"
+eq "parse được đủ pattern" "$n" "15"
 
 echo "mỗi pattern phải bắt được fixture của nó"
 # Invented credentials, shaped like the real thing. None of these are valid.
@@ -35,12 +35,27 @@ fixture 'GitHub token'      'tok=ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 fixture 'GitLab PAT'        'glpat-aaaaaaaaaaaaaaaaaaaa'
 fixture 'Slack token'       'xoxb-1111111111-abcdefghij'
 fixture 'Slack webhook'     'https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX'
-fixture 'Stripe key'        'sk_live_aaaaaaaaaaaaaaaaaaaaaaaa'
+fixture 'Stripe secret key' 'sk_live_aaaaaaaaaaaaaaaaaaaaaaaa'
 fixture 'OpenAI-style key'  'sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 fixture 'JWT'               'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig'
 fixture 'private key block' '-----BEGIN RSA PRIVATE KEY-----'
 fixture 'URL with password' 'db: postgres://user:hunter2@host/db'
 fixture 'assigned secret'   '{"AWS_SECRET_ACCESS_KEY":"wJalrXUtnFEMIabcdEXAMPLEKEY"}'
+fixture 'GitHub fine-grained' 'github_pat_11ABCDEFG0aaaaaaaaaaaaaaaaaaaa'
+fixture 'npm token'         '//registry.npmjs.org/:_authToken=npm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+fixture 'Discord webhook'   'https://discord.com/api/webhooks/123456789012345678/aB3dE5gH7jK9lM1nO3pQ5rS7tU9vW1xY'
+fixture 'AWS access key id' 'ASIAIOSFODNN7EXAMPLE'
+fixture 'assigned secret'   'api_key: aaaaaaaaaaaaaaaaaaaaaa'
+
+echo "giảm nhiễu: khoá publishable KHÔNG bị báo"
+printf 'k = pk_live_aaaaaaaaaaaaaaaaaaaaaaaa\n' > "$tmp/pk"
+got=$(set -euo pipefail; scan_embedded "$tmp/pk" | cut -f2 | sort -u | tr '\n' ',')
+case "$got" in *Stripe*) bad_ "pk_live bị báo nhầm là Stripe key" ;; *) ok_ "pk_live bỏ qua" ;; esac
+
+echo "quét được YAML (trước đây -name '*.ya?ml' không khớp gì)"
+mkdir -p "$tmp/y"; : > "$tmp/y/a.yaml"; : > "$tmp/y/b.yml"; : > "$tmp/y/c.py"; : > "$tmp/y/d.min.js"
+got=$(find_config_files "$tmp/y" | wc -l | tr -d ' ')
+eq "yaml + yml + py, bỏ .min.js" "$got" "3"
 
 echo "nhiều pattern trên cùng một file đều phải được báo"
 printf 'a=ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nb=AKIAIOSFODNN7EXAMPLE\n' > "$tmp/multi"

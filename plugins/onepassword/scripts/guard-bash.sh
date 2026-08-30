@@ -70,27 +70,34 @@ decide() {
 # that matter.
 tokens=()
 while IFS= read -r tok; do
+  # Drop backslashes left over from shell quoting: open(\".env\") otherwise
+  # yields the token `.env\`, which matches nothing.
+  tok="${tok//\\/}"
   [[ -n "$tok" ]] && tokens+=("$tok")
   # The trailing newline matters: without it `read` discards the final token, which
   # is almost always the filename — `cat .env` would then look like just `cat`.
-done < <(printf '%s\n' "$command_line" | tr ' \t\n"'"'"'`;|&()<>{}' '\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n')
+done < <(printf '%s\n' "$command_line" | tr ' \t\n"'"'"'`;|&()<>{}=,' '\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n')
 
 base_of() { printf '%s' "${1##*/}"; }
 
 # --- 1. direct `op` calls that can surface a secret value -------------------
 # Find an `op` invocation (bare or by path), then look at what follows it. Listing
 # metadata is fine; anything that resolves a secret is not.
-saw_op=0 danger=0 prev=""
+saw_op=0 danger=0 saw_noun=0
 for t in ${tokens[@]+"${tokens[@]}"}; do
   b=$(base_of "$t")
   if (( saw_op )); then
     case "$b" in
       read|inject|run) danger=1; break ;;
-      get) [[ "$prev" == "item" || "$prev" == "document" ]] && { danger=1; break; } ;;
+      # `--reveal` prints concealed values whatever the subcommand is.
+      --reveal)        danger=1; break ;;
+      item|document)   saw_noun=1 ;;
+      # `op item --format json get app` puts flags between the noun and the verb,
+      # so requiring them to be adjacent missed a command that prints secrets.
+      get)             (( saw_noun )) && { danger=1; break; } ;;
     esac
-    prev="$b"
   fi
-  [[ "$b" == "op" ]] && { saw_op=1; prev=""; }
+  [[ "$b" == "op" ]] && { saw_op=1; saw_noun=0; }
 done
 
 if (( danger )); then
@@ -98,9 +105,9 @@ if (( danger )); then
 fi
 
 # --- 2. shell-reading a plaintext secret file -------------------------------
-readers_re='^(cat|bat|head|tail|less|more|strings|xxd|od|nl|grep|egrep|fgrep|rg|ag|awk|sed|printenv)$'
+readers_re='^(cat|bat|head|tail|less|more|strings|xxd|od|nl|dd|base64|cut|paste|tr|grep|egrep|fgrep|rg|ag|awk|sed|printenv|python|python3|perl|ruby|node|deno|bun|php)$'
 # `.env`, `.env.production`, `.env.production.local`, and the `.env*` glob form.
-secret_re='^(\.env(\.[A-Za-z0-9_-]+)*\*?|\.netrc|\.pgpass|\.npmrc|credentials(\.json)?|id_rsa[^/]*|id_ed25519[^/]*|id_ecdsa[^/]*|[^/]*\.(pem|p12|pfx|jks|key))$'
+secret_re='^(\.env[A-Za-z0-9_.*-]*|\.netrc|\.pgpass|\.npmrc|credentials(\.json)?|id_rsa[^/]*|id_ed25519[^/]*|id_ecdsa[^/]*|[^/]*\.(pem|p12|pfx|jks|key))$'
 safe_re='\.(example|sample|tpl|template|op|pub|md|lock|ts|js|json5)$'
 
 saw_reader=0 saw_secret=0

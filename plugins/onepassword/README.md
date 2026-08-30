@@ -1,8 +1,13 @@
 # onepassword
 
-Truy cập secrets của project từ 1Password. Mỗi lần `opgate` chạm vào một secret,
-macOS hiện sheet Touch ID và **nói rõ project nào đang xin biến nào để chạy lệnh gì**.
+Truy cập secrets của project từ 1Password. Mỗi lần `opgate` đọc hoặc ghi **vault**,
+macOS hiện sheet Touch ID và nói rõ project nào đang xin biến nào để chạy lệnh gì.
 Không approve thì lệnh không chạy.
+
+Nói chính xác: gate bảo vệ **truy cập vault**. `opgate scan` và `opgate import
+--dry-run` vẫn đọc file `.env` plaintext trên đĩa mà không hỏi — file đó vốn đã nằm
+đó và ai đọc file cũng đọc được, nên chặn ở đây không thêm gì. Điểm khác biệt là
+chúng không **in** giá trị ra đâu cả.
 
 **Phạm vi, nói thẳng:** đây là *kiểm soát hợp tác* cộng lớp chống tai nạn, không phải
 sandbox. Nó ràng buộc những ai gọi `opgate`. 1Password ủy quyền cho `op` theo phiên
@@ -55,7 +60,8 @@ opgate put myapp DB_URL       # đưa secret VÀO vault (--multiline cho PEM/JSO
 opgate audit -n 20            # gần đây đã truy cập gì
 ```
 
-Yêu cầu thêm: `jq` (`brew install jq`) cho `opgate put`. `opgate doctor` kiểm tra.
+Yêu cầu thêm: `jq` (`brew install jq`) cho `opgate put` và `opgate import`.
+`opgate doctor` kiểm tra.
 
 Ba bộ test chạy được bất cứ lúc nào — không cần vault, không cần mạng, không cần
 vân tay:
@@ -75,9 +81,15 @@ opgate run -f api/.env.op -- npm run dev
 ```
 
 `import` tạo item `<project>-<thư mục>-<môi trường>` (ví dụ `cme-api`,
-`cme-web-production`) mang tag `opgate` và `project:<tên>`, sinh `.env.op` cạnh file
-gốc, và sao lưu bản gốc vào `~/.local/share/opgate/backups/`. Nó **không xoá** bản
-gốc — xoá là việc của bạn, sau khi đã chắc app còn chạy.
+`cme-web-production`) mang tag `opgate` và `project:<tên>`, rồi sinh file reference
+cạnh file gốc: `.env` → `.env.op`, `.env.production` → `.env.production.op`. Nó
+**không xoá và không sao lưu** bản gốc — bản gốc vẫn nằm đó, nên một bản sao
+plaintext thứ hai chỉ nới rộng vùng lộ chứ không thêm an toàn. Cần bản sao thì
+`--backup`, và nhớ tự xoá.
+
+`import` từ chối ghi đè khi item đã tồn tại nhưng không do opgate tạo (thiếu tag
+`opgate`), khi hai file khác nhau cùng suy ra một tên item, và khi file `.op` đích
+đang được sinh từ nguồn khác. `--force` bỏ qua các chốt đó.
 
 Biến không bí mật (`NODE_ENV`, `PORT`, `API_URL`) ở lại `.env.op` dạng literal, nên
 file đó vẫn commit được và vault không đầy rác. Biến không phân loại được chắc chắn
@@ -102,7 +114,10 @@ ln -s "$(claude plugin path onepassword 2>/dev/null || echo ~/.claude/plugins/ca
 ```
 
 Codex không có hook system, nên thêm luật vào `AGENTS.md` của project (mẫu có trong
-`project-setup.md`). Touch ID gate vẫn chặn Codex — đó là lý do nó nằm ở tầng CLI.
+`project-setup.md`). Touch ID gate chặn Codex **khi Codex dùng `opgate`** — nó nằm ở
+tầng CLI nên không phân biệt ai gọi. Nhưng Codex gọi thẳng `op` thì không có gì chặn,
+y như với bất kỳ tiến trình nào chạy dưới tài khoản của bạn. Xem phần phạm vi ở đầu
+file và `references/security-model.md`.
 
 ## Cấu hình
 

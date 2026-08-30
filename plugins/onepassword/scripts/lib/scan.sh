@@ -6,79 +6,112 @@
 # transcript.
 
 # Directories that are never worth walking.
-SCAN_PRUNE='-name node_modules -o -name .git -o -name vendor -o -name dist -o -name build -o -name .next -o -name target -o -name __pycache__ -o -name .venv'
+scan_prune_args() {
+  printf '%s\n' -name node_modules -o -name .git -o -name vendor -o -name dist \
+    -o -name build -o -name .next -o -name .nuxt -o -name out -o -name coverage \
+    -o -name target -o -name __pycache__ -o -name .venv -o -name venv \
+    -o -name .terraform -o -name Pods -o -name .gradle
+}
+
+# Files larger than this are skipped: a scanner that takes minutes on a large repo
+# does not get run.
+SCAN_MAX_SIZE="${SCAN_MAX_SIZE:-1024k}"
+
+# A path containing a colon would be mis-split when parsing `grep -n` output as
+# file:line, and a mis-split could put file CONTENT where a line number belongs.
+# Dropping those few paths is cheaper than risking that.
+_drop_colon_paths() { grep -v ':' || true; }
 
 # env files belonging to a project, excluding the committable template forms.
 find_env_files() { # <root>
-  local root="$1"
-  find "$root" \( $SCAN_PRUNE \) -prune -o \
+  local root="$1"; local -a prune=(); local a
+  while IFS= read -r a; do prune+=("$a"); done < <(scan_prune_args)
+  find "$root" \( "${prune[@]}" \) -prune -o \
        -type f \( -name '.env' -o -name '.env.*' \) -print 2>/dev/null \
     | grep -Ev '\.(example|sample|tpl|template|op)$' \
+    | _drop_colon_paths \
     | sort
 }
 
-# Config files that habitually end up holding a credential someone pasted.
+# Config and source files that habitually end up holding a credential someone
+# pasted. `-name '*.ya?ml'` used to stand in for yaml and yml; `?` matches exactly
+# one character, so it matched neither and YAML was never scanned at all.
 find_config_files() { # <root>
-  local root="$1"
-  find "$root" \( $SCAN_PRUNE \) -prune -o \
-       -type f \( -name '*.json' -o -name '*.ya?ml' -o -name '*.toml' -o -name '*.ini' \
-                  -o -name '*.conf' -o -name '*.tf' -o -name '*.tfvars' -o -name '.npmrc' \
-                  -o -name '*.sh' -o -name '*.zshrc' -o -name '*.bashrc' \) -print 2>/dev/null \
-    | grep -Ev '(package-lock|yarn\.lock|pnpm-lock|composer\.lock|\.min\.js)' \
+  local root="$1"; local -a prune=(); local a
+  while IFS= read -r a; do prune+=("$a"); done < <(scan_prune_args)
+  find "$root" \( "${prune[@]}" \) -prune -o \
+       -type f -size "-$SCAN_MAX_SIZE" \( \
+            -name '*.json' -o -name '*.yaml' -o -name '*.yml' -o -name '*.toml' \
+         -o -name '*.ini'  -o -name '*.conf' -o -name '*.cfg'  -o -name '*.properties' \
+         -o -name '*.tf'   -o -name '*.tfvars' -o -name '.npmrc' -o -name '.netrc' \
+         -o -name '*.sh'   -o -name '*.bash' -o -name '*.zsh'  -o -name '*.fish' \
+         -o -name '*.js'   -o -name '*.mjs'  -o -name '*.cjs'  -o -name '*.ts' \
+         -o -name '*.jsx'  -o -name '*.tsx'  -o -name '*.py'   -o -name '*.rb' \
+         -o -name '*.go'   -o -name '*.php'  -o -name '*.java' -o -name '*.cs' \
+         -o -name '*.rs'   -o -name '*.tpl'  -o -name '*.tmpl' -o -name 'Dockerfile*' \
+       \) -print 2>/dev/null \
+    | grep -Ev '(package-lock|yarn\.lock|pnpm-lock|composer\.lock|go\.sum|Cargo\.lock|\.min\.(js|css)$)' \
+    | _drop_colon_paths \
     | sort
 }
 
-# Credential shapes worth flagging wherever they appear. Each entry is
-# "label<TAB>flags<TAB>ERE". The patterns match the credential itself, so the value
-# is never printed — only the label, the file and the line number.
+# Credential shapes worth flagging wherever they appear. Fields are tab-separated
+# and built with printf, not a heredoc: a literal tab is invisible in a diff and
+# an editor turned them into spaces once, silently reducing this to one pattern.
 #
-# `flags` is passed to grep: `i` for the generic assignment pattern, because env
-# names are conventionally upper case (AWS_SECRET_ACCESS_KEY) while the pattern
-# spells them lower case. The format-specific patterns stay case-sensitive so
-# `AKIA…` does not match ordinary prose.
-# Built with printf rather than a heredoc: the fields are tab-separated, and a
-# literal tab is invisible in a diff and trivially turned into spaces by an editor
-# or a copy-paste. That happened once here and silently reduced the scanner to a
-# single pattern, so the separator is now explicit in the source.
-#
-# The flags field is '-' rather than empty for the same class of reason: tab is an
-# IFS whitespace character, so `read` collapses two adjacent tabs into one
-# delimiter and an empty middle field shifts every later field left.
+# The flags field is '-' rather than empty for a related reason: tab is an IFS
+# whitespace character, so `read` collapses two adjacent tabs and an empty middle
+# field shifts every later field left.
 scan_patterns() {
   printf '%s\t%s\t%s\n' \
-    'AWS access key id'  '-' 'AKIA[0-9A-Z]{16}' \
-    'GitHub token'       '-' 'gh[pousr]_[A-Za-z0-9]{30,}' \
-    'GitLab PAT'         '-' 'glpat-[A-Za-z0-9_-]{15,}' \
-    'Slack token'        '-' 'xox[baprs]-[A-Za-z0-9-]{10,}' \
-    'Slack webhook'      '-' 'hooks\.slack\.com/services/[A-Za-z0-9/]{20,}' \
-    'Stripe key'         '-' '[sprk]k_(live|test)_[A-Za-z0-9]{20,}' \
-    'OpenAI-style key'   '-' 'sk-[A-Za-z0-9_-]{20,}' \
-    'JWT'                '-' 'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}' \
-    'private key block'  '-' '\-\-\-\-\-BEGIN [A-Z ]*PRIVATE KEY\-\-\-\-\-' \
-    'URL with password'  '-' '[a-z][a-z0-9+.-]*://[^/@[:space:]"'"'"']+:[^/@[:space:]"'"'"']+@' \
-    'assigned secret'    'i' '(password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"'][^"'"'"']{12,}["'"'"']'
+    'AWS access key id'   '-' '(^|[^A-Za-z0-9])A(KIA|SIA)[0-9A-Z]{16}' \
+    'GitHub token'        '-' 'gh[pousr]_[A-Za-z0-9]{30,}' \
+    'GitHub fine-grained' '-' 'github_pat_[A-Za-z0-9_]{20,}' \
+    'GitLab PAT'          '-' 'glpat-[A-Za-z0-9_-]{15,}' \
+    'npm token'           '-' 'npm_[A-Za-z0-9]{30,}' \
+    'Slack token'         '-' 'xox[baprs]-[A-Za-z0-9-]{10,}' \
+    'Slack webhook'       '-' 'hooks\.slack\.com/services/[A-Za-z0-9/]{20,}' \
+    'Discord webhook'     '-' 'discord(app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]{20,}' \
+    'Stripe secret key'   '-' '[sr]k_(live|test)_[A-Za-z0-9]{20,}' \
+    'OpenAI-style key'    '-' 'sk-[A-Za-z0-9_-]{20,}' \
+    'JWT'                 '-' 'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}' \
+    'private key block'   '-' '\-\-\-\-\-BEGIN [A-Z ]*PRIVATE KEY\-\-\-\-\-' \
+    'URL with password'   '-' '[a-z][a-z0-9+.-]*://[^/@[:space:]"'"'"']+:[^/@[:space:]"'"'"']+@' \
+    'assigned secret'     'i' '(password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|auth[_-]?token)["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"'][^"'"'"']{12,}["'"'"']' \
+    'assigned secret'     'i' '(password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|auth[_-]?token|_authToken)[[:space:]]*[:=][[:space:]]*[^"'"'"'[:space:]]{16,}'
 }
 
-# scan_embedded <file> -> "line<TAB>label" for each hit. Never emits the match.
+# scan_embedded_list -> "file<TAB>line<TAB>label" for every hit across the file
+# list on stdin. Never emits the match itself.
 #
-# Every grep is `|| true`: callers run under `set -e`, and a pattern that does not
-# match exits 1. Without this the first non-matching pattern aborted the whole
-# function, so only a file matching the very first pattern was ever reported.
-scan_embedded() {
-  local file="$1" label flags pattern
+# One grep per pattern across all files, rather than per pattern per file: the old
+# shape re-read every selected file 11 times.
+scan_embedded_list() {
+  local list; list=$(mktemp "${TMPDIR:-/tmp}/opgate-scan.XXXXXX")
+  cat > "$list"
+  [[ -s "$list" ]] || { rm -f "$list"; return 0; }
+
+  local label flags pattern
   while IFS=$'\t' read -r label flags pattern; do
     [[ -n "$label" && -n "$pattern" ]] || continue
     local -a gflags=(-nEI)
     [[ "$flags" == *i* ]] && gflags+=(-i)
-    # Only line numbers leave grep: -o would print the credential, and printing the
-    # whole matching line is worse.
-    { grep "${gflags[@]}" -- "$pattern" "$file" 2>/dev/null || true; } \
-      | cut -d: -f1 \
-      | while IFS= read -r ln; do
-          [[ -n "$ln" ]] && printf '%s\t%s\n' "$ln" "$label"
+    # /dev/null keeps grep in multi-file mode so it always prefixes the filename.
+    # cut leaves only file:line — the matched text never leaves the pipeline.
+    { tr '\n' '\0' < "$list" \
+        | xargs -0 grep "${gflags[@]}" -- "$pattern" /dev/null 2>/dev/null || true; } \
+      | cut -d: -f1,2 \
+      | while IFS=: read -r f ln; do
+          [[ -n "$f" && -n "$ln" && "$f" != /dev/null ]] && printf '%s\t%s\t%s\n' "$f" "$ln" "$label"
         done
   done < <(scan_patterns)
+  rm -f "$list"
   return 0
+}
+
+# Single-file form, kept for the tests.
+scan_embedded() { # <file>
+  printf '%s\n' "$1" | scan_embedded_list | cut -f2,3
 }
 
 # item_name_for <envfile> <project> <repo-root>

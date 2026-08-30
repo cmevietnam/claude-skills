@@ -67,6 +67,40 @@ t DISCORD_HOOK 'https://discord.com/api/webhooks/123456789012345678/aB3dE5gH7jK9
 t WEBHOOK_URL 'https://example.com/hook' secret
 
 echo
+echo "FAIL-CLOSED: không được xếp secret thật thành config/placeholder"
+# Mọi ca dưới đây từng bị xếp sai và ghi literal vào .env.op — file dán nhãn
+# "commit được". Đây là hậu quả tệ nhất mà bộ phân loại có thể gây ra.
+t DB_PASS      'hunter2'                          secret
+t DB_PASSWORD  'password'                         secret
+t API_KEY      '<p@ssword>'                       placeholder
+t db_pass      'hunter2'                          secret
+t MYSQL_PW     'abc123'                           secret
+t PASSPHRASE   'correct horse'                    secret
+t ADMIN_PASS   'x'                                secret
+t MAGIC_LINK   'https://app.example/login?token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig' secret
+t CALLBACK     'https://a.example/cb?api_key=abcdef123456'  secret
+t SHORT_TOKEN  'a1b2c3'                            secret
+t SEED_PHRASE  'word word word'                    secret
+
+echo "giá trị ngắn KHÔNG còn tự động thành config"
+# Quy tắc "ngắn và đơn giản -> config" là lỗ fail-open: nó biến hunter2 thành
+# cấu hình. Giờ chỉ TÊN mới hạ được một biến xuống config.
+t SOME_VALUE   'abc'      ambiguous
+t RANDOM_THING 'x1'       ambiguous
+t NODE_ENV     'prod'     config
+t PORT         '8080'     config
+
+echo "placeholder chỉ còn những dấu hiệu không thể nhầm"
+t API_KEY  'changeme'      placeholder
+t API_KEY  '<your-token>'  placeholder
+t API_KEY  '${FROM_CI}'    placeholder
+t API_KEY  'your-key-here' placeholder
+t API_KEY  'TODO'          placeholder
+t API_KEY  'secret'        secret
+t API_KEY  'test'          secret
+t API_KEY  'dummy'         secret
+t API_KEY  'example'       secret
+
 echo "describe_value không được lộ giá trị"
 for v in 'sk_live_abcdefghijklmnopqrst' 'postgres://u:p@h/db' $'multi\nline'; do
   d=$(describe_value "$v")

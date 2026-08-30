@@ -13,6 +13,13 @@
 # What this does NOT do: stop a determined caller. See references/security-model.md.
 set -euo pipefail
 
+# `bash -x opgate import .env` traced every expansion — including parsed values and
+# the argument to the classifier — to stderr, and therefore into the transcript,
+# before the Touch ID gate ever ran. Debugging must not be a disclosure channel.
+case $- in *x*) set +x ;; esac
+case $- in *v*) set +v ;; esac
+unset BASH_XTRACEFD
+
 OPGATE_BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 OPGATE_SCRIPT_DIR=$(cd -- "$OPGATE_BIN_DIR/../scripts" && pwd)
 # shellcheck source=../scripts/lib/common.sh
@@ -35,7 +42,7 @@ opgate — Touch ID-gated access to 1Password secrets
   opgate put    ITEM FIELD [--multiline] ghi một secret VÀO 1Password (đọc từ stdin)
 
   opgate scan   [PATH]                  tìm .env và secret nhúng trong project (không in giá trị)
-  opgate import FILE [--yes]            đưa một file .env vào vault + sinh .env.op
+  opgate import FILE [--yes] [--backup] đưa một file .env vào vault + sinh <file>.op
   opgate items  [-p PROJECT]            liệt kê item trong vault theo project
 
   opgate list   [-f FILE]               liệt kê tên biến + ref (không bao giờ in giá trị)
@@ -82,6 +89,52 @@ with_timeout() { # <seconds> <cmd...>
   local rc=0; wait "$pid" 2>/dev/null || rc=$?
   kill -9 "$watcher" 2>/dev/null
   return $rc
+}
+
+# Refuse to write anywhere that is not a plain regular file. A device node turns
+# "write a file" into "write to the transcript"; a FIFO hands the value to whoever
+# is reading; a symlink lands somewhere other than the name you approved.
+assert_safe_sink() { # <path> <resolved-path>
+  local out="$1" real="$2"
+  case "$real" in
+    /dev/*|/proc/*)
+      die "từ chối ghi vào $real — đó không phải file, secret sẽ đi thẳng ra stdout/stderr hoặc thiết bị.
+       Cần secret cho một lệnh thì dùng: opgate run -- <cmd>" ;;
+  esac
+  if [[ -L "$out" ]]; then
+    die "$out là symlink — từ chối, đích thật có thể nằm ngoài chỗ bạn nghĩ (trỏ tới $(readlink -- "$out"))"
+  fi
+  if [[ -e "$real" && ! -f "$real" ]]; then
+    die "$real tồn tại nhưng không phải file thường (FIFO, socket, thiết bị?) — từ chối ghi"
+  fi
+  # A hard link passes both checks above and would redirect the overwrite into
+  # another name for the same inode.
+  if [[ -f "$real" ]]; then
+    local links; links=$(stat -f %l -- "$real" 2>/dev/null || printf 1)
+    (( links > 1 )) && die "$real có $links hard link — ghi vào đây sẽ sửa cả những tên khác trỏ tới cùng nội dung"
+  fi
+}
+
+# Write a dotenv value, quoting when the raw form would not round-trip.
+dotenv_quote() { # <value>
+  local v="$1"
+  if [[ -z "$v" ]]; then printf ''; return; fi
+  if [[ "$v" =~ ^[A-Za-z0-9_./:@+-]+$ ]]; then printf '%s' "$v"; return; fi
+  # Double-quoted with escapes: a raw newline, quote or `#` would otherwise change
+  # the meaning of the generated file.
+  local out="" i c bs=$'\\'
+  for (( i = 0; i < ${#v}; i++ )); do
+    c="${v:i:1}"
+    case "$c" in
+      '"')      out+="${bs}\"" ;;
+      "$bs")    out+="${bs}${bs}" ;;
+      $'\n')    out+="${bs}n" ;;
+      $'\t')    out+="${bs}t" ;;
+      $'\r')    out+="${bs}r" ;;
+      *)        out+="$c" ;;
+    esac
+  done
+  printf '"%s"' "$out"
 }
 
 # Where a path really lands, after resolving `..` and any symlinked parent.
@@ -215,17 +268,7 @@ cmd_inject() {
   # NOT relax these: a device node, FIFO or symlink target is how a "file" write
   # becomes a write to the transcript or to somewhere you did not name.
   local real; real=$(resolved_path "$out")
-  case "$real" in
-    /dev/*|/proc/*)
-      die "từ chối ghi vào $real — đó không phải file, secret sẽ đi thẳng ra stdout/stderr hoặc thiết bị.
-       Cần secret cho một lệnh thì dùng: opgate run -- <cmd>" ;;
-  esac
-  if [[ -L "$out" ]]; then
-    die "$out là symlink — từ chối, đích thật có thể nằm ngoài chỗ bạn nghĩ (trỏ tới $(readlink -- "$out"))"
-  fi
-  if [[ -e "$real" && ! -f "$real" ]]; then
-    die "$real tồn tại nhưng không phải file thường (FIFO, socket, thiết bị?) — từ chối ghi"
-  fi
+  assert_safe_sink "$out" "$real"
 
   # Rendering secrets to disk is the one operation here that leaves plaintext
   # behind, so refuse unless git is already set up to ignore the result.
@@ -242,10 +285,17 @@ cmd_inject() {
   while IFS= read -r v; do [[ -n "$v" ]] && vars+=("$v"); done < <(env_file_vars "$tpl")
   # A JSON/YAML template holds op:// references that are not VAR= lines, so fall
   # back to counting references rather than claiming "(none)" on the prompt.
-  local refcount; refcount=$(grep -o 'op://[^"'"'"' 	]*' -- "$tpl" 2>/dev/null | wc -l | tr -d ' ')
+  local refcount
+  refcount=$( { grep -o 'op://[^"'"'"' 	]*' -- "$tpl" 2>/dev/null || true; } | wc -l | tr -d ' ')
+  # A template can hold both `VAR=` lines and bare op:// references in JSON/YAML.
+  # Reporting only the parsed variables under-reports what will be resolved, so
+  # the reference count is always shown alongside.
   local scope
-  if (( ${#vars[@]} )); then scope=$(summarize_list "${vars[@]}")
-  else scope="$refcount tham chiếu op://"; fi
+  if (( ${#vars[@]} )); then
+    scope="$(summarize_list "${vars[@]}") · $refcount tham chiếu op:// trong file"
+  else
+    scope="$refcount tham chiếu op://"
+  fi
 
   gate_require "inject" "$(basename -- "$tpl") -> $real" \
     "$(project_name) → ghi secret ra file $(basename -- "$real"): $scope"
@@ -418,6 +468,10 @@ cmd_doctor() {
     local vrc=0; _verify_gate_binary >/dev/null 2>&1 || vrc=$?
     if (( vrc == 2 )); then
       bad "gate binary khác hash đã ghi lúc build → xác nhận rồi chạy: opgate build"; fail=1
+    elif [[ ! -f "$OPGATE_GATE_SUM" ]]; then
+      # Reported rather than swallowed: without a recorded hash the check passes
+      # unconditionally, so calling the binary "healthy" would be misleading.
+      bad "chưa ghi hash tham chiếu cho gate binary → opgate build"; fail=1
     else
       ok "gate binary: $OPGATE_GATE_BIN"
     fi
@@ -463,37 +517,6 @@ cmd_doctor() {
   printf '\n' >&2; info "tất cả ổn"
 }
 
-# Parse one env file into the parallel arrays IMP_NAMES / IMP_VALUES.
-# bash 3.2 has no associative arrays, hence two arrays kept in step.
-parse_env_file() { # <file>
-  local file="$1" line name value
-  IMP_NAMES=(); IMP_VALUES=()
-  # `|| [[ -n "$line" ]]` keeps the final line when the file has no trailing
-  # newline — dropping it would silently skip the last variable.
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line%$'\r'}"
-    [[ "$line" =~ ^[[:space:]]*# ]] && continue
-    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
-    [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*= ]] || continue
-
-    name="${line%%=*}"
-    name="${name#"${name%%[![:space:]]*}"}"      # ltrim
-    name="${name%"${name##*[![:space:]]}"}"      # rtrim
-    name="${name#export }"
-    name="${name%"${name##*[![:space:]]}"}"
-
-    value="${line#*=}"
-    value="${value#"${value%%[![:space:]]*}"}"   # ltrim
-    # Strip one matching pair of surrounding quotes.
-    if   [[ "$value" == \"*\" && ${#value} -ge 2 ]]; then value="${value:1:${#value}-2}"
-    elif [[ "$value" == \'*\' && ${#value} -ge 2 ]]; then value="${value:1:${#value}-2}"
-    else value="${value%"${value##*[![:space:]]}"}"
-    fi
-
-    IMP_NAMES+=("$name"); IMP_VALUES+=("$value")
-  done < "$file"
-}
-
 cmd_scan() {
   local target="" env_only=0
   while (( $# )); do
@@ -530,8 +553,8 @@ cmd_scan() {
       item=$(item_name_for "$f" "$project" "$root")
       parse_env_file "$f"
       s=0; c=0; pl=0; em=0
-      for (( i = 0; i < ${#IMP_NAMES[@]}; i++ )); do
-        kind=$(classify_var "${IMP_NAMES[$i]}" "${IMP_VALUES[$i]}")
+      for (( i = 0; i < ${#OPG_NAMES[@]}; i++ )); do
+        kind=$(classify_var "${OPG_NAMES[$i]}" "${OPG_VALUES[$i]}")
         case "$kind" in
           secret|ambiguous) s=$((s+1)) ;;
           config) c=$((c+1)) ;;
@@ -555,15 +578,14 @@ cmd_scan() {
   (( env_only )) && return 0
 
   printf '\nsecret nhúng trong file khác:\n'
-  local hits=0 cf ln label
-  while IFS= read -r cf; do
-    [[ -n "$cf" ]] || continue
-    while IFS=$'\t' read -r ln label; do
-      [[ -n "$ln" ]] || continue
-      printf '  %s:%s\t%s\n' "${cf#"$root"/}" "$ln" "$label"
-      hits=$((hits + 1))
-    done < <(scan_embedded "$cf")
-  done < <(find_config_files "$root")
+  local hits=0 f2 ln label
+  # One pass over the whole file list per pattern, rather than every pattern
+  # against every file: the old shape re-read each selected file 11 times.
+  while IFS=$'\t' read -r f2 ln label; do
+    [[ -n "$f2" ]] || continue
+    printf '  %s:%s\t%s\n' "${f2#"$root"/}" "$ln" "$label"
+    hits=$((hits + 1))
+  done < <(find_config_files "$root" | scan_embedded_list | sort -u)
 
   if (( hits == 0 )); then
     printf '  không thấy gì\n'
@@ -576,13 +598,15 @@ cmd_scan() {
 
 cmd_import() {
   require_op; require_jq
-  local file="" project="" item="" assume_yes=0 dry=0
+  local file="" project="" item="" assume_yes=0 dry=0 want_backup=0 force=0
   while (( $# )); do
     case "$1" in
       -p|--project) [[ $# -ge 2 ]] || die "--project cần một tên"; project="$2"; shift 2 ;;
       --item)       [[ $# -ge 2 ]] || die "--item cần một tên"; item="$2"; shift 2 ;;
       -y|--yes)     assume_yes=1; shift ;;
       --dry-run)    dry=1; shift ;;
+      --backup)     want_backup=1; shift ;;
+      --force)      force=1; shift ;;
       -h|--help)    usage; exit 0 ;;
       *) [[ -z "$file" ]] || die "opgate import: chỉ nhận một file"; file="$1"; shift ;;
     esac
@@ -594,18 +618,24 @@ cmd_import() {
   local root; root=$(git rev-parse --show-toplevel 2>/dev/null || dirname -- "$file")
   [[ -n "$project" ]] || project=$(basename -- "$root")
   [[ -n "$item" ]] || item=$(item_name_for "$file" "$project" "$root")
+  # An item title feeds op:// references and the generated file. A slash makes an
+  # invalid reference; a newline could inject a second assignment into .env.op.
+  [[ "$item" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || die "tên item không hợp lệ: '$item' — chỉ chấp nhận chữ, số, và . _ -"
+  [[ "$project" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || die "tên project không hợp lệ: '$project'"
 
   parse_env_file "$file"
-  (( ${#IMP_NAMES[@]} )) || die "$file không có biến nào"
+  (( ${#OPG_NAMES[@]} )) || die "$file không có biến nào"
 
   # Decide what goes to the vault. Ambiguous entries are settled by you, and the
   # question shows the SHAPE of the value, never the value: deciding does not
   # require seeing it, and printing it would put it in the transcript.
   local -a vault_idx=() literal_idx=() ambiguous_idx=()
   local i name kind ans
-  for (( i = 0; i < ${#IMP_NAMES[@]}; i++ )); do
-    name="${IMP_NAMES[$i]}"
-    kind=$(classify_var "$name" "${IMP_VALUES[$i]}")
+  for (( i = 0; i < ${#OPG_NAMES[@]}; i++ )); do
+    name="${OPG_NAMES[$i]}"
+    kind=$(classify_var "$name" "${OPG_VALUES[$i]}")
     case "$kind" in
       secret)  vault_idx+=("$i") ;;
       config|placeholder|empty) literal_idx+=("$i") ;;
@@ -628,7 +658,7 @@ cmd_import() {
       printf '\n%d biến không phân loại được chắc chắn. Giá trị KHÔNG được in ra —\n' "${#ambiguous_idx[@]}" >&2
       printf 'chỉ mô tả hình dạng, vì in ra là đưa nó vào transcript.\n\n' >&2
       for i in ${ambiguous_idx[@]+"${ambiguous_idx[@]}"}; do
-        printf '  %s — %s\n' "${IMP_NAMES[$i]}" "$(describe_value "${IMP_VALUES[$i]}")" >&2
+        printf '  %s — %s\n' "${OPG_NAMES[$i]}" "$(describe_value "${OPG_VALUES[$i]}")" >&2
         printf '    đưa vào vault? [Y/n] ' >&2
         # Read from stdin, which the `-t 0` above proved is a terminal. Reading
         # /dev/tty instead looked equivalent and was not: it opens successfully in
@@ -643,7 +673,7 @@ cmd_import() {
       # or quietly vaults something that did not need it.
       printf '\n' >&2
       for i in ${ambiguous_idx[@]+"${ambiguous_idx[@]}"}; do
-        printf '  %s — %s\n' "${IMP_NAMES[$i]}" "$(describe_value "${IMP_VALUES[$i]}")" >&2
+        printf '  %s — %s\n' "${OPG_NAMES[$i]}" "$(describe_value "${OPG_VALUES[$i]}")" >&2
       done
       die "${#ambiguous_idx[@]} biến ở trên cần bạn quyết, nhưng không có terminal để hỏi.
        Chạy lại trong terminal, hoặc thêm --yes để đưa tất cả chúng vào vault."
@@ -651,23 +681,63 @@ cmd_import() {
   fi
 
   local -a vault_names=()
-  for i in ${vault_idx[@]+"${vault_idx[@]}"}; do vault_names+=("${IMP_NAMES[$i]}"); done
+  for i in ${vault_idx[@]+"${vault_idx[@]}"}; do vault_names+=("${OPG_NAMES[$i]}"); done
 
   printf '\n%s\n' "$file" >&2
   printf '  vault  : %s -> op://%s/%s/<VAR>\n' "${#vault_idx[@]} biến" "$OPGATE_VAULT" "$item" >&2
-  printf '  literal: %s giữ nguyên trong .env.op\n' "${#literal_idx[@]} biến" >&2
+  printf '  literal: %s giữ nguyên trong file .op\n' "${#literal_idx[@]} biến" >&2
   (( ${#ambiguous_idx[@]} )) && printf '  chờ hỏi: %s\n' "${#ambiguous_idx[@]} biến" >&2
 
   if (( dry )); then
     printf '\n  --dry-run: không ghi gì\n' >&2
-    for i in ${vault_idx[@]+"${vault_idx[@]}"}; do printf '    vault     %s\n' "${IMP_NAMES[$i]}" >&2; done
+    for i in ${vault_idx[@]+"${vault_idx[@]}"}; do printf '    vault     %s\n' "${OPG_NAMES[$i]}" >&2; done
     for i in ${ambiguous_idx[@]+"${ambiguous_idx[@]}"}; do
-      printf '    sẽ hỏi   %s — %s\n' "${IMP_NAMES[$i]}" "$(describe_value "${IMP_VALUES[$i]}")" >&2
+      printf '    sẽ hỏi   %s — %s\n' "${OPG_NAMES[$i]}" "$(describe_value "${OPG_VALUES[$i]}")" >&2
     done
-    for i in ${literal_idx[@]+"${literal_idx[@]}"}; do printf '    literal   %s\n' "${IMP_NAMES[$i]}" >&2; done
+    for i in ${literal_idx[@]+"${literal_idx[@]}"}; do printf '    literal   %s\n' "${OPG_NAMES[$i]}" >&2; done
     return 0
   fi
   (( ${#vault_idx[@]} )) || die "không có biến nào cần đưa vào vault"
+
+  # Merge with an existing item so re-importing does not drop fields added
+  # elsewhere. A failure that is not "no such item" must not be read as one.
+  local item_json probe_err="" exists=1
+  probe_err=$(op item get "$item" --vault "$OPGATE_VAULT" --format json </dev/null 2>&1 >/dev/null) || exists=0
+  if (( ! exists )); then
+    case "$probe_err" in
+      *"isn't an item"*|*"could not find"*|*"no item matching"*|*"not found"*) ;;
+      *) die "không truy vấn được item \"$item\": $probe_err" ;;
+    esac
+  fi
+
+  if (( exists )); then
+    item_json=$(op item get "$item" --vault "$OPGATE_VAULT" --format json </dev/null)
+
+    # Only touch items this tool created. Rebuilding an arbitrary item as a Secure
+    # Note would drop its category, sections, URLs and — 1Password warns — any
+    # passkey it holds.
+    local owned; owned=$(printf '%s' "$item_json" \
+      | jq -r 'if (.category == "SECURE_NOTE" and ((.tags // []) | index("opgate"))) then "yes" else "no" end')
+    if [[ "$owned" != "yes" ]]; then
+      die "item \"$item\" đã tồn tại trong vault $OPGATE_VAULT nhưng không phải do opgate tạo
+       (thiếu tag 'opgate' hoặc không phải Secure Note). Ghi đè sẽ làm mất category,
+       section, URL và passkey của nó. Dùng --item <tên khác>."
+    fi
+
+    # Two different files can map to the same item name (p/a/b and p/a-b both give
+    # p-a-b). Refuse rather than silently merge one project'"'"'s secrets into another.
+    local prev_src; prev_src=$(printf '%s' "$item_json" \
+      | jq -r '(.fields // []) | map(select(.label == "opgate_source")) | .[0].value // ""')
+    local this_src="${file#"$root"/}"
+    if [[ -n "$prev_src" && "$prev_src" != "$this_src" ]] && (( ! force )); then
+      die "item \"$item\" đang giữ secret của $prev_src, còn đây là $this_src.
+       Hai file khác nhau cùng suy ra một tên item. Dùng --item <tên khác>, hoặc
+       --force nếu bạn thật sự muốn gộp chúng."
+    fi
+  else
+    item_json=$(jq -n --arg t "$item" '{title: $t, category: "SECURE_NOTE", tags: [], fields: [
+      {id: "notesPlain", type: "STRING", purpose: "NOTES", label: "notesPlain", value: ""}]}')
+  fi
 
   # One approval for the whole file. Per-variable prompts would mean dozens of
   # Touch ID sheets for a real project, and a control you turn off is worth less
@@ -675,71 +745,92 @@ cmd_import() {
   gate_require "import" "$item: $(IFS=,; printf '%s' "${vault_names[*]}")" \
     "$(project_name) → nhập $(basename -- "$file") vào item \"$item\": $(summarize_list "${vault_names[@]}")"
 
-  # Merge with an existing item so re-importing does not drop fields added
-  # elsewhere. A failure that is not "no such item" must not be read as one.
-  local fields_json probe_err="" exists=1
-  probe_err=$(op item get "$item" --vault "$OPGATE_VAULT" --format json </dev/null 2>&1 >/dev/null) || exists=0
-  if (( exists )); then
-    fields_json=$(op item get "$item" --vault "$OPGATE_VAULT" --format json </dev/null | jq '.fields // []')
-  else
-    case "$probe_err" in
-      *"isn't an item"*|*"could not find"*|*"no item matching"*|*"not found"*) ;;
-      *) die "không truy vấn được item \"$item\": $probe_err" ;;
-    esac
-    fields_json='[{"id":"notesPlain","type":"STRING","purpose":"NOTES","label":"notesPlain","value":""}]'
-  fi
+  # Record which file this item came from, so a name collision is detectable.
+  item_json=$(printf '%s' "$item_json" | jq --arg s "${file#"$root"/}" '
+    .fields = ((.fields // []) | map(select(.label != "opgate_source")))
+            + [{id: "opgate_source", type: "STRING", label: "opgate_source", value: $s}]')
 
   # Values reach jq over a file descriptor, never argv.
+  local i
   for i in ${vault_idx[@]+"${vault_idx[@]}"}; do
-    fields_json=$(printf '%s' "$fields_json" \
-      | jq --arg f "${IMP_NAMES[$i]}" --rawfile v <(printf '%s' "${IMP_VALUES[$i]}") \
-          'map(select(.label != $f)) + [{id: $f, type: "CONCEALED", label: $f, value: $v}]')
+    item_json=$(printf '%s' "$item_json" \
+      | jq --arg f "${OPG_NAMES[$i]}" --rawfile v <(printf '%s' "${OPG_VALUES[$i]}") '
+          .fields = ((.fields // []) | map(select(.label != $f)))
+                  + [{id: $f, type: "CONCEALED", label: $f, value: $v}]')
   done
 
-  local tags="opgate,project:$project"
+  # Union the tags rather than replacing them: an edit template replaces the whole
+  # item, so listing only our two would drop any tag you added by hand.
+  item_json=$(printf '%s' "$item_json" | jq --arg p "project:$project" '
+    .tags = (((.tags // []) + ["opgate", $p]) | unique)')
+
   if (( exists )); then
-    op item edit "$item" --vault "$OPGATE_VAULT" --tags "$tags" --template <(
-      printf '%s' "$fields_json" | jq --arg t "$item" '{title: $t, category: "SECURE_NOTE", fields: .}'
-    ) </dev/null >/dev/null
+    op item edit "$item" --vault "$OPGATE_VAULT" --template <(printf '%s' "$item_json") </dev/null >/dev/null
     info "cập nhật item \"$item\" (${#vault_idx[@]} biến)"
   else
-    op item create --vault "$OPGATE_VAULT" --tags "$tags" --template <(
-      printf '%s' "$fields_json" | jq --arg t "$item" '{title: $t, category: "SECURE_NOTE", fields: .}'
-    ) </dev/null >/dev/null
-    info "tạo item \"$item\" (${#vault_idx[@]} biến), tag: $tags"
+    op item create --vault "$OPGATE_VAULT" --template <(printf '%s' "$item_json") </dev/null >/dev/null
+    info "tạo item \"$item\" (${#vault_idx[@]} biến), tag: opgate, project:$project"
   fi
 
-  # Write .env.op next to the original.
-  local opfile; opfile="$(dirname -- "$file")/.env.op"
+  # Write the reference file next to the original, named after it. A fixed
+  # `.env.op` meant importing `.env.production` and then `.env.local` in one
+  # directory silently discarded the first result.
+  local base; base=$(basename -- "$file")
+  local opfile; opfile="$(dirname -- "$file")/${base}.op"
+  [[ "$base" == ".env" ]] && opfile="$(dirname -- "$file")/.env.op"
+  local opreal; opreal=$(resolved_path "$opfile")
+  assert_safe_sink "$opfile" "$opreal"
+
+  # Refuse to clobber a file generated from a different source.
+  if [[ -f "$opreal" ]] && (( ! force )); then
+    local prev; prev=$(sed -n 's/^# nguồn: //p' "$opreal" | head -1)
+    if [[ -n "$prev" && "$prev" != "${file#"$root"/}" ]]; then
+      die "$opfile đang được sinh từ $prev, không phải ${file#"$root"/}.
+       Ghi đè sẽ mất file cũ. Dùng --force nếu bạn chắc."
+    fi
+  fi
+
+  # Written to a temporary file and moved into place, so an interrupted run
+  # cannot leave a half-written reference file behind.
+  local optmp; optmp="${opreal}.tmp.$$"
   {
-    printf '# sinh bởi `opgate import` từ %s\n' "$(basename -- "$file")"
+    printf '# sinh bởi `opgate import`\n'
+    printf '# nguồn: %s\n' "${file#"$root"/}"
     printf '# commit được: chỉ chứa op:// reference và giá trị không bí mật.\n'
-    printf '# chạy: opgate run -- <lệnh>\n\n'
-    for (( i = 0; i < ${#IMP_NAMES[@]}; i++ )); do
-      local in_vault=0 j
+    printf '# chạy: opgate run -f %s -- <lệnh>\n\n' "$(basename -- "$opfile")"
+    local j in_vault
+    for (( i = 0; i < ${#OPG_NAMES[@]}; i++ )); do
+      in_vault=0
       for j in ${vault_idx[@]+"${vault_idx[@]}"}; do [[ "$j" == "$i" ]] && in_vault=1; done
       if (( in_vault )); then
-        printf '%s=op://%s/%s/%s\n' "${IMP_NAMES[$i]}" "$OPGATE_VAULT" "$item" "${IMP_NAMES[$i]}"
+        printf '%s=op://%s/%s/%s\n' "${OPG_NAMES[$i]}" "$OPGATE_VAULT" "$item" "${OPG_NAMES[$i]}"
       else
-        printf '%s=%s\n' "${IMP_NAMES[$i]}" "${IMP_VALUES[$i]}"
+        # Quoted when the raw form would not round-trip: a value containing a
+        # newline, quote or `#` would otherwise change the file's meaning.
+        printf '%s=%s\n' "${OPG_NAMES[$i]}" "$(dotenv_quote "${OPG_VALUES[$i]}")"
       fi
     done
-  } > "$opfile"
+  } > "$optmp"
+  chmod 644 "$optmp" 2>/dev/null || true
+  mv -f -- "$optmp" "$opreal"
   info "ghi $opfile"
 
-  # Keep the original. Deleting it is your call, made after you have confirmed the
-  # app still runs — a missed variable with no backup is unrecoverable.
-  local backup_dir="$OPGATE_HOME/backups"
-  mkdir -p -- "$backup_dir"
-  local backup="$backup_dir/${item}-$(date +%Y%m%d-%H%M%S).env"
-  ( umask 077; cp -- "$file" "$backup" )
-  info "sao lưu bản gốc: $backup"
+  # A backup is a second plaintext copy that lives forever, outside both hooks,
+  # with no pruning step — while the original is kept anyway. That is more
+  # exposure for no added safety, so it is opt-in.
+  if (( want_backup )); then
+    local backup_dir="$OPGATE_HOME/backups"
+    mkdir -p -- "$backup_dir"; chmod 700 "$backup_dir" 2>/dev/null || true
+    local backup="$backup_dir/${item}-$(date +%Y%m%d-%H%M%S)-$$.env"
+    ( umask 077; cp -- "$file" "$backup" )
+    warn "sao lưu plaintext: $backup — xoá khi không cần nữa"
+  fi
 
   if ! git check-ignore -q -- "$file" 2>/dev/null; then
     warn "$(basename -- "$file") CHƯA được git ignore — thêm vào .gitignore trước khi commit"
   fi
   info "kiểm tra:  opgate run -f $opfile -- <lệnh>"
-  info "xoá bản gốc sau khi chắc chắn mọi thứ chạy: rm $file"
+  info "bản gốc còn nguyên; xoá sau khi chắc chắn mọi thứ chạy: rm $file"
 }
 
 cmd_items() {

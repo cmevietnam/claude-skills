@@ -2,10 +2,21 @@
 # Shared paths, logging and small helpers for opgate.
 # Sourced by bin/opgate, scripts/build-gate.sh and scripts/lib/gate.sh.
 
+# Placeholder detection lives in classify.sh; env_file_literals uses it so the
+# literal warning and the importer agree on what counts as a blank.
+if ! declare -f _is_placeholder >/dev/null 2>&1; then
+  _opgate_lib_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+  [[ -r "$_opgate_lib_dir/classify.sh" ]] && source "$_opgate_lib_dir/classify.sh"
+fi
+
 # --- paths ------------------------------------------------------------------
 # Deliberately NOT honouring XDG_DATA_HOME: the gate binary's location must not be
-# redirectable through the environment, or anything that can set a variable can
-# point us at a fake gate that exits 0.
+# redirectable by a variable that exists for exactly that purpose.
+#
+# This is a speed bump, not a wall. The path still derives from HOME, and anything
+# that can set HOME could point us at a different tree — but anything that can do
+# that can also just run `op` directly, which no part of this tool prevents. See
+# references/security-model.md.
 OPGATE_HOME="$HOME/.local/share/opgate"
 OPGATE_STATE_HOME="$HOME/.local/state/opgate"
 OPGATE_GATE_BIN="$OPGATE_HOME/bin/touchid-gate"
@@ -98,55 +109,183 @@ resolve_env_file() {
   printf '%s' "$candidate"
 }
 
-# Variable names declared in a secret-reference file. Names only — a caller that
-# wants values must go through the gate.
+# --- dotenv parsing --------------------------------------------------------
 #
-# `op run` tolerates whitespace around `=`; an earlier version of this pattern did
-# not, so `ADMIN_TOKEN = op://...` was resolved by op but omitted from the approval
-# prompt. Under-reporting scope on the prompt is worse than failing outright, so
-# this accepts the same shapes op does.
-env_file_vars() {
-  local file="$1"
-  sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' -- "$file" \
-    | sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*=.*/\2/p'
+# One parser, used by everything. The approval prompt, the literal warning and
+# `import` previously used three different implementations; any divergence means
+# the Touch ID sheet under-reports what `op run` will actually resolve, which is a
+# security bug rather than a cosmetic one.
+#
+# Aims to match what `op run` accepts: optional `export`, whitespace around `=`,
+# names that may start with a digit, single-quoted values taken literally,
+# double-quoted values with \n \t \r \" \\ escapes, quoted values spanning
+# several physical lines, and `#` starting a comment only outside quotes.
+#
+# Fills the parallel arrays OPG_NAMES / OPG_VALUES. bash 3.2 has no associative
+# arrays, hence two arrays kept in step.
+parse_env_file() { # <file>
+  local file="$1" line rest name value
+  local in_quote="" buf="" pending=""
+  OPG_NAMES=(); OPG_VALUES=()
+
+  # `|| [[ -n "$line" ]]` keeps the final line when the file has no trailing
+  # newline — dropping it would silently skip the last variable.
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+
+    if [[ -n "$in_quote" ]]; then
+      local close; close=$(_dq_find_close "$line" "$in_quote")
+      if [[ "$close" == "-1" ]]; then
+        buf+=$'\n'"$line"
+      else
+        buf+=$'\n'"${line:0:close}"
+        [[ "$in_quote" == '"' ]] && buf=$(_dq_unescape "$buf")
+        OPG_NAMES+=("$pending"); OPG_VALUES+=("$buf")
+        in_quote=""; buf=""; pending=""
+      fi
+      continue
+    fi
+
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+
+    # `export` followed by any amount of whitespace.
+    if [[ "$line" =~ ^export[[:space:]]+(.*)$ ]]; then line="${BASH_REMATCH[1]}"; fi
+
+    # op accepts names beginning with a digit; an earlier pattern required a
+    # letter or underscore and silently dropped `1TOKEN=…` from the prompt.
+    [[ "$line" =~ ^([A-Za-z0-9_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]] || continue
+    name="${BASH_REMATCH[1]}"; rest="${BASH_REMATCH[2]}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+
+    case "${rest:0:1}" in
+      "'")
+        local body="${rest:1}" c
+        c=$(_dq_find_close "$body" "'")
+        if [[ "$c" == "-1" ]]; then
+          in_quote="'"; buf="$body"; pending="$name"
+        else
+          OPG_NAMES+=("$name"); OPG_VALUES+=("${body:0:c}")
+        fi ;;
+      '"')
+        local body="${rest:1}" c
+        c=$(_dq_find_close "$body" '"')
+        if [[ "$c" == "-1" ]]; then
+          in_quote='"'; buf="$body"; pending="$name"
+        else
+          OPG_NAMES+=("$name"); OPG_VALUES+=("$(_dq_unescape "${body:0:c}")")
+        fi ;;
+      *)
+        # Unquoted: `#` begins a comment. op keeps `abc123` from
+        # `TOKEN=abc123 #note`, so storing the note as part of the secret was
+        # both wrong and a way to put a comment inside a vault field.
+        value="$rest"
+        if [[ "$value" =~ ^([^#]*)\#.*$ ]]; then value="${BASH_REMATCH[1]}"; fi
+        value="${value%"${value##*[![:space:]]}"}"
+        OPG_NAMES+=("$name"); OPG_VALUES+=("$value") ;;
+    esac
+  done < "$file"
+
+  # An unterminated quote: keep what we have rather than dropping the variable,
+  # so the prompt still mentions it.
+  if [[ -n "$in_quote" ]]; then
+    [[ "$in_quote" == '"' ]] && buf=$(_dq_unescape "$buf")
+    OPG_NAMES+=("$pending"); OPG_VALUES+=("$buf")
+  fi
 }
 
-# `VAR<TAB>value` for each entry, so callers can distinguish op:// references from
-# literals without re-implementing the parser.
+# Index of the closing quote in <s>, honouring backslash escapes for `"`.
+# Prints -1 when there is none.
+_dq_find_close() { # <string> <quote-char>
+  local s="$1" q="$2" i c
+  local bs=$'\\'
+  for (( i = 0; i < ${#s}; i++ )); do
+    c="${s:i:1}"
+    # Inside double quotes a backslash escapes the next character, so a `\"` is
+    # part of the value rather than its terminator.
+    if [[ "$q" == '"' && "$c" == "$bs" ]]; then i=$((i + 1)); continue; fi
+    [[ "$c" == "$q" ]] && { printf '%d' "$i"; return; }
+  done
+  printf '%d' -1
+}
+
+_dq_unescape() { # <string>
+  local s="$1" out="" i c n
+  local bs=$'\\'
+  for (( i = 0; i < ${#s}; i++ )); do
+    c="${s:i:1}"
+    if [[ "$c" == "$bs" && $((i + 1)) -lt ${#s} ]]; then
+      n="${s:i+1:1}"
+      case "$n" in
+        n)  out+=$'\n'; i=$((i + 1)) ;;
+        t)  out+=$'\t'; i=$((i + 1)) ;;
+        r)  out+=$'\r'; i=$((i + 1)) ;;
+        '"') out+='"';  i=$((i + 1)) ;;
+        "$bs") out+="$bs"; i=$((i + 1)) ;;
+        *)  out+="$c" ;;
+      esac
+    else
+      out+="$c"
+    fi
+  done
+  printf '%s' "$out"
+}
+
+# Variable names declared in a secret-reference file. Names only — a caller that
+# wants values must go through the gate.
+env_file_vars() {
+  parse_env_file "$1"
+  local i
+  for (( i = 0; i < ${#OPG_NAMES[@]}; i++ )); do printf '%s\n' "${OPG_NAMES[$i]}"; done
+}
+
+# `VAR<TAB>ref` for each entry; the second field is the op:// reference when the
+# value is one, and empty otherwise. Values are deliberately NOT emitted here: a
+# value may contain tabs or newlines, and a line-based stream carrying secrets is
+# a leak waiting for a careless caller.
 env_file_pairs() {
-  local file="$1"
-  sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' -- "$file" \
-    | sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*=[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\2	\3/p'
+  parse_env_file "$1"
+  local i v
+  for (( i = 0; i < ${#OPG_NAMES[@]}; i++ )); do
+    v="${OPG_VALUES[$i]}"
+    case "$v" in
+      op://*) printf '%s\t%s\n' "${OPG_NAMES[$i]}" "$v" ;;
+      *)      printf '%s\t\n' "${OPG_NAMES[$i]}" ;;
+    esac
+  done
 }
 
 # Entries that hold a literal value AND whose name looks like a secret. A plain
 # `NODE_ENV=test` is fine in a committed file; a literal `JWT_SECRET=` is not, and
 # warning about both would train you to ignore the warning.
-OPGATE_SECRETY_NAME='(SECRET|TOKEN|_KEY|^KEY|APIKEY|API_KEY|PASSWORD|PASSWD|PWD|CREDENTIAL|PRIVATE|SIGNING|SALT|CERT|DSN|DATABASE_URL|REDIS_URL|CONNECTION_STRING|AUTH|SESSION|COOKIE|WEBHOOK|ACCESS_KEY|SECRET_KEY)'
+OPGATE_SECRETY_NAME='(SECRET|TOKEN|_KEY|^KEY|APIKEY|API_KEY|PASSWORD|PASSWD|PASSPHRASE|_PASS|^PASS|_PW$|PWD|CREDENTIAL|PRIVATE|SIGNING|SALT|CERT|DSN|DATABASE_URL|REDIS_URL|CONNECTION_STRING|AUTH|SESSION|COOKIE|WEBHOOK|ACCESS_KEY|SECRET_KEY|SEED|MNEMONIC)'
 
 env_file_literals() {
-  local file="$1"
-  # Empty values and obvious placeholders are excluded: warning that
-  # `TODO_KEY=changeme` is "a secret in a committable file" is noise, and noise is
-  # how a warning stops being read.
-  env_file_pairs "$file" \
-    | awk -F'\t' '
-        $2 ~ /^op:\/\// { next }
-        $2 == "" { next }
-        tolower($2) ~ /^(changeme|change-me|x+|y+|todo|tbd|your[-_a-z]*|replace[-_a-z]*|example|placeholder|dummy|<.*>|\$\{.*\})$/ { next }
-        { print $1 }' \
-    | grep -E "$OPGATE_SECRETY_NAME" || true
+  parse_env_file "$1"
+  local i name value uname
+  for (( i = 0; i < ${#OPG_NAMES[@]}; i++ )); do
+    name="${OPG_NAMES[$i]}"; value="${OPG_VALUES[$i]}"
+    [[ -z "$value" ]] && continue
+    case "$value" in op://*) continue ;; esac
+    # Placeholders are not leaks; warning about `TODO_KEY=changeme` is noise, and
+    # noise is how a warning stops being read.
+    if declare -f _is_placeholder >/dev/null 2>&1 && _is_placeholder "$value"; then continue; fi
+    uname=$(printf '%s' "$name" | LC_ALL=C tr 'a-z' 'A-Z')
+    [[ "$uname" =~ $OPGATE_SECRETY_NAME ]] && printf '%s\n' "$name"
+  done
 }
 
-# Truncate a list for display in the Touch ID sheet, which has limited room.
+# Render a list for the Touch ID sheet. The count is always shown: the sheet has
+# limited room, so a long list is truncated, and an approval that silently hides
+# how much it covers is worse than one that says "and 40 more".
 summarize_list() {
   local -a items=("$@")
-  local count=${#items[@]}
+  local count=${#items[@]} shown=12
   if (( count == 0 )); then printf '(none)'; return; fi
-  if (( count <= 6 )); then
-    printf '%s' "$(IFS=', '; printf '%s' "${items[*]}")"
+  if (( count <= shown )); then
+    printf '%d: %s' "$count" "$(IFS=', '; printf '%s' "${items[*]}")"
   else
-    local -a head=("${items[@]:0:6}")
-    printf '%s +%d nữa' "$(IFS=', '; printf '%s' "${head[*]}")" "$((count - 6))"
+    local -a head=("${items[@]:0:shown}")
+    printf '%d biến: %s +%d nữa' "$count" "$(IFS=', '; printf '%s' "${head[*]}")" "$((count - shown))"
   fi
 }

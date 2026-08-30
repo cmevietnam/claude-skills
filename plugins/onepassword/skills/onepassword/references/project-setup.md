@@ -32,10 +32,15 @@ Một lần Touch ID cho cả file; sheet liệt kê mọi biến sắp được
 
 - tạo/cập nhật item `<project>-<thư mục>-<môi trường>` trong vault `Dev`, tag
   `opgate` và `project:<tên>`
-- sinh `.env.op` cạnh file gốc: secret thành `op://` ref, biến không bí mật giữ
-  nguyên literal
-- sao lưu bản gốc vào `~/.local/share/opgate/backups/` (chmod 600)
-- **không** xoá bản gốc
+- sinh file reference cạnh file gốc: `.env` → `.env.op`,
+  `.env.production` → `.env.production.op`. Secret thành `op://` ref, biến không
+  bí mật giữ nguyên literal (được quote khi cần)
+- **không** xoá và **không** sao lưu bản gốc. Bản gốc vẫn nằm đó, nên một bản sao
+  plaintext thứ hai chỉ nới rộng vùng lộ. Cần thì `--backup`, rồi tự xoá.
+
+Nó dừng lại thay vì ghi đè khi: item đã tồn tại nhưng không do opgate tạo, hai file
+khác nhau cùng suy ra một tên item, hoặc file `.op` đích đang được sinh từ nguồn
+khác. `--force` bỏ qua các chốt đó.
 
 Biến nó không chắc thì nó hỏi, và câu hỏi chỉ mô tả hình dạng giá trị chứ không in
 giá trị. Không có terminal thì nó dừng thay vì đoán — `--yes` để đưa hết những ca
@@ -79,8 +84,7 @@ commit được thành file rò rỉ.
 
 ## 4. Dọn plaintext
 
-`import` đã sao lưu bản gốc vào `~/.local/share/opgate/backups/` và **không** xoá
-nó. Sau khi chắc chắn app chạy được bằng `.env.op`:
+`import` giữ nguyên bản gốc. Sau khi chắc chắn app chạy được bằng file `.op`:
 
 ```bash
 git check-ignore .env || echo ".env" >> .gitignore

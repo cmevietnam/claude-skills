@@ -16,7 +16,8 @@ transcript của cuộc hội thoại và được gửi lên model provider. M�
 đó coi như đã lộ và phải rotate — vault trở nên vô nghĩa.
 
 Vì vậy `opgate` **không có lệnh `read`**. Secret chỉ đi tới ba nơi: env của một
-process con, clipboard, hoặc một file đã được git ignore.
+process con, clipboard, hoặc một file đã được git ignore. (`opgate import --backup`
+tạo thêm một bản sao plaintext — mặc định tắt, và nếu bật thì bạn phải tự xoá.)
 
 ## Việc không được làm
 
