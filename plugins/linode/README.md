@@ -1,73 +1,76 @@
 # linode
 
-Làm việc với Linode trong ranh giới tag của project: resource tạo ra luôn mang tag
-project, và mọi thao tác ghi lên resource của project khác đều bị chặn.
+Work with Linode inside the project's tag boundary: resources are created with the
+project tag, and writes to another project's resources are refused.
 
-Một account Linode phẳng — mọi project chung một chỗ. Plugin này dựng lại ranh giới
-mà API không có, bằng hai trục tag: **project** (của ai) và **env** (môi trường
-nào). `linode-cli` vẫn là công cụ chính; `lingate` chỉ lo phần `linode-cli` không
-có khái niệm.
+A Linode account is flat — every project shares one space. This plugin rebuilds the
+boundary the API does not have, along two tag axes: **project** (whose) and **env**
+(which environment). `linode-cli` stays the main tool; `lingate` only covers what
+`linode-cli` has no concept of.
 
-## Cài
+## Install
 
 ```bash
 claude plugin install linode@hieuvo-skills
 ```
 
-Rồi ở mỗi repo, một lần:
+Then, once per repo:
 
 ```bash
 lingate init cme --region sg-sin-2 --envs dev,staging,prod --protect prod
-lingate orphans        # resource cũ chưa gắn tag
+lingate orphans        # older resources with no tags
 lingate doctor
 ```
 
-Cần `linode-cli` đã `configure`. Không cần gì khác — hook và `lingate` chỉ dùng
-bash, awk và chính `linode-cli`. Dùng `perl` (macOS có sẵn) để đặt deadline cho lời
-gọi API, và dùng `jq` nếu có nhưng không bắt buộc.
+Needs a `configure`d `linode-cli`. Nothing else — the hooks and `lingate` use only
+bash, awk and `linode-cli` itself. `perl` (shipped with macOS) sets the deadline on
+API calls, and `jq` is used when present but not required.
 
-## Ranh giới
+## The boundary
 
-Hook `PreToolUse(Bash)` xét mọi lệnh `linode-cli` và **fail closed**: API lỗi, id
-lạ, action chưa biết, hay chính hook hỏng giữa chừng đều thành từ chối. Ngoại lệ
-duy nhất nằm ngoài tầm với của nó — nếu cả hook chạy quá `timeout` trong
-`hooks.json` thì Claude Code bỏ qua quyết định và lệnh đi tiếp; vì vậy mọi lời gọi
-API trong một lần hook dùng chung một ngân sách (`LINGATE_BUDGET`, mặc định 11s,
-mỗi lời gọi tối đa `LINGATE_DEADLINE` 8s) để kịp trả lời "từ chối" trước khi hết
-giờ. Chi tiết: `skills/linode/references/guard-rules.md`.
+The `PreToolUse(Bash)` hook inspects every `linode-cli` command and **fails
+closed**: an API error, an unknown id, an unclassified action, or the hook itself
+breaking halfway all end in a refusal. The one exception is out of its reach — if
+the whole hook exceeds the `timeout` in `hooks.json`, Claude Code discards the
+decision and the command proceeds; so every API call in one hook run shares a
+budget (`LINGATE_BUDGET`, default 11 s, each call capped at `LINGATE_DEADLINE`
+8 s) so a "refuse" can still be answered in time. Details:
+`skills/linode/references/guard-rules.md`.
 
-- Đọc (`list`, `view`, …) — luôn cho qua.
-- Tạo — bắt buộc `--tags <project>` và `--tags <env>`.
-- Ghi lên resource của project khác — từ chối, không ngoại lệ.
-- Ghi lên resource chưa gắn tag — từ chối, chỉ sang `lingate adopt`.
-- Ghi lên resource khác môi trường — từ chối (CROSS-ENV).
-- Resource phục vụ nhiều môi trường — từ chối, trừ khi project bật
-  `allowSharedEnvs`; khi đó cho phép nhưng **luôn hỏi** nếu một trong các môi
-  trường còn lại được bảo vệ.
-- Ghi trong `protectedEnvs` — hỏi người dùng.
-- Sửa hoặc xoá chính tag ranh giới (`tags create/delete`) — chặn hoặc hỏi.
-- `--help` và các trang trợ giúp cục bộ — luôn cho qua, chúng không chạm API.
-- Credential ra stdout (`kubeconfig-view`, `*-creds-view`, `--root_pass` viết
-  thẳng) — hỏi hoặc từ chối, và chỉ sang skill `onepassword`.
+- Reads (`list`, `view`, …) — always pass.
+- Creates — `--tags <project>` and `--tags <env>` are mandatory.
+- Writes to another project's resource — refused, no exceptions.
+- Writes to an untagged resource — refused, pointing at `lingate adopt`.
+- Writes to a resource in another environment — refused (CROSS-ENV).
+- Resources serving several environments — refused, unless the project enables
+  `allowSharedEnvs`; then allowed, but **always asks** when one of the other
+  environments is protected.
+- Writes in `protectedEnvs` — ask the user.
+- Editing or deleting the boundary tags themselves (`tags create/delete`) — refuse
+  or ask.
+- `--help` and local help topics — always pass; they never reach the API.
+- Credentials on stdout (`kubeconfig-view`, `*-creds-view`, a literal
+  `--root_pass`) — ask or refuse, pointing at the `onepassword` skill.
 
-Bảng luật đầy đủ: `skills/linode/references/guard-rules.md`.
+Full rule table: `skills/linode/references/guard-rules.md`.
 
-Đây là thứ chặn sai sót thường gặp, không phải sandbox — một agent muốn né thì né
-được. Giá trị của nó là chặn cái sai *có khả năng xảy ra* trước khi nó thành sự cố.
+It stops the ordinary mistake, it is not a sandbox — an agent that wants to evade
+it can. Its value is stopping the _likely_ mistake before it becomes an incident.
 
-## Quyền sở hữu nằm ở đâu
+## Where ownership lives
 
-| Loại | Nguồn sự thật |
-|---|---|
-| `linodes` `volumes` `nodebalancers` `domains` `lke` `firewalls` `images` | trường `tags` trên API |
-| `databases` `vpcs` `object-storage` `placement` `stackscripts` `sshkeys` | `.linode/owned.json` trong repo |
+| Type                                                                     | Source of truth                  |
+| ------------------------------------------------------------------------ | -------------------------------- |
+| `linodes` `volumes` `nodebalancers` `domains` `lke` `firewalls` `images` | the `tags` field on the API      |
+| `databases` `vpcs` `object-storage` `placement` `stackscripts` `sshkeys` | `.linode/owned.json` in the repo |
 
-Nhóm dưới không có trường `tags` trên API Linode, nên id được ghi sổ ngay lúc tạo
-bởi hook `PostToolUse` (vì vậy create của nhóm này bắt buộc `--json`).
+The second group has no `tags` field on the Linode API, so the id is recorded at
+creation time by the `PostToolUse` hook (which is why creates in this group
+require `--json`).
 
-Cả `.linode/project.json` lẫn `.linode/owned.json` đều **commit vào git**.
+Both `.linode/project.json` and `.linode/owned.json` are **committed to git**.
 
-## Cấu hình
+## Configuration
 
 `.linode/project.json`:
 
@@ -83,29 +86,30 @@ Cả `.linode/project.json` lẫn `.linode/owned.json` đều **commit vào git*
 }
 ```
 
-Bỏ `envs` (`lingate init --no-envs`) thì tắt hoàn toàn hàng rào cross-env.
+Omit `envs` (`lingate init --no-envs`) to disable the cross-env guard entirely.
 
-`allowSharedEnvs` (`lingate init --shared-envs`) cho phép một resource phục vụ
-nhiều môi trường — hợp lệ khi cố ý gộp để tiết kiệm, nhưng mọi lệnh ghi lên nó
-đều phải xác nhận nếu môi trường còn lại được bảo vệ. `lingate doctor` liệt kê
-chúng như nợ kỹ thuật: trạng thái đích vẫn là một resource một môi trường.
+`allowSharedEnvs` (`lingate init --shared-envs`) lets one resource serve several
+environments — legitimate when consolidating on purpose to save cost, but every
+write to it must be confirmed when the other environment is protected.
+`lingate doctor` lists them as technical debt: the target state is still one
+resource, one environment.
 
-Biến môi trường:
+Environment variables:
 
-| Biến | Mặc định | Việc |
-|---|---|---|
-| `LINODE_ENV` | `defaultEnv` | Môi trường của lệnh. Tiền tố ngay trên dòng lệnh (`LINODE_ENV=prod linode-cli …`) là cách duy nhất hook nhìn thấy được. |
-| `LINGATE_TTL` | `60` | Giây cache kết quả tra tag tại `~/.cache/lingate`. Lệnh phá huỷ luôn bỏ qua cache. |
-| `LINGATE_GUARD` | `on` | `off` tắt hàng rào. Việc của con người, không phải của agent. |
-| `LINGATE_DEADLINE` | `8` | Giây tối đa cho **một** lời gọi API tra tag. |
-| `LINGATE_BUDGET` | `11` | Giây tối đa cho **tất cả** lời gọi API của một lần hook — phải nhỏ hơn `timeout` 15s trong `hooks.json`. |
+| Variable           | Default      | Purpose                                                                                                                     |
+| ------------------ | ------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| `LINODE_ENV`       | `defaultEnv` | The command's environment. A prefix on the command line (`LINODE_ENV=prod linode-cli …`) is the only form the hook can see. |
+| `LINGATE_TTL`      | `60`         | Seconds a tag lookup is cached under `~/.cache/lingate`. Destructive actions always bypass the cache.                       |
+| `LINGATE_GUARD`    | `on`         | `off` disables the guard. A decision for a person, not for the agent.                                                       |
+| `LINGATE_DEADLINE` | `8`          | Maximum seconds for **one** tag lookup.                                                                                     |
+| `LINGATE_BUDGET`   | `11`         | Maximum seconds for **all** API calls of one hook run — must stay below the 15 s `timeout` in `hooks.json`.                 |
 
-## Test
+## Tests
 
 ```bash
 bash plugins/linode/scripts/test-guard.sh
 ```
 
-162 assertion, chạy hoàn toàn offline: một `linode-cli` giả ở đầu `PATH` trả lời mọi
-truy vấn quyền sở hữu từ một bảng cố định, nên không cần account, token hay mạng.
-Mỗi lỗ hổng từng được tìm ra đều có một assertion giữ chỗ.
+170 assertions, fully offline: a stub `linode-cli` at the front of `PATH` answers
+every ownership lookup from a fixed table, so no account, token or network is
+needed. Every hole ever found has an assertion holding its place.

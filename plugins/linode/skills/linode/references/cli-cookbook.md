@@ -1,43 +1,44 @@
-# Công thức linode-cli
+# linode-cli recipes
 
-Tra cứu chuẩn vẫn là `linode-cli <group> <action> --help`. Đây là những thứ hay
-dùng và những cái bẫy đã gặp thật.
+The reference is still `linode-cli <group> <action> --help`. These are the things
+used most, and the traps actually hit.
 
-Mọi ví dụ giả định project `cme`, env `staging`. Đổi tag cho khớp
+Every example assumes project `cme`, env `staging`. Change the tags to match
 `lingate whoami`.
 
-## Nhìn account qua lăng kính project
+## The account through the project lens
 
 ```bash
 linode-cli linodes list --tags cme --json | jq -r '.[] | "\(.id)\t\(.label)\t\(.status)"'
 linode-cli linodes list --tags cme --text --no-headers --format 'id,label,tags'
-lingate ls                                   # gộp cả loại dùng sổ sở hữu
+lingate ls                                   # includes the ledger-backed types
 ```
 
-Lọc chạy phía server nên rẻ. Ghép nhiều điều kiện được: `--tags cme --region sg-sin-2`.
+Filtering runs server-side, so it is cheap. Conditions combine:
+`--tags cme --region sg-sin-2`.
 
 ## Compute
 
 ```bash
-# tạo — hai tag luôn đi cùng nhau
+# create — the two tags always travel together
 linode-cli linodes create --tags cme --tags staging \
   --label cme-web-1 --region sg-sin-2 --type g6-standard-1 --image linode/ubuntu26.04
 
-# đổi type (dừng máy, không đảo ngược ngay được)
+# change type (stops the machine; not immediately reversible)
 linode-cli linodes resize 12345 --type g6-standard-2
 
-# cài lại từ image — xoá sạch đĩa
+# reinstall from an image — wipes the disk
 opgate exec ROOT_PASS=op://Dev/cme/LINODE_ROOT_PASS -- \
   linode-cli linodes rebuild 12345 --image linode/ubuntu26.04 --root_pass "$ROOT_PASS"
 
 linode-cli linodes ips-list 12345 --json | jq -r '.ipv4.public[].address'
 ```
 
-## Volume, DNS, firewall
+## Volumes, DNS, firewalls
 
 ```bash
 linode-cli volumes create --tags cme --tags staging --label cme-data --size 20 --region sg-sin-2
-linode-cli volumes attach 555 --linode_id 12345      # hook kiểm tra CẢ hai đầu
+linode-cli volumes attach 555 --linode_id 12345      # the hook checks BOTH ends
 
 linode-cli domains create --tags cme --tags staging --domain cme.example --type master --soa_email a@b.c
 linode-cli domains records-create 22000001 --type A --name api --target 1.2.3.4 --ttl_sec 300
@@ -47,8 +48,8 @@ linode-cli firewalls create --tags cme --tags staging --label cme-fw \
 linode-cli firewalls device-create 999 --id 12345 --type linode
 ```
 
-`domains records-create 22000001 …` — id đầu tiên là domain cha, và quyền sở hữu
-được thừa kế từ đó; bản thân record không mang tag.
+`domains records-create 22000001 …` — the first id is the parent domain, and
+ownership is inherited from it; the record itself carries no tags.
 
 ## LKE
 
@@ -61,40 +62,41 @@ linode-cli lke pools-list 580172 --json | jq -r '.[] | "\(.id)\t\(.count)\t\(.ty
 linode-cli lke pool-update 580172 848275 --count 3
 ```
 
-Node worker (`lke580172-…`) không mang tag riêng; muốn biết nó thuộc về ai thì nhìn
-cluster. Đừng gắn tag tay cho chúng — recycle một cái là tag biến mất.
+Worker nodes (`lke580172-…`) carry no tags of their own; to know whose they are,
+look at the cluster. Do not tag them by hand — one recycle and the tag is gone.
 
-## Loại không gắn tag được
+## Types that cannot carry tags
 
 ```bash
-linode-cli vpcs create --label cme-vpc --region sg-sin-2 --json      # --json là bắt buộc
+linode-cli vpcs create --label cme-vpc --region sg-sin-2 --json      # --json is mandatory
 linode-cli databases mysql-create --label cme-db --region sg-sin-2 \
   --engine mysql/8 --type g6-nanode-1 --cluster_size 1 --json
 ```
 
-`--json` để hook `PostToolUse` đọc được id và ghi `.linode/owned.json`. Chạy lệnh
-tạo **một mình** — không `&&` với lệnh khác, không redirect stdout — vì hook đọc id
-từ stdout của cả lần gọi. Nếu nó báo không đọc được id thì ghi tay:
-`lingate own <group> <id> --env <env>`.
+`--json` lets the `PostToolUse` hook read the id and write `.linode/owned.json`.
+Run the create **alone** — no `&&` with another command, no stdout redirect —
+because the hook reads the id from the whole call's stdout. If it reports that it
+could not read the id, record it by hand: `lingate own <group> <id> --env <env>`.
 
-## Theo dõi tác vụ chạy nền
+## Following background work
 
-Resize, rebuild, migrate đều bất đồng bộ. Trạng thái nằm ở `events`:
+Resize, rebuild and migrate are asynchronous. Their state lives in `events`:
 
 ```bash
 linode-cli events list --json | jq -r '.[:5][] | "\(.action)\t\(.status)\t\(.entity.label // "")"'
 linode-cli linodes view 12345 --text --no-headers --format 'status'
 ```
 
-## Bẫy hay gặp
+## Common traps
 
-- **`update --tags` là PUT**, thay toàn bộ mảng tag chứ không thêm vào. Muốn thêm
-  thì `lingate adopt`, đừng tự viết update.
-- **Bảng mặc định bị truncate** và giấu cột. Dùng `--json`, hoặc `--no-truncation`
-  với `--all-columns`.
-- **Cảnh báo lệch version API** in ra ở mọi lệnh (`The API responded with version …`).
-  Nó ở stderr; `--suppress-warnings` khi script hoá.
-- **Phân trang**: `list` mặc định trả một trang. `--all-rows` khi cần hết.
-- **`--raw-body`** cho endpoint mà CLI chưa dựng cờ; chỉ dùng với POST/PUT.
-- **`images`** trộn cả image công khai của Linode và image riêng; lọc bằng
-  `--is_public false` hoặc `--tags cme`.
+- **`update --tags` is a PUT** that replaces the whole tag array; it does not
+  append. To add a tag use `lingate adopt`, never a hand-written update.
+- **The default table truncates** and hides columns. Use `--json`, or
+  `--no-truncation` with `--all-columns`.
+- **The API-version mismatch warning** prints on every command
+  (`The API responded with version …`). It is stderr; `--suppress-warnings` when
+  scripting.
+- **Pagination**: `list` returns one page by default. `--all-rows` for everything.
+- **`--raw-body`** for endpoints the CLI has no flags for yet; POST/PUT only.
+- **`images`** mixes Linode's public images with private ones; filter with
+  `--is_public false` or `--tags cme`.

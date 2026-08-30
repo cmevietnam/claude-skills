@@ -1,10 +1,17 @@
 {
   "name": "linode",
-  "description": "Làm việc với Linode trong ranh giới tag của project: resource tạo ra luôn mang tag project, và mọi thao tác ghi lên resource của project khác đều bị chặn.",
+  "description": "Work with Linode inside the project's tag boundary: resources are created with the project tag, and writes to another project's resources are refused.",
   "version": "0.1.0",
   "author": { "name": "hieuvo" },
   "homepage": "https://github.com/hieuvo/claude-skills",
   "repository": "https://github.com/hieuvo/claude-skills",
   "license": "MIT",
-  "keywords": ["linode", "akamai", "cloud", "infrastructure", "tags", "guardrails"]
+  "keywords": [
+    "linode",
+    "akamai",
+    "cloud",
+    "infrastructure",
+    "tags",
+    "guardrails"
+  ]
 }

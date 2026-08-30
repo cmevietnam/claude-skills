@@ -1,136 +1,140 @@
 ---
 name: linode
-description: Thao tác hạ tầng Linode bằng `linode-cli`, trong ranh giới tag của project và tag môi trường. Dùng khi cần tạo hoặc sửa Linode/volume/DNS/firewall/LKE, khi cần xem hạ tầng của project, khi gặp resource chưa gắn tag, khi một lệnh Linode bị hook chặn, hoặc khi lệnh cần root password / kubeconfig / credential.
+description: Operate Linode infrastructure with `linode-cli` inside the project's tag boundary and environment tag. Use when creating or changing Linodes/volumes/DNS/firewalls/LKE, when inspecting the project's infrastructure, when a resource has no tags, when a Linode command is refused by the hook, or when a command needs a root password / kubeconfig / credential.
 ---
 
-# Linode trong ranh giới project và môi trường
+# Linode inside the project and environment boundary
 
-Một account Linode phẳng: mọi project nằm chung một chỗ và nhìn thấy nhau. Thứ duy
-nhất chia chúng ra là **tag**. Vì vậy mỗi resource ở đây mang hai tag — tag project
-nói nó của ai, và tag env nói nó là môi trường nào — còn hook `PreToolUse` từ chối
-mọi lệnh ghi không thoả cả hai. Vài loại (VPC, database, object storage…) API không
-cho gắn tag; chúng dùng sổ sở hữu trong repo thay thế.
+A Linode account is flat: every project sits in one pile and can see the others.
+The only thing that separates them is **tags**. So every resource here carries two
+tags — the project tag says whose it is, the env tag says which environment it is —
+and the `PreToolUse` hook refuses any write that does not satisfy both. A few types
+(VPC, database, object storage…) cannot carry tags on the API; those use an
+ownership ledger in the repo instead.
 
-`linode-cli` vẫn là công cụ chính, không bị bọc lại. `lingate` chỉ lo phần
-`linode-cli` không có khái niệm: project, môi trường, và sổ sở hữu.
+`linode-cli` stays the main tool, unwrapped. `lingate` only covers what
+`linode-cli` has no concept of: project, environment, and the ledger.
 
-## Luật quan trọng nhất
+## The rule that matters most
 
-**Đọc thoải mái, ghi thì phải đúng cả project lẫn env.** Cụ thể:
+**Read freely; write only with the right project AND the right env.** Concretely:
 
-1. Resource mới tạo **luôn** kèm `--tags <project>` và `--tags <env>`. Thiếu một
-   trong hai là resource ra đời ngoài hàng rào, và từ đó không lệnh nào chạm được
-   vào nó nữa.
-2. **Không bao giờ ghi lên resource mang tag project khác.** Không ngoại lệ, kể cả
-   khi người dùng nói "cứ sửa giúp" — hãy hỏi lại và để họ tự chạy.
-3. **Cross-env là lỗi, không phải chi tiết.** Lệnh chạy ở env `staging` không được
-   đụng vào resource tag `prod`. Muốn sang env khác thì nói thẳng ra ngay trên dòng
-   lệnh: `LINODE_ENV=prod linode-cli …`, và hỏi người dùng trước.
-4. **Một resource, một môi trường.** Trừ khi project bật `allowSharedEnvs` — khi đó
-   một máy được phục vụ hai env để tiết kiệm, nhưng mọi lệnh ghi lên nó sẽ hỏi nếu
-   env còn lại được bảo vệ. Đừng tự gắn thêm env tag thứ hai; dùng `lingate adopt`.
+1. A new resource **always** gets `--tags <project>` and `--tags <env>`. Miss
+   either and it is born outside the fence, and from then on no command can touch
+   it.
+2. **Never write to a resource tagged with another project.** No exceptions, even
+   when the user says "just fix it" — ask again and let them run it themselves.
+3. **Cross-env is an error, not a detail.** A command running in `staging` must not
+   touch a resource tagged `prod`. To work in another env, say so on the command
+   line — `LINODE_ENV=prod linode-cli …` — and ask the user first.
+4. **One resource, one environment.** Unless the project enables
+   `allowSharedEnvs` — then one box may serve two envs to save cost, but every
+   write to it asks when the other env is protected. Never add a second env tag
+   yourself; use `lingate adopt`.
 
-## Việc không được làm
+## Do not
 
-- Chạy `linode-cli … create` mà quên `--tags`. Không có tag = không có chủ.
-- `linode-cli <group> update <id> --tags x` để "đổi tag" — đây là PUT thay **toàn
-  bộ** mảng tag. Muốn thêm tag thì `lingate adopt`, đừng tự viết lệnh update.
-- Tự adopt resource chưa gắn tag. Nó có thể là của project khác. **Hỏi người dùng
-  trước**, rồi mới `lingate adopt <group> <id> --env <env> --yes`.
-- `--root_pass <mật khẩu viết thẳng>` → giá trị vào transcript, phải rotate ngay.
-  Dùng `opgate exec`, xem `references/secrets.md`.
-- In kubeconfig / DB credential / object-storage key ra stdout. Cho nó đi thẳng vào
-  file đã git-ignore hoặc vào 1Password.
-- Viết tắt tên cờ (`--tag` thay `--tags`). CLI chấp nhận và hook cũng hiểu, nhưng
-  người đọc lại lệnh thì không — viết đủ.
-- Đưa id hay tag qua biến shell (`--linode_id $ID`, `--tags $TAGS`), hay bọc
-  `linode-cli` trong một wrapper lạ. Hook không đọc được thì từ chối hoặc hỏi —
-  viết id và tag rõ ràng ngay trên dòng lệnh.
-- Nối lệnh tạo loại dùng sổ (VPC, database…) với lệnh khác bằng `&&`/`;`, hay
-  redirect stdout của nó. Chạy nó một mình với `--json` để sổ sở hữu ghi đúng id.
-- Đoán khi bị chặn. Hook luôn nói rõ lệnh đúng là gì — đọc rồi làm theo, đừng thử
-  đường vòng.
+- Run `linode-cli … create` without `--tags`. No tag, no owner.
+- Use `linode-cli <group> update <id> --tags x` to "change a tag" — it is a PUT
+  that replaces the **whole** tag array. To add a tag, `lingate adopt`; never write
+  the update yourself.
+- Adopt an untagged resource on your own. It may belong to another project. **Ask
+  the user first**, then `lingate adopt <group> <id> --env <env> --yes`.
+- `--root_pass <literal password>` → the value lands in the transcript and must be
+  rotated at once. Use `opgate exec`; see `references/secrets.md`.
+- Print a kubeconfig / DB credential / object-storage key to stdout. Send it
+  straight to a git-ignored file or into 1Password.
+- Abbreviate flag names (`--tag` for `--tags`). The CLI accepts it and the hook
+  understands it, but whoever reads the command later will not — spell it out.
+- Pass ids or tags through shell variables (`--linode_id $ID`, `--tags $TAGS`), or
+  wrap `linode-cli` in an unfamiliar wrapper. What the hook cannot read it refuses
+  or asks about — write ids and tags literally on the command line.
+- Chain a ledger-type create (VPC, database…) with another command via `&&`/`;`,
+  or redirect its stdout. Run it alone with `--json` so the ledger records the
+  right id.
+- Guess when refused. The hook always states the correct command — read it and
+  follow it; do not look for a way around.
 
-## Chạy linode-cli
+## Running linode-cli
 
-- Cú pháp `linode-cli <group> <action> [id...] [--flags]`. `linode-cli commands`
-  liệt kê group; `linode-cli <group> <action> --help` là nguồn tra cứu chuẩn —
-  dùng nó thay vì đoán tên flag.
-- **Luôn `--json`** khi cần đọc kết quả bằng máy rồi ghép với `jq`; bảng mặc định
-  cắt cột và truncate giá trị. `--text --no-headers --format 'id,label,tags'` khi
-  chỉ cần vài cột.
-- Lọc phía server ngay ở `list`: `--tags`, `--region`, `--label`, `--id`. Đây là
-  cách nhìn account qua lăng kính project: `linode-cli linodes list --tags cme`.
-- Region/type/image mặc định đã có trong `~/.config/linode-cli` nên khỏi truyền
-  lại — nhưng tag thì không có mặc định, luôn phải truyền tay.
-- Mỗi lệnh in một dòng cảnh báo lệch version API. Đó là tiếng ồn trên stderr, lọc
-  bằng `--suppress-warnings` khi script hoá.
+- Syntax: `linode-cli <group> <action> [id...] [--flags]`. `linode-cli commands`
+  lists the groups; `linode-cli <group> <action> --help` is the reference — use it
+  instead of guessing flag names.
+- **Always `--json`** when the output will be parsed, then `jq`; the default table
+  drops columns and truncates values. `--text --no-headers --format 'id,label,tags'`
+  when a few columns are enough.
+- Filter server-side right in `list`: `--tags`, `--region`, `--label`, `--id`. That
+  is the project lens on the account: `linode-cli linodes list --tags cme`.
+- Default region/type/image already live in `~/.config/linode-cli`, so they need
+  not be repeated — but tags have no default and must always be passed.
+- Every command prints one API-version-mismatch warning. That is stderr noise;
+  `--suppress-warnings` when scripting.
 
-## Lệnh lingate
+## lingate commands
 
-| Lệnh | Dùng khi |
-|---|---|
-| `lingate whoami` | Không chắc đang đứng ở project/env nào. Rẻ, cứ gọi trước khi ghi. |
-| `lingate ls [group]` | Muốn biết project này đang có gì. |
-| `lingate orphans` | Có resource chưa gắn tag; đây là danh sách ứng viên adopt. |
-| `lingate adopt <g> <id> --env E` | Nhận một resource cũ về project. In dry-run trước; chỉ chạy thật khi thêm `--yes`. |
-| `lingate own <g> <id> --env E` | Loại không gắn tag được (VPC, database, object storage…) — ghi vào sổ. |
-| `lingate disown <g> <id>` | Resource đã xoá hoặc không còn thuộc project. |
-| `lingate init <tag> --envs a,b,c` | Repo chưa có `.linode/project.json`. |
-| `lingate doctor` | Có gì đó không chạy. In toàn bộ trạng thái và cách sửa. |
+| Command                           | When                                                                                      |
+| --------------------------------- | ----------------------------------------------------------------------------------------- |
+| `lingate whoami`                  | Unsure which project/env you are in. Cheap; run it before any write.                      |
+| `lingate ls [group]`              | What does this project own.                                                               |
+| `lingate orphans`                 | Untagged resources exist; this is the adoption shortlist.                                 |
+| `lingate adopt <g> <id> --env E`  | Bring an older resource into the project. Dry-run first; only runs for real with `--yes`. |
+| `lingate own <g> <id> --env E`    | Untaggable type (VPC, database, object storage…) — record it in the ledger.               |
+| `lingate disown <g> <id>`         | Resource deleted or no longer the project's.                                              |
+| `lingate init <tag> --envs a,b,c` | The repo has no `.linode/project.json` yet.                                               |
+| `lingate doctor`                  | Something is off. Prints the whole state and how to fix it.                               |
 
-## Quy trình thường gặp
+## Common workflows
 
-**Tạo resource mới** — tag project và tag env đi cùng nhau, luôn luôn:
+**Create a resource** — project tag and env tag travel together, always:
 
 ```bash
-lingate whoami                              # đang ở project/env nào
+lingate whoami                              # which project/env am I in
 linode-cli linodes create --tags cme --tags staging \
   --label cme-web-1 --region sg-sin-2
 ```
 
-**Thao tác trên môi trường khác** — nói rõ ngay trên dòng lệnh, và hỏi trước:
+**Work in another environment** — say it on the command line, and ask first:
 
 ```bash
 LINODE_ENV=prod linode-cli linodes reboot 95747451
 ```
 
-**Gặp resource chưa gắn tag** — đừng tự nhận:
+**An untagged resource** — do not claim it yourself:
 
 ```bash
-lingate orphans                             # nó là của ai chưa biết
-lingate adopt linodes 95747451 --env prod   # dry-run, in ra sẽ làm gì
-# hỏi người dùng, rồi mới:
+lingate orphans                             # whose it is, nobody knows yet
+lingate adopt linodes 95747451 --env prod   # dry run: prints what it would do
+# ask the user, and only then:
 lingate adopt linodes 95747451 --env prod --yes
 ```
 
-**Tạo loại không gắn tag được** — thêm `--json` để sổ sở hữu tự ghi:
+**Create an untaggable type** — add `--json` so the ledger records it:
 
 ```bash
 linode-cli vpcs create --label cme-vpc --region sg-sin-2 --json
-# hook PostToolUse ghi id vào .linode/owned.json; nhớ commit file đó
+# the PostToolUse hook writes the id to .linode/owned.json; commit that file
 ```
 
-**Lệnh bị chặn**: lý do từ chối đã nói chính xác phải làm gì. Nếu nó bảo resource
-thuộc project khác thì dừng lại và báo người dùng — đó là câu trả lời "không", chứ
-không phải một trở ngại cần vượt qua.
+**A refused command**: the reason states exactly what to do. If it says the
+resource belongs to another project, stop and tell the user — that is the answer
+"no", not an obstacle to get past.
 
-## Quy ước tag & label
+## Tag and label conventions
 
-Hai tag cho mỗi resource, khai báo trong `.linode/project.json` (commit vào git):
+Two tags per resource, declared in `.linode/project.json` (committed to git):
 
 ```
-<tên-project>        cme, urgentc, gocova
-<môi-trường>         dev, staging, prod
+<project-name>       cme, urgentc, gocova
+<environment>        dev, staging, prod
 ```
 
-Label đặt theo `<project>-<vai trò>[-<số>]`: `cme-web-1`, `cme-postgres`. Node của
-LKE do cluster tự sinh (`lke580172-…`) nên không mang tag riêng — quyền sở hữu của
-nó lấy theo cluster, đừng gắn tag tay cho chúng.
+Labels follow `<project>-<role>[-<n>]`: `cme-web-1`, `cme-postgres`. LKE worker
+nodes are created by their cluster (`lke580172-…`) and carry no tags of their own —
+ownership follows the cluster; do not tag them by hand.
 
-## Đọc thêm
+## Further reading
 
-- `references/project-setup.md` — dựng `.linode/project.json` và nhận resource cũ về
-- `references/guard-rules.md` — hook chặn gì, vì sao, và làm gì khi bị chặn
-- `references/secrets.md` — root password, kubeconfig, credential đi qua 1Password
-- `references/cli-cookbook.md` — công thức `linode-cli` cho việc hay làm
+- `references/project-setup.md` — set up `.linode/project.json` and adopt older resources
+- `references/guard-rules.md` — what the hook refuses, why, and what to do when refused
+- `references/secrets.md` — root passwords, kubeconfigs and credentials through 1Password
+- `references/cli-cookbook.md` — `linode-cli` recipes for everyday tasks
