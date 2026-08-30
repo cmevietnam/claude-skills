@@ -61,7 +61,8 @@ môi trường nào tắt được nó. Đường dẫn tới binary được ch
 trong stdout/stderr của process con. `--no-masking` không bao giờ được dùng.
 
 **Lớp 3 — hook.** Chặn `op read` gọi trực tiếp và hỏi trước khi đọc file secret
-plaintext. Chống tai nạn, không phải sandbox.
+plaintext. Chống tai nạn, không phải sandbox. Một lần approve mở **cửa sổ 60 phút
+cho đúng file đó** — xem "Approval windows" bên dưới.
 
 **Lớp 4 — audit log.** `~/.local/state/opgate/access.log`, chmod 600. Chỉ chứa tên
 biến và reference, không chứa giá trị. Không có khoá và không chống sửa; `OPGATE_CALLER`
@@ -116,7 +117,71 @@ Liệt kê ở đây thay vì để bạn tự phát hiện sau.
   `sudo -v` thành công im lặng, không hỏi gì.
 - `OPGATE_TTL` — marker là file đoán trước được trong thư mục ghi được, nên tự tạo
   marker là bỏ qua được prompt. Khoá marker cũng không gồm lệnh hay reference, nên
-  approve một `exec` là mở cho mọi `exec` khác trong cùng thư mục.
+  approve một `exec` là mở cho mọi `exec` khác trong cùng thư mục. Cửa sổ approve
+  của **lớp 3** dùng lại ý tưởng đó nhưng ở một lớp khác hẳn — đọc phần
+  "Approval windows" trước khi kết luận hai thứ là một.
+
+## Approval windows — layer 3 only
+
+*(This section is in English; the rest of this file predates the project-wide
+English rule and has not been retranslated.)*
+
+The guards used to answer "ask" every single time the agent reached for a
+plaintext secret file. Answering the same prompt about the same `.env` thirty
+times in one session is how you stop reading prompts, so an approval now opens a
+**60-minute window for that one file**. Inside the window the guard answers
+"allow"; outside it, nothing changes.
+
+How a window opens, and why neither path is somewhere an agent can quietly stand:
+
+- **You approved a prompt.** The PreToolUse guard writes the key it would grant
+  into `pending/<tool_use_id>`; the PostToolUse hook promotes it. Claude Code does
+  not run PostToolUse for a call that was denied or cancelled, so a promotion is
+  your yes and nothing else. The Post hook does no classification of its own — it
+  only promotes what the guard already decided, so the two hooks cannot drift
+  apart about what counts as a secret file.
+- **`opgate unlock --minutes N <path>…`**, which is Touch ID gated even though it
+  moves no secret value. That is what makes a window traceable: every one opened
+  legitimately has a `GRANT` record in `opgate audit`.
+
+Deliberate limits:
+
+- **Per file, by resolved path.** Approving `.env` does not open `.env.production`,
+  and a command that touches two secret files needs both windows open.
+- **Never over a `deny`.** A window makes a plaintext file quieter. It has no
+  effect on the branch that blocks direct `op` calls, which stays denied.
+- **The auto-remember length is a constant, not an environment variable.** A knob
+  that widens a security window is a knob the guarded thing can turn. `unlock`
+  may ask for longer (up to 8h) because that number appears on the Touch ID sheet
+  before it takes effect.
+- **Modes where nothing was asked record nothing.** Under `bypassPermissions`,
+  `dontAsk` or `auto` no prompt is shown, so the tool running proves nothing. The
+  check is an allowlist (`default`, `plan`, `acceptEdits`), so an unrecognised
+  future mode also records nothing.
+- **Unparsable is not approved.** A grant file with the wrong version, a
+  non-numeric expiry, or a path that does not match the file being opened is
+  treated as no grant.
+
+### Why this is a different trade from `OPGATE_TTL`
+
+`OPGATE_TTL` cached **layer 1** — the Touch ID gate on the vault itself. Forging
+its marker file bought you real secret values without a fingerprint, and the key
+did not include the command, so approving one `exec` opened every `exec` in the
+directory. It deserved to be removed.
+
+A layer-3 window caches the answer to "may I open a file that is already sitting
+plaintext on your disk". Layer 3 is explicitly the accident-preventer, not the
+sandbox: an agent that *wants* that file can already reach it with a command the
+tokenizer does not recognise, so the window does not lower the ceiling. What it
+does raise is the accident surface — for one named file, for one hour, in a
+session you were part of.
+
+Forging a grant is still possible; it is a file in a directory you own. The answer
+is evidence rather than prevention, the same trade as the gate binary hash: every
+window opened writes `GRANT` and every window used writes `GRANT-USED`, so a grant
+with no matching record in `opgate audit` is a forgery you can see. `opgate grants`
+lists what is open, `opgate lock` closes it, and `opgate doctor` warns about any
+window it finds.
 
 ## Prompt nói gì và không nói gì
 

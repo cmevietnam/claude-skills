@@ -9,6 +9,13 @@ set -uo pipefail
 dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 pass=0 fail=0
 
+# The guards now write pending approval records under $HOME. Without this, running
+# the suite left ~30 records in the developer's real ~/.local/state/opgate for
+# files like `/p/.env` that do not exist. A test run must not touch live state.
+_opgate_test_home=$(mktemp -d "${TMPDIR:-/tmp}/opgate-guards.XXXXXX") || exit 1
+trap 'rm -rf -- "$_opgate_test_home"' EXIT
+export HOME="$_opgate_test_home"
+
 decision() { # <script> <json>
   printf '%s' "$2" | bash "$1" | sed -n 's/.*"permissionDecision":"\([a-z]*\)".*/\1/p'
 }

@@ -45,6 +45,9 @@ tạo thêm một bản sao plaintext — mặc định tắt, và nếu bật t
 | `opgate put <ITEM> <FIELD>` | Đưa một secret **vào** 1Password. Đọc giá trị từ stdin. Thêm `--multiline` cho PEM key / JSON nhiều dòng. |
 | `opgate doctor` | Có gì đó không chạy. Kiểm tra toàn bộ setup và in cách sửa. |
 | `opgate audit -n 20` | Xem gần đây đã truy cập secret nào. |
+| `opgate grants` | Xem hook đang mở cửa sổ approve cho file nào, còn bao lâu. Không cần Touch ID. |
+| `opgate unlock -m 60 <file>` | Mở trước một cửa sổ để hook thôi hỏi về đúng file đó. Một lần Touch ID. |
+| `opgate lock [file]` | Đóng cửa sổ ngay. Không tham số = đóng tất cả. Không cần Touch ID. |
 
 ## Quy trình thường gặp
 
@@ -82,6 +85,16 @@ bỏ qua, hãy báo người dùng sửa file.
 **Cách nhóm**: mỗi file env thành một item, đặt tên `<project>-<thư mục>-<môi
 trường>` (`cme-api`, `cme-web-production`), tất cả mang tag `project:<tên>`. Nhóm
 bằng tag chứ không chỉ bằng cách đặt tên, nên lọc được trong app lẫn CLI.
+
+**Hook hỏi rồi người dùng approve** — lần sau nó sẽ **không hỏi lại trong 60 phút**
+cho đúng file đó. Điều này nghĩa là: một `cat .env` đi lọt không có nghĩa là bạn
+được phép đọc thoải mái, chỉ là người dùng đã đồng ý gần đây. Luật "không đưa giá
+trị secret ra stdout" không đổi. Nếu cần biết project có biến gì thì vẫn là
+`opgate list`.
+
+Cửa sổ chỉ mở cho **một file**, theo đường dẫn đã resolve. Nó không bao giờ mở cho
+`op read` / `op item get` — những lệnh đó luôn bị chặn. Người dùng gõ `opgate lock`
+là đóng ngay.
 
 **Lệnh trả về exit 77**: người dùng đã từ chối ở sheet Touch ID. Đó là câu trả lời
 "không" — dừng lại và hỏi, đừng thử lại hay tìm đường vòng. Exit 78 nghĩa là không

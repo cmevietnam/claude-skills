@@ -29,17 +29,15 @@ esac
 # Extract .tool_input.command. jq when available; otherwise a scanner that walks
 # the JSON string honouring backslash escapes, so an embedded `\"` (as in
 # `bash -c "op read ..."`) does not truncate the command we inspect.
-if command -v jq >/dev/null 2>&1; then
-  command_line=$(printf '%s' "$payload" | jq -r '.tool_input.command // ""' 2>/dev/null) || command_line=""
-else
-  command_line=$(printf '%s' "$payload" | awk '
+_json_str() { # <key> — same scanner, any top-level-ish string field
+  printf '%s' "$payload" | awk -v key="$1" '
     { line = line $0 "\n" }
     END {
       # Tolerate whitespace before the colon: `"command" : "..."` is valid JSON,
       # and the jq path accepts it, so this path must too.
-      k = match(line, /"command"[ \t\r\n]*:/)
-      if (k == 0) exit
-      rest = substr(line, k + RLENGTH)
+      pos = match(line, "\"" key "\"[ \t\r\n]*:")
+      if (pos == 0) exit
+      rest = substr(line, pos + RLENGTH)
       q = index(rest, "\"")
       if (q == 0) exit
       rest = substr(rest, q + 1)
@@ -54,7 +52,13 @@ else
         else out = out c
       }
       print out
-    }')
+    }'
+}
+
+if command -v jq >/dev/null 2>&1; then
+  command_line=$(printf '%s' "$payload" | jq -r '.tool_input.command // ""' 2>/dev/null) || command_line=""
+else
+  command_line=$(_json_str command)
 fi
 [[ -n "$command_line" ]] || exit 0
 
@@ -110,7 +114,7 @@ for t in ${tokens[@]+"${tokens[@]}"}; do
 done
 
 if (( danger )); then
-  decide deny "Goi op truc tiep bi chan. Dung opgate: 'opgate run -- <cmd>' de nap secret vao env (co Touch ID gate + audit log), 'opgate copy <ref>' de chep vao clipboard, 'opgate list' de xem co secret gi. Khong bao gio in gia tri secret ra stdout - no se vao transcript va duoc gui len model provider."
+  decide deny "Calling op directly is blocked. Use opgate instead: 'opgate run -- <cmd>' loads the secrets into a child process env (Touch ID gate + audit log), 'opgate copy <ref>' puts one on the clipboard, 'opgate list' shows which secrets exist. Never print a secret value to stdout - it lands in the transcript and is shipped to the model provider. No approval window applies here."
 fi
 
 # --- 2. shell-reading a plaintext secret file -------------------------------
@@ -120,16 +124,51 @@ secret_re='^(\.env[A-Za-z0-9_.*-]*|\.envrc|\.netrc|\.pgpass|\.npmrc|\.git-creden
 safe_re='\.(example|sample|tpl|template|op|pub|md|lock|ts|js|json5)$'
 
 saw_reader=0 saw_secret=0
+secret_tokens=()
 for t in ${tokens[@]+"${tokens[@]}"}; do
   # `dd if=.env`, `--file=.env`: the filename sits after a `key=` prefix.
   [[ "$t" =~ ^[A-Za-z_-]+=(.+)$ ]] && t="${BASH_REMATCH[1]}"
   b="${t##*/}"
   [[ "$b" =~ $readers_re ]] && saw_reader=1
-  if [[ "$b" =~ $secret_re ]] && ! [[ "$b" =~ $safe_re ]]; then saw_secret=1; fi
+  if [[ "$b" =~ $secret_re ]] && ! [[ "$b" =~ $safe_re ]]; then
+    saw_secret=1
+    secret_tokens+=("$t")
+  fi
 done
 
 if (( saw_reader && saw_secret )); then
-  decide ask "Lenh nay doc mot file co the chua secret plaintext. Doc no se dua gia tri vao context cua model va gui len provider. Neu chi can biet co bien gi, dung: opgate list. Neu can chay app voi secret, dung: opgate run -- <cmd>."
+  # The deny branch above is settled before this point and grants never reach it:
+  # a window buys you a quieter prompt on a file already sitting on your disk, not
+  # a way to call `op read`.
+  guard_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+  # shellcheck source=lib/grants.sh
+  source "$guard_dir/lib/grants.sh"
+
+  if command -v jq >/dev/null 2>&1; then
+    cwd=$(printf '%s' "$payload" | jq -r '.cwd // ""' 2>/dev/null) || cwd=""
+  else
+    cwd=$(_json_str cwd)
+  fi
+  call_id=$(grant_call_id "$payload")
+
+  # One command can touch several secret files. Every one of them must already be
+  # open, or the command as a whole is not something you have approved.
+  canons=() all_open=1
+  for t in ${secret_tokens[@]+"${secret_tokens[@]}"}; do
+    c=$(grant_canonical_path "$t" "${cwd:-$PWD}") || { all_open=0; continue; }
+    canons+=("$c")
+    grant_active "$c" >/dev/null || all_open=0
+  done
+  (( ${#canons[@]} )) || all_open=0
+
+  if (( all_open )); then
+    grant_audit "GRANT-USED" "bash" "${canons[0]##*/}"
+    decide allow "opgate: an approval window is open for the secret file(s) this command reads. Run 'opgate grants' to see it, 'opgate lock' to close it now."
+  fi
+
+  [[ -n "$call_id" ]] && (( ${#canons[@]} )) && pending_write "$call_id" "${canons[@]}"
+
+  decide ask "This command reads a file that may hold plaintext secrets. Reading it puts the values into the model context and ships them to the provider. To see which variables exist, use: opgate list. To run the app with its secrets, use: opgate run -- <cmd>. Approving opens a 60-minute window for THESE files only; 'opgate lock' closes it."
 fi
 
 exit 0

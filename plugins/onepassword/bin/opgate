@@ -30,6 +30,8 @@ source "$OPGATE_SCRIPT_DIR/lib/gate.sh"
 source "$OPGATE_SCRIPT_DIR/lib/classify.sh"
 # shellcheck source=../scripts/lib/scan.sh
 source "$OPGATE_SCRIPT_DIR/lib/scan.sh"
+# shellcheck source=../scripts/lib/grants.sh
+source "$OPGATE_SCRIPT_DIR/lib/grants.sh"
 
 usage() {
   cat >&2 <<'USAGE'
@@ -50,8 +52,17 @@ opgate — Touch ID-gated access to 1Password secrets
   opgate audit  [-n N]                  xem nhật ký truy cập
   opgate build                          build lại binary Touch ID gate + ghi hash
 
+  opgate unlock [-m MIN] PATH...        stop the Read/Grep/Bash hook asking about
+                                        these exact files for MIN minutes (60)
+  opgate grants                         list the open windows and their time left
+  opgate lock   [PATH...]               close them (no argument = close every one)
+
 Không có `opgate read` — cố ý. Xem references/security-model.md.
 Mỗi lệnh chạm vào secret đều hỏi Touch ID; không có cache, không có cách tắt.
+
+`unlock`/`lock`/`grants` only affect how often the hook re-asks about a plaintext
+file already on your disk. They cannot skip a Touch ID prompt and cannot reach the
+vault. See references/security-model.md.
 
 Env: OPGATE_VAULT (Dev) · OPGATE_ENV_FILE (.env.op) · OPGATE_ALLOW_PASSWORD (1 để
      cho phép dùng mật khẩu máy thay vân tay)
@@ -549,6 +560,18 @@ cmd_doctor() {
     warn "còn .env plaintext trong repo: $(printf '%s ' "${plaintext[@]}")"
   fi
 
+  # An open window is the one piece of state that makes the guards quieter than
+  # they look, so doctor has to say it out loud rather than let you wonder why a
+  # .env read went through without a prompt.
+  local windows; windows=$(grant_list)
+  if [[ -n "$windows" ]]; then
+    local left origin path
+    while IFS=$'\t' read -r left origin path; do
+      [[ -n "$path" ]] || continue
+      warn "hook approval window open: $path — $(( left / 60 ))m left ($origin). \`opgate lock\` closes it."
+    done <<<"$windows"
+  fi
+
   if (( test_gate )); then
     info "đang thử prompt xác thực — chạm vân tay để xác nhận…"
     if gate_require "doctor" "self-test" "$(project_name) → opgate doctor self-test"; then
@@ -897,10 +920,91 @@ cmd_items() {
   op item list --vault "$OPGATE_VAULT" --tags "project:$project" </dev/null 2>&1
 }
 
+# --- approval windows (layer 3 only) ----------------------------------------
+#
+# These do not touch the vault and cannot weaken the Touch ID gate. They control
+# how often the PreToolUse guards re-ask about a plaintext file already sitting on
+# your disk. See lib/grants.sh for why that is a different trade from OPGATE_TTL,
+# which was removed.
+
+cmd_unlock() {
+  local minutes="$OPGATE_GRANT_DEFAULT_MINUTES" paths=()
+  while (( $# )); do
+    case "$1" in
+      --minutes|-m) [[ $# -ge 2 ]] || die "--minutes needs a number"
+                    require_int "$2" "--minutes"; minutes="$2"; shift 2 ;;
+      -h|--help)    usage; exit 0 ;;
+      --)           shift; paths+=("$@"); break ;;
+      -*)           die "opgate unlock: unknown argument '$1'" ;;
+      *)            paths+=("$1"); shift ;;
+    esac
+  done
+  (( minutes >= 1 )) || die "--minutes must be >= 1"
+  (( minutes <= OPGATE_GRANT_MAX_MINUTES )) \
+    || die "--minutes caps at $OPGATE_GRANT_MAX_MINUTES ($(( OPGATE_GRANT_MAX_MINUTES / 60 ))h)"
+  (( ${#paths[@]} )) || die "opgate unlock needs at least one path.
+       On purpose: a window opens for the files you name, never for a whole project.
+       Run \`opgate scan\` to see which secret files this project has."
+
+  # Canonicalise first so the sheet names exactly what the guards will key on.
+  local canons=() p c
+  for p in "${paths[@]}"; do
+    c=$(grant_canonical_path "$p" "$PWD") || die "cannot resolve path: $p"
+    canons+=("$c")
+  done
+
+  # Gated, even though no secret value moves: it makes every window traceable to
+  # one Touch ID, so a grant with no matching audit record is visible as a forgery.
+  local list; list=$(printf '%s\n' "${canons[@]}")
+  gate_require "unlock" "${minutes}m ${#canons[@]} file" \
+    "Open a ${minutes}-minute window so the onepassword hook stops asking about:
+$list"
+
+  for c in "${canons[@]}"; do
+    grant_open "$c" "$minutes" "unlock" "${CLAUDE_SESSION_ID:-cli}" \
+      && ok "${minutes}m · $c" \
+      || bad "could not open a window for $c"
+  done
+  info "\`opgate grants\` lists them, \`opgate lock\` closes them now."
+}
+
+cmd_lock() {
+  # Tightening never needs approval.
+  if (( $# == 0 )); then
+    local n; n=$(grant_revoke_all)
+    info "closed $n window(s)"
+    return 0
+  fi
+  local p c rc=0
+  for p in "$@"; do
+    case "$p" in -h|--help) usage; exit 0 ;; esac
+    c=$(grant_canonical_path "$p" "$PWD") || { bad "cannot resolve path: $p"; rc=1; continue; }
+    if grant_revoke "$c"; then ok "closed · $c"; else bad "no open window for $c"; rc=1; fi
+  done
+  return "$rc"
+}
+
+cmd_grants() {
+  local rows; rows=$(grant_list)
+  if [[ -z "$rows" ]]; then
+    info "no open windows — the guards will ask on the next read"
+    return 0
+  fi
+  printf 'LEFT\tORIGIN\tFILE\n'
+  local left origin path
+  while IFS=$'\t' read -r left origin path; do
+    [[ -n "$path" ]] || continue
+    printf '%dm%02ds\t%s\t%s\n' $(( left / 60 )) $(( left % 60 )) "$origin" "$path"
+  done <<<"$rows"
+}
+
 # --- dispatch ---------------------------------------------------------------
 
 sub="${1:-help}"; shift || true
 case "$sub" in
+  unlock) cmd_unlock "$@" ;;
+  lock)   cmd_lock   "$@" ;;
+  grants) cmd_grants "$@" ;;
   run)    cmd_run    "$@" ;;
   exec)   cmd_exec   "$@" ;;
   inject) cmd_inject "$@" ;;

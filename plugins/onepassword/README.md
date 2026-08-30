@@ -149,7 +149,7 @@ bị gỡ.
 
 ## Hook
 
-Plugin cài hai `PreToolUse` hook:
+Plugin cài ba `PreToolUse` hook và một `PostToolUse` hook:
 
 - **Bash** — chặn `op read` / `op item get` / `op run` / `--reveal` / `--raw` /
   `op item share` / `op service-account create` / `op connect token create` gọi
@@ -161,8 +161,30 @@ Plugin cài hai `PreToolUse` hook:
   **không** bị hỏi (quá ồn), và nó vẫn đọc được `.env` bên trong — xem
   `security-model.md`.
 
+- **PostToolUse (Bash|Read|Grep)** — khi bạn approve một prompt ở trên, hook này
+  ghi lại quyết định đó thành một **cửa sổ 60 phút cho đúng file đó**, để lần sau
+  không hỏi lại. Nó không tự phân loại gì cả: PreToolUse hook đã ghi sẵn key vào
+  `pending/<tool_use_id>`, việc duy nhất ở đây là chuyển nó thành grant.
+
 Hook là lớp **chống tai nạn**, không phải sandbox. Lớp bảo vệ thật là Touch ID gate.
 Chi tiết: `skills/onepassword/references/security-model.md`.
+
+## Cửa sổ approve (`unlock` / `grants` / `lock`)
+
+```bash
+opgate grants                          # đang mở cửa sổ nào, còn bao lâu
+opgate unlock --minutes 60 .env        # mở trước, một lần Touch ID
+opgate lock                            # đóng tất cả ngay
+opgate lock .env                       # đóng đúng một file
+```
+
+Chỉ tác động tới lớp hook. Không bỏ qua được Touch ID, không chạm tới vault, và
+không biến `deny` thành `allow` — gọi `op` trực tiếp vẫn bị chặn như cũ. Cửa sổ tính
+theo **đường dẫn đã resolve**, nên approve `.env` không mở `.env.production`, và một
+lệnh đọc hai file secret thì cần cả hai cửa sổ.
+
+`opgate doctor` cảnh báo nếu còn cửa sổ nào đang mở. Vì sao chuyện này khác với
+`OPGATE_TTL` đã bị gỡ: xem `security-model.md`.
 
 ## Có thể gặp hai prompt liên tiếp
 
@@ -186,3 +208,8 @@ vài giây, dễ chạm nhầm; đọc dòng mô tả trên sheet trước khi c
 
 `~/.local/state/opgate/access.log` (chmod 600), tab-separated:
 `thời gian · trạng thái · caller · project · hành động · tên biến`. Không chứa giá trị.
+
+Trạng thái liên quan tới cửa sổ approve: `GRANT` (mở, hành động là `unlock` hoặc
+`auto`), `GRANT-USED` (một lần hook cho qua nhờ cửa sổ), `GRANT-REVOKED`. Một grant
+tồn tại mà không có bản ghi `GRANT` tương ứng là dấu hiệu có người tự tạo file —
+đây là **bằng chứng**, không phải cơ chế chặn.
