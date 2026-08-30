@@ -7,20 +7,24 @@
 # it, and a guard that fights reads only teaches you to work around it.
 #
 # It fails closed on everything it can control: an unknown id, an API error, an
-# action it has never heard of, or an internal error in this script itself all
-# end in a refusal. It cannot fail closed on the one thing outside its control —
-# if the whole hook exceeds its timeout, Claude Code discards the decision and
-# the command proceeds. That is why the API lookup carries its own, much shorter
-# deadline; see references/guard-rules.md, which states the limit plainly.
+# action it has never heard of, a wrapper it does not recognise, or an internal
+# error in this script itself all end in a refusal or a prompt. It cannot fail
+# closed on the one thing outside its control — if the whole hook exceeds its
+# timeout, Claude Code discards the decision and the command proceeds. That is
+# why API lookups share one budget well inside that timeout; see
+# references/guard-rules.md, which states the limit plainly.
 #
-# No dependencies beyond bash and linode-cli itself.
+# No dependencies beyond bash, awk and linode-cli itself.
 
+LINGATE_T0=$(date +%s)
 payload=$(cat)
 
 # Fast path: nothing of interest, get out before doing any real work. Every Bash
-# call in the session pays for this script's startup.
+# call in the session pays for this script's startup. `lin` is a real alias of
+# linode-cli, so a whole-word match for it is checked too.
 case "$payload" in
-  *linode*|*'"lin '*|*' lin '*|*'/lin '*) ;;
+  *linode*) ;;
+  *lin*) printf '%s' "$payload" | grep -Eq '(^|[^A-Za-z0-9_.-])lin([^A-Za-z0-9_.-]|$)' || exit 0 ;;
   *) exit 0 ;;
 esac
 
@@ -42,7 +46,16 @@ emit() {
 guard_done=0
 trap '[[ $guard_done -eq 1 ]] || emit deny "lingate: hook gap loi giua chung nen khong xac minh duoc lenh nay thuoc project/env nao. Day la tu choi co chu dich (fail closed). Chay: bash plugins/linode/scripts/test-guard.sh de xem hong o dau."' EXIT
 
-decide() { guard_done=1; emit "$1" "$2"; exit 0; }
+# `ask` is remembered, not issued: a later segment on the same line may still
+# deserve a refusal, and a refusal outranks a prompt. Only deny exits early.
+pending_ask=""
+decide() {
+  if [[ "$1" == ask ]]; then
+    [[ -n "$pending_ask" ]] || pending_ask="$2"
+    return 0
+  fi
+  guard_done=1; emit "$1" "$2"; exit 0
+}
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)
 for f in "$here/lib/common.sh" "$here/lib/linode.sh"; do
@@ -50,27 +63,41 @@ for f in "$here/lib/common.sh" "$here/lib/linode.sh"; do
     "lingate: thieu file $f nen hang rao khong chay duoc. Cai lai plugin hoac chay 'claude plugin validate ./plugins/linode'."
 done
 # shellcheck source=lib/common.sh
-. "$here/lib/common.sh"
+. "$here/lib/common.sh" 2>/dev/null
 # shellcheck source=lib/linode.sh
-. "$here/lib/linode.sh"
+. "$here/lib/linode.sh" 2>/dev/null
+# A library that failed to parse leaves these undefined; without this check the
+# script would fall through to "nothing to guard" and let the write go.
+type lin_split_all >/dev/null 2>&1 && type json_str_file >/dev/null 2>&1 || decide deny \
+  "lingate: scripts/lib/*.sh khong nap duoc (loi cu phap?). Chay: bash -n plugins/linode/scripts/lib/common.sh plugins/linode/scripts/lib/linode.sh"
 
 if [[ "$LINGATE_GUARD" == off ]]; then guard_done=1; exit 0; fi
 
 command_line=$(hook_command "$payload")
-if [[ -z "$command_line" ]]; then guard_done=1; exit 0; fi
+if [[ -z "$command_line" ]]; then
+  case "$payload" in
+    *'"command"'*) decide deny "lingate: payload co truong command nhung khong doc duoc noi dung, nen khong xac minh duoc lenh. Kiem tra jq/awk tren may." ;;
+  esac
+  guard_done=1; exit 0
+fi
+
+# Where the command runs. The Bash tool reports its cwd in the payload; that is
+# the directory whose .linode/project.json applies, not the one Claude Code was
+# launched from. A `cd` inside the command moves it again.
+eff_cwd=$(payload_str "$payload" '.cwd' 'cwd')
+[[ -n "$eff_cwd" ]] || eff_cwd="${CLAUDE_PROJECT_DIR:-$PWD}"
 
 # --- split the command line into real invocations ---------------------------
-# The lexer honours quoting, so a `&&` inside a label no longer splits the
-# command and a quoted `--tags="a --tags b"` no longer looks like two flags.
 lin_split_all "$command_line"
 
-# Project identity, resolved once and only when a write actually needs it.
+# Project identity, resolved when a write needs it, per working directory.
 proj_root=""; proj_tag=""; proj_envs=""; proj_default_env=""; proj_protected=""
-proj_shared=""
+proj_shared=""; proj_for_cwd=""
 need_project() {
-  [[ -n "$proj_tag" ]] && return 0
-  proj_root=$(find_project_root) || decide deny \
-    "Khong tim thay .linode/project.json tinh tu thu muc nay tro len, nen khong biet resource sap dung den thuoc project nao. Chay 'lingate init <tag>' o goc repo truoc (vi du: lingate init cme), roi chay lai lenh. Doc: skills/linode/references/project-setup.md"
+  [[ -n "$proj_tag" && "$proj_for_cwd" == "$eff_cwd" ]] && return 0
+  proj_for_cwd="$eff_cwd"
+  proj_root=$(find_project_root "$eff_cwd") || decide deny \
+    "Khong tim thay .linode/project.json tinh tu $eff_cwd tro len, nen khong biet resource sap dung den thuoc project nao. Chay 'lingate init <tag>' o goc repo truoc (vi du: lingate init cme), roi chay lai lenh. Doc: skills/linode/references/project-setup.md"
   proj_tag=$(json_str_file "$proj_root/$LINGATE_CONFIG" tag)
   [[ -n "$proj_tag" ]] || decide deny \
     "File $proj_root/$LINGATE_CONFIG khong co truong 'tag'. Sua lai hoac chay 'lingate init <tag>' de tao lai."
@@ -128,19 +155,22 @@ env_verdict() {
   return 0
 }
 
-
 # A resource must be in the project AND in the environment this command is aimed
 # at. Crossing either line is a refusal, not a prompt.
 check_owner() {
   # $1 = group, $2 = id, $3 = extra wording for the message
-  local g="$1" rid="$2" what="$3" tags_out t e src=""
-  RESOLVED_GROUP=""; RESOLVED_ID=""
+  local g="$1" rid="$2" what="$3" tags_out t e src="" og="$g" oid="$rid" hdr
   tags_out=$(resolve_tags "$g" "$rid" "$lookup_fresh") || decide deny \
-    "Khong tra duoc tag cua $g $rid trong $LINGATE_DEADLINE giay (linode-cli loi, id khong ton tai, hoac mang cham). Khi chua biet chac resource thuoc ve ai thi lingate tu choi chu khong doan. Kiem tra bang: linode-cli $g $(view_action_for "$g") $rid --json"
+    "Khong tra duoc tag cua $g $rid trong ngan sach $LINGATE_BUDGET giay (linode-cli loi, id khong ton tai, mang cham, hoac da het thoi gian cho cac lookup truoc). Khi chua biet chac resource thuoc ve ai thi lingate tu choi chu khong doan. Kiem tra bang: linode-cli $g $(view_action_for "$g") $rid --json"
 
-  local og="$g" oid="$rid"
-  if [[ -n "$RESOLVED_GROUP" && "$RESOLVED_GROUP $RESOLVED_ID" != "$g $rid" ]]; then
-    og="$RESOLVED_GROUP"; oid="$RESOLVED_ID"
+  # First line names the resource whose tags were actually read: for an untagged
+  # LKE worker that is its cluster, and the message should point there.
+  hdr=${tags_out%%$'\n'*}
+  case "$hdr" in
+    @*) tags_out=${tags_out#*$'\n'}; [[ "$tags_out" == "$hdr" ]] && tags_out=""
+        og=${hdr#@}; oid=${og#*/}; og=${og%%/*} ;;
+  esac
+  if [[ "$og $oid" != "$g $rid" ]]; then
     src=" (no la node cua $og $oid va khong mang tag rieng, nen quyen so huu lay theo cluster)"
   fi
 
@@ -159,15 +189,44 @@ check_owner() {
   local -a renv=()
   while IFS= read -r e; do [[ -n "$e" ]] && renv[${#renv[@]}]="$e"; done \
     <<< "$(env_of_tags "$proj_envs" "${tags[@]}")"
-  env_verdict "$what $g $rid" ${renv[@]+"${renv[@]}"}
+  env_verdict "$what $g $rid$src" ${renv[@]+"${renv[@]}"}
+}
+
+# A ledger-backed resource: the repo's own record says who owns it.
+check_ledger() {
+  # $1 = group, $2 = id, $3 = extra wording
+  local g="$1" rid="$2" what="$3"
+  ledger_is_ours "$proj_root" "$proj_tag" || decide deny \
+    "$proj_root/$LINGATE_LEDGER khai bao no thuoc project '$(json_str_file "$proj_root/$LINGATE_LEDGER" tag)' chu khong phai '$proj_tag'. Mot so so huu chi noi thay cho dung project cua no. Chay 'lingate init $proj_tag' - no se cat so cu sang mot ben va tao so moi."
+  ledger_has "$proj_root" "$proj_tag" "$g" "$rid" || decide deny \
+    "$what $g $rid khong co trong so so huu .linode/owned.json cua project '$proj_tag'. Neu no dung la cua project, ghi so bang 'lingate own $g $rid --env $cur_env' roi chay lai. Neu khong phai, dung dung den no."
+  [[ -n "$proj_envs" ]] || return 0
+  local -a lenv=()
+  local e
+  while IFS= read -r e; do [[ -n "$e" ]] && lenv[${#lenv[@]}]="$e"; done \
+    <<< "$(ledger_envs_of "$proj_root" "$proj_tag" "$g" "$rid")"
+  env_verdict "$what $g $rid (theo so so huu)" ${lenv[@]+"${lenv[@]}"}
+}
+
+# Whichever source of truth applies to the group.
+check_target() {
+  case "$(group_scope "$1")" in
+    taggable) check_owner "$1" "$2" "$3" ;;
+    ledger)   check_ledger "$1" "$2" "$3" ;;
+    *)        decide deny "Khong biet cach xac minh quyen so huu cua $1 $2." ;;
+  esac
 }
 
 # Every extra resource the command names — the Linode a volume attaches to, a
-# firewall device, a placement group member — is being written to as well.
+# firewall device, the VPC an interface joins — is being written to as well.
 check_refs() {
   local i=0
+  if (( ${#LIN_BAD_REFS[@]} > 0 )); then
+    decide deny \
+      "Lenh nay tro toi mot resource khac qua gia tri lingate khong doc duoc: '${LIN_BAD_REFS[0]}' (bien shell hoac danh sach JSON). Khong doc duoc thi khong xac minh duoc chu so huu. Viet id ro rang tren dong lenh."
+  fi
   while (( i < ${#LIN_REF_GROUPS[@]} )); do
-    check_owner "${LIN_REF_GROUPS[i]}" "${LIN_REF_IDS[i]}" "Resource dich"
+    check_target "${LIN_REF_GROUPS[i]}" "${LIN_REF_IDS[i]}" "Resource dich"
     i=$((i + 1))
   done
 }
@@ -183,21 +242,53 @@ protected_gate() {
   esac
 }
 
-# How many brand-new ledger-backed resources does this one Bash call create? More
-# than one and the PostToolUse hook cannot tell which id belongs to which, so
-# ownership of at least one of them would be lost.
-ledger_creates=0
+# Does this segment's standard output end up somewhere other than the
+# transcript? Follow the pipeline to its last stage: a file redirect there, or a
+# stage that is `opgate` (put), counts; anything else — including a pipe into a
+# command that itself prints — does not.
+stdout_is_kept_private() {
+  local j="$1"
+  while (( j < ${#segs[@]} )) && [[ "${seg_piped[j]}" == 1 ]]; do j=$((j + 1)); done
+  (( j < ${#segs[@]} )) || return 1
+  [[ "${seg_stdout[j]}" == 1 ]] && return 0
+  lin_words "${segs[j]}"
+  lin_head && [[ "$LIN_HEAD" == opgate ]]
+}
+
+# How many linode invocations does this one Bash call contain? A ledger create
+# must be alone: the PostToolUse hook reads the id out of the call's stdout, and
+# any other invocation's output in the same stream makes that id ambiguous.
+inv_count=0
 for _s in "${segs[@]}"; do
   parse_linode_cmd "$_s" || continue
-  [[ -n "$LIN_GROUP" && -n "$LIN_ACTION" ]] || continue
-  [[ "$(group_scope "$LIN_GROUP")" == ledger ]] || continue
-  case "$LIN_ACTION" in create|*-create) ;; *) continue ;; esac
-  (( ${#LIN_IDS[@]} == 0 )) || continue
-  ledger_creates=$((ledger_creates + 1))
+  [[ -n "$LIN_GROUP" ]] && inv_count=$((inv_count + 1))
 done
 
+idx=-1
 for segment in "${segs[@]}"; do
-  parse_linode_cmd "$segment" || continue
+  idx=$((idx + 1))
+  parse_linode_cmd "$segment"
+  rc=$?
+  case $rc in
+    1)
+      # Not an invocation. A `cd` still matters: it moves later segments.
+      lin_head || continue
+      case "$LIN_HEAD" in
+        cd|pushd)
+          case "$LIN_HEAD_ARG" in
+            ''|-*|*'$'*) ;;
+            '~'|'~/'*) eff_cwd="${HOME:-/}${LIN_HEAD_ARG#\~}" ;;
+            /*) eff_cwd="$LIN_HEAD_ARG" ;;
+            *) eff_cwd="$eff_cwd/$LIN_HEAD_ARG" ;;
+          esac ;;
+      esac
+      continue ;;
+    2) continue ;;   # a nested script; its segments were appended and are checked in turn
+    3)
+      decide ask \
+        "'$LIN_HEAD_UNKNOWN' dung truoc linode-cli tren dong lenh nay, va lingate khong biet no co chay lenh phia sau hay khong - neu co thi hang rao dang bi bo qua. Neu '$LIN_HEAD_UNKNOWN' chi doc chuoi do nhu du lieu thi cu xac nhan; neu no thuc su chay linode-cli, hay chay linode-cli truc tiep de lingate kiem tra duoc."
+      continue ;;
+  esac
 
   # `--help` prints local text and never reaches the API. It is also what every
   # refusal message tells the developer to run next.
@@ -217,9 +308,9 @@ for segment in "${segs[@]}"; do
 
   # --- reads ----------------------------------------------------------------
   if [[ "$kind" == read ]]; then
-    if [[ "$LIN_ACTION" =~ $LINGATE_SECRET_READ_RE ]] && (( has_sink == 0 )); then
+    if [[ "$LIN_ACTION" =~ $LINGATE_SECRET_READ_RE ]] && ! stdout_is_kept_private "$idx"; then
       decide ask \
-        "Lenh nay in thang credential ra stdout, tuc la vao transcript cua cuoc hoi thoai va len model provider - lo roi thi phai rotate. Muon giu kin thi cho no di thang toi noi can den: '... --json | jq -r <field> > <file da git-ignore>', hoac cat vao 1Password bang 'opgate put <item> <FIELD>'. Doc: skills/linode/references/secrets.md"
+        "Lenh nay in credential ra stdout, tuc la vao transcript cua cuoc hoi thoai va len model provider - lo roi thi phai rotate. Muon giu kin thi cho no di thang toi noi can den: '... --json | jq -r <field> > <file da git-ignore>', hoac cat vao 1Password bang '... | opgate put <item> <FIELD>'. Chuyen huong stderr hay pipe vao mot lenh khac van in ra man hinh thi khong tinh. Doc: skills/linode/references/secrets.md"
     fi
     continue
   fi
@@ -249,6 +340,7 @@ for segment in "${segs[@]}"; do
   if [[ "$scope" == cli ]]; then
     decide ask \
       "Lenh nay doi credential hoac identity cua linode-cli chu khong phai mot resource cua project '$proj_tag'. Nguoi dung tu quyet dinh."
+    continue
   fi
 
   if [[ "$scope" == unscoped ]]; then
@@ -294,6 +386,10 @@ for segment in "${segs[@]}"; do
   # drops the project tag or the env tag is how a resource silently leaves the
   # fence without anyone deleting anything.
   if (( ${#LIN_TAGS[@]} > 0 )); then
+    for _t in "${LIN_TAGS[@]}"; do
+      case "$_t" in *'$'*) decide deny \
+        "--tags nhan gia tri '$_t' la bien shell, lingate khong doc duoc nen khong xac minh duoc resource se mang tag gi. Viet tag ro rang: --tags $proj_tag --tags $cur_env" ;; esac
+    done
     tags_contain "$proj_tag" "${LIN_TAGS[@]}" || decide deny \
       "--tags o day dat lai toan bo tag cua resource thanh '${LIN_TAGS[*]}', khong con '$proj_tag' - resource se roi khoi project va khong con hang rao nao bao ve. Them '--tags $proj_tag' vao danh sach."
     if [[ -n "$proj_envs" ]]; then
@@ -327,46 +423,35 @@ for segment in "${segs[@]}"; do
     # reach stdout would demand the secret reach the transcript, so this one is
     # exempt and its id is recorded by hand; see references/secrets.md.
     case "$LIN_GROUP $LIN_ACTION" in
-      'object-storage keys-create') protected_gate; continue ;;
+      'object-storage keys-create') check_refs; protected_gate; continue ;;
     esac
     # Ledger groups have no tags field, so the id must be captured at creation
     # time or ownership is lost the moment the command finishes. All three checks
     # below are about that one id actually reaching the PostToolUse hook.
     (( LIN_HAS_JSON == 1 )) || decide deny \
       "'$LIN_GROUP' khong co truong tags tren API, nen quyen so huu duoc ghi vao .linode/owned.json. Them '--json' de lingate doc duoc id vua tao va ghi so tu dong. Doc: skills/linode/references/guard-rules.md"
-    (( ledger_creates <= 1 )) || decide deny \
-      "Mot lenh Bash dang tao $ledger_creates resource khong gan tag duoc cung luc. lingate khong the biet id nao la cua cai nao nen se ghi sai so so huu. Tach ra chay tung lenh mot."
-    (( has_sink == 0 )) || decide deny \
-      "Output cua lenh tao nay bi chuyen huong hoac dua qua pipe, nen hook PostToolUse khong doc duoc id va quyen so huu se mat. Chay lenh tao mot minh voi '--json' truoc (id se duoc ghi so), roi dung id do o buoc sau."
-    protected_gate
-    continue
-  fi
-
-  owner_id="${LIN_IDS[0]:-}"
-  [[ -n "$owner_id" ]] || decide deny \
-    "'$LIN_GROUP $LIN_ACTION' la lenh ghi nhung khong co id resource nao tren dong lenh, nen khong xac minh duoc no cham vao cai gi cua ai. Xem cu phap: linode-cli $LIN_GROUP $LIN_ACTION --help"
-
-  if [[ "$scope" == ledger ]]; then
-    ledger_is_ours "$proj_root" "$proj_tag" || decide deny \
-      "$proj_root/$LINGATE_LEDGER khai bao no thuoc project '$(json_str_file "$proj_root/$LINGATE_LEDGER" tag)' chu khong phai '$proj_tag'. Mot so so huu chi noi thay cho dung project cua no; sua lai file hoac chay 'lingate init $proj_tag' de tao lai."
-    ledger_has "$proj_root" "$proj_tag" "$LIN_GROUP" "$owner_id" || decide deny \
-      "$LIN_GROUP $owner_id khong co trong so so huu .linode/owned.json cua project '$proj_tag'. Neu no dung la cua project, ghi so bang 'lingate own $LIN_GROUP $owner_id --env $cur_env' roi chay lai. Neu khong phai, dung dung den no."
-    if [[ -n "$proj_envs" ]]; then
-      _lenv=()
-      while IFS= read -r _e; do [[ -n "$_e" ]] && _lenv[${#_lenv[@]}]="$_e"; done \
-        <<< "$(ledger_envs_of "$proj_root" "$proj_tag" "$LIN_GROUP" "$owner_id")"
-      env_verdict "$LIN_GROUP $owner_id (theo so so huu)" ${_lenv[@]+"${_lenv[@]}"}
+    (( inv_count <= 1 )) || decide deny \
+      "Lenh Bash nay goi linode-cli $inv_count lan, trong do co mot lenh tao resource khong gan tag duoc. Hook ghi so doc id tu stdout cua ca lenh, nen output cua cac lenh kia lam no ghi sai id. Chay lenh tao mot minh voi '--json' truoc, roi dung id do o buoc sau."
+    if [[ "${seg_stdout[idx]}" == 1 || "${seg_piped[idx]}" == 1 ]]; then
+      decide deny \
+        "Stdout cua lenh tao nay bi chuyen huong vao file hoac dua qua pipe, nen hook PostToolUse khong doc duoc id va quyen so huu se mat. Chay lenh tao mot minh voi '--json' (chuyen huong stderr thi khong sao), roi dung id do o buoc sau."
     fi
     check_refs
     protected_gate
     continue
   fi
 
-  # --- taggable: the API itself says who owns this --------------------------
-  check_owner "$LIN_GROUP" "$owner_id" ""
+  owner_id=$(lin_owner_id)
+  [[ -n "$owner_id" ]] || decide deny \
+    "'$LIN_GROUP $LIN_ACTION' la lenh ghi nhung khong co id resource nao tren dong lenh, nen khong xac minh duoc no cham vao cai gi cua ai. Xem cu phap: linode-cli $LIN_GROUP $LIN_ACTION --help"
+
+  check_target "$LIN_GROUP" "$owner_id" ""
   check_refs
   protected_gate
 done
 
+if [[ -n "$pending_ask" ]]; then
+  guard_done=1; emit ask "$pending_ask"; exit 0
+fi
 guard_done=1
 exit 0

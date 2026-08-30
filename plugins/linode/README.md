@@ -31,9 +31,10 @@ gọi API, và dùng `jq` nếu có nhưng không bắt buộc.
 Hook `PreToolUse(Bash)` xét mọi lệnh `linode-cli` và **fail closed**: API lỗi, id
 lạ, action chưa biết, hay chính hook hỏng giữa chừng đều thành từ chối. Ngoại lệ
 duy nhất nằm ngoài tầm với của nó — nếu cả hook chạy quá `timeout` trong
-`hooks.json` thì Claude Code bỏ qua quyết định và lệnh đi tiếp; vì vậy lời gọi API
-mang deadline riêng ngắn hơn (`LINGATE_DEADLINE`, mặc định 8s) để kịp trả lời
-"từ chối" trước khi hết giờ. Chi tiết: `skills/linode/references/guard-rules.md`.
+`hooks.json` thì Claude Code bỏ qua quyết định và lệnh đi tiếp; vì vậy mọi lời gọi
+API trong một lần hook dùng chung một ngân sách (`LINGATE_BUDGET`, mặc định 11s,
+mỗi lời gọi tối đa `LINGATE_DEADLINE` 8s) để kịp trả lời "từ chối" trước khi hết
+giờ. Chi tiết: `skills/linode/references/guard-rules.md`.
 
 - Đọc (`list`, `view`, …) — luôn cho qua.
 - Tạo — bắt buộc `--tags <project>` và `--tags <env>`.
@@ -96,7 +97,8 @@ Biến môi trường:
 | `LINODE_ENV` | `defaultEnv` | Môi trường của lệnh. Tiền tố ngay trên dòng lệnh (`LINODE_ENV=prod linode-cli …`) là cách duy nhất hook nhìn thấy được. |
 | `LINGATE_TTL` | `60` | Giây cache kết quả tra tag tại `~/.cache/lingate`. Lệnh phá huỷ luôn bỏ qua cache. |
 | `LINGATE_GUARD` | `on` | `off` tắt hàng rào. Việc của con người, không phải của agent. |
-| `LINGATE_DEADLINE` | `8` | Giây tối đa cho một lời gọi API tra tag, để hook kịp trả lời trước `timeout`. |
+| `LINGATE_DEADLINE` | `8` | Giây tối đa cho **một** lời gọi API tra tag. |
+| `LINGATE_BUDGET` | `11` | Giây tối đa cho **tất cả** lời gọi API của một lần hook — phải nhỏ hơn `timeout` 15s trong `hooks.json`. |
 
 ## Test
 
@@ -104,6 +106,6 @@ Biến môi trường:
 bash plugins/linode/scripts/test-guard.sh
 ```
 
-103 assertion, chạy hoàn toàn offline: một `linode-cli` giả ở đầu `PATH` trả lời mọi
+162 assertion, chạy hoàn toàn offline: một `linode-cli` giả ở đầu `PATH` trả lời mọi
 truy vấn quyền sở hữu từ một bảng cố định, nên không cần account, token hay mạng.
 Mỗi lỗ hổng từng được tìm ra đều có một assertion giữ chỗ.

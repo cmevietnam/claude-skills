@@ -33,8 +33,9 @@ linode-cli lke kubeconfig-view 580172 --json \
 chmod 600 ~/.kube/cme-prod.yaml
 ```
 
-Hook chỉ hỏi khi lệnh **không** có redirect hay pipe — có nghĩa là bạn đang định
-in nó ra màn hình.
+Hook hỏi khi stdout của lệnh **không** kết thúc ở một file hay ở `opgate` sau khi
+đi hết pipeline. `2>/dev/null` không tính (đó là stderr), và `| base64 -d` cũng
+không — lệnh sau pipe vẫn in ra màn hình.
 
 ## 3. Credential do Linode sinh ra
 
@@ -56,8 +57,9 @@ lingate own object-storage <id> --env staging
 ```
 
 Mọi create khác của nhóm dùng sổ (VPC, database, placement group…) đều bị **từ
-chối** nếu output bị pipe hay redirect, vì lúc đó quyền sở hữu sẽ mất mà không ai
-biết. Chạy chúng trần với `--json`.
+chối** nếu stdout bị pipe hay redirect, hoặc nếu lệnh đứng chung một lần gọi Bash
+với một lời gọi `linode-cli` khác — vì hook ghi sổ đọc id từ stdout của cả lần gọi
+và sẽ ghi sai. Chạy chúng **một mình**, trần, với `--json`.
 
 Muốn kiểm tra là đã có thì so bên trong process con, đừng in ra:
 

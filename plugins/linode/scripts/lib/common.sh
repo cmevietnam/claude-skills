@@ -12,6 +12,7 @@ LINGATE_LEDGER="$LINGATE_DIR/owned.json"
 # LINGATE_GUARD   : on | off — off disables the PreToolUse guard  (default: on)
 # LINGATE_TTL     : seconds an ownership lookup stays cached       (default: 60)
 # LINGATE_DEADLINE: seconds one API lookup may take               (default: 8)
+# LINGATE_BUDGET  : seconds ALL lookups of one hook run may take   (default: 11)
 LINGATE_GUARD="${LINGATE_GUARD:-on}"
 LINGATE_TTL="${LINGATE_TTL:-60}"
 LINGATE_DEADLINE="${LINGATE_DEADLINE:-8}"
@@ -230,16 +231,23 @@ hook_response() { payload_str "$1" '(.tool_response.stdout? // .tool_response.ou
 # The ledger is written one entry per line so grep can read it, but it is read
 # back through tr so that a human who reformats the file does not break it.
 
+# ledger_entries <root> <tag> — one JSON object per line. A ledger that names a
+# different project yields nothing: its entries are not ours to carry forward.
 ledger_entries() {
   local file="$1/$LINGATE_LEDGER"
   [[ -f "$file" ]] || return 0
+  ledger_is_ours "$1" "$2" || return 0
   tr -d '\n\t' < "$file" | grep -o '{[^{}]*}' | grep '"type"' || true
 }
 
 # ledger_save <root> <tag>  — entries arrive on stdin, one JSON object per line.
+# Refuses (exit 2) to overwrite a ledger that belongs to another project: that
+# would silently re-parent every resource it lists. `lingate init` is the one
+# caller allowed to replace such a file, and it sets aside the old one first.
 ledger_save() {
   local root="$1" tag="$2" file="$1/$LINGATE_LEDGER" tmp entries
   entries=$(cat)
+  if [[ -f "$file" ]] && ! ledger_is_ours "$root" "$tag"; then return 2; fi
   tmp="$file.tmp.$$"
   mkdir -p -- "$root/$LINGATE_DIR" || return 1
   {

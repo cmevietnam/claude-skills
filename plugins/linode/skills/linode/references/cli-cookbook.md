@@ -72,8 +72,10 @@ linode-cli databases mysql-create --label cme-db --region sg-sin-2 \
   --engine mysql/8 --type g6-nanode-1 --cluster_size 1 --json
 ```
 
-`--json` để hook `PostToolUse` đọc được id và ghi `.linode/owned.json`. Nếu nó báo
-không đọc được id thì ghi tay: `lingate own <group> <id> --env <env>`.
+`--json` để hook `PostToolUse` đọc được id và ghi `.linode/owned.json`. Chạy lệnh
+tạo **một mình** — không `&&` với lệnh khác, không redirect stdout — vì hook đọc id
+từ stdout của cả lần gọi. Nếu nó báo không đọc được id thì ghi tay:
+`lingate own <group> <id> --env <env>`.
 
 ## Theo dõi tác vụ chạy nền
 

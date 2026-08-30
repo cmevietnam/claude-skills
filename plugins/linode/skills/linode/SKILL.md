@@ -43,6 +43,11 @@ cho gắn tag; chúng dùng sổ sở hữu trong repo thay thế.
   file đã git-ignore hoặc vào 1Password.
 - Viết tắt tên cờ (`--tag` thay `--tags`). CLI chấp nhận và hook cũng hiểu, nhưng
   người đọc lại lệnh thì không — viết đủ.
+- Đưa id hay tag qua biến shell (`--linode_id $ID`, `--tags $TAGS`), hay bọc
+  `linode-cli` trong một wrapper lạ. Hook không đọc được thì từ chối hoặc hỏi —
+  viết id và tag rõ ràng ngay trên dòng lệnh.
+- Nối lệnh tạo loại dùng sổ (VPC, database…) với lệnh khác bằng `&&`/`;`, hay
+  redirect stdout của nó. Chạy nó một mình với `--json` để sổ sở hữu ghi đúng id.
 - Đoán khi bị chặn. Hook luôn nói rõ lệnh đúng là gì — đọc rồi làm theo, đừng thử
   đường vòng.
 

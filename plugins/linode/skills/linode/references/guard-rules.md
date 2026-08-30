@@ -11,11 +11,13 @@ mà lúc nghi ngờ thì tự mở còn tệ hơn không có chốt.
 Có đúng **một** trường hợp nó không tự quyết được, và cần nói thẳng: nếu toàn bộ
 hook chạy quá `timeout` khai báo trong `hooks/hooks.json` (15 giây), Claude Code
 huỷ hook và **bỏ qua quyết định** — lệnh đi tiếp theo luồng quyền bình thường.
-Không có cách nào để một hook hết giờ trở thành "chặn". Vì vậy lời gọi API tra tag
-mang deadline riêng, ngắn hơn nhiều (`LINGATE_DEADLINE`, mặc định 8 giây, dùng
-`perl -e alarm`) và chạy với `--no-retry`: hết 8 giây thì `resolve_tags` thất bại
-và guard **từ chối** trong khi vẫn còn thời gian để trả lời. Cửa sổ fail-open thu
-lại còn những sự cố khiến chính bash treo, chứ không phải mạng chậm.
+Không có cách nào để một hook hết giờ trở thành "chặn". Vì vậy mọi lời gọi API
+trong một lần hook dùng chung **một ngân sách** (`LINGATE_BUDGET`, mặc định 11
+giây); mỗi lời gọi nhận phần còn lại, tối đa `LINGATE_DEADLINE` (8 giây), qua
+`perl -e alarm` và `--no-retry`. Hết ngân sách thì `resolve_tags` thất bại và
+guard **từ chối** trong khi vẫn còn thời gian để trả lời — dù lệnh có phải tra 3
+resource (chủ + đích + cluster cha) đi nữa. Cửa sổ fail-open thu lại còn những sự
+cố khiến chính bash treo, chứ không phải mạng chậm.
 
 Nó không phải sandbox. Đây là thứ chặn sai sót thường gặp trước khi nó thành sự
 cố, không phải thứ chống lại một tác nhân cố tình phá.
@@ -37,6 +39,11 @@ cố, không phải thứ chống lại một tác nhân cố tình phá.
 | Resource dùng chung env, env còn lại **không** được bảo vệ | cho qua |
 | Resource thứ hai trên dòng lệnh (`--linode_id`, `--firewall_id`, `--id --type`, `--linodes`) không thuộc project/env | **từ chối** |
 | Sổ sở hữu khai báo `"tag"` khác với project hiện tại | **từ chối** |
+| Id của resource đích là biến shell hay JSON (`--linode_id $ID`) | **từ chối** (không đọc được thì không xác minh được) |
+| `--tags $VAR` | **từ chối** |
+| `linode-cli` đứng sau một wrapper hook **không biết** (`mystery-tool linode-cli …`) | **hỏi** |
+| Create loại dùng sổ nằm chung lệnh Bash với một lời gọi `linode-cli` khác | **từ chối** (hook ghi sổ không biết id nào của cái nào) |
+| Đọc credential rồi pipe vào lệnh vẫn in ra màn hình (`\| base64 -d`), hay chỉ redirect stderr | **hỏi** (chưa phải sink) |
 | Ghi ở env nằm trong `protectedEnvs` | **hỏi** |
 | `--tags` trên lệnh ghi làm rơi tag project hoặc tag env | **từ chối** |
 | `--tags` gắn thêm một env tag thứ hai | **từ chối** (resource mơ hồ) |
@@ -100,18 +107,31 @@ Nhóm bên phải dùng sổ `.linode/owned.json`.
 
 ## Cách hook đọc một dòng lệnh
 
-- Dòng lệnh được đưa qua một **lexer tôn trọng dấu nháy**: `'...'`, `"..."` và
-  `\` được xử lý đúng, nên `&&` nằm trong một label không cắt lệnh làm đôi, và
-  `--tags="cme --tags staging"` được nhìn thấy đúng là **một** tag.
-- Lexer phát sinh operator riêng, nên `&`, `;`, `|`, `( )`, `` ` `` và `$( )` đều
-  mở một lệnh mới. `bash -c "..."` được mở ra và soi lại như một dòng lệnh riêng.
-- Một token `linode-cli`/`linode`/`lin` chỉ tính là lời gọi khi nó đứng ở chỗ thực
-  sự chạy được: đầu đoạn, hoặc sau `bash -c`, `env`, `sudo -u root`, `xargs`, hoặc
-  sau từ khoá shell như `do`/`then`. So khớp theo **basename**, nên
-  `/opt/homebrew/bin/linode-cli` cũng bị bắt, còn `echo linode-cli` thì không.
-- **Cờ được nhận diện theo tiền tố**, vì `argparse` chấp nhận tiền tố không nhập
-  nhằng: `--tag`, `--ta` đều là `--tags`; `--root_pas` là `--root_pass`;
-  `--linode_i` là `--linode_id`. Khớp đúng nguyên văn từng để lọt chúng.
+- Dòng lệnh được đưa qua một **lexer shell thật**: `'...'`, `"..."` và `\` được
+  xử lý đúng (nên `&&` trong một label không cắt lệnh làm đôi, `--tags="cme --tags
+  staging"` là **một** tag); **xuống dòng** là ranh giới lệnh; `$( )` và backtick
+  được mở ra **kể cả trong nháy kép**; target của redirect (`> file`) bị nuốt chứ
+  không thành id; thân heredoc bị bỏ qua; `\` cuối dòng là nối dòng.
+- `bash -c "..."`, `sh -lc`, `eval …`, `env -S "…"` được mở ra và soi lại như
+  một dòng lệnh riêng.
+- Một token `linode-cli`/`linode`/`lin` (so theo **basename**) chỉ tính là lời gọi
+  khi nó ở chỗ thực sự chạy được: đầu đoạn, sau từ khoá shell (`do`, `then`, `!`,
+  `{`, `time`), sau gán biến (`LINODE_ENV=prod`), hoặc sau một wrapper hook **biết
+  arity cờ** của nó: `env`, `sudo`/`doas`, `command`, `exec`, `nohup`, `nice`,
+  `stdbuf`, `timeout`, `xargs`, `watch`, `caffeinate`, và `opgate exec|run … --`.
+  `sudo -u root`, `timeout 10`, `xargs -I{}` đều đáp đúng chỗ. `echo linode-cli`,
+  `grep linode`, `cat linode-notes.txt` là dữ liệu → bỏ qua. Một head hook
+  **không biết** mà phía sau có `linode-cli` → **hỏi**, vì không biết nó có chạy
+  lệnh phía sau hay không.
+- **Cờ phân giải như argparse**: tên đầy đủ khớp trước, rồi mới tới tiền tố không
+  nhập nhằng. Nên `--domain` là field thật của `domains create` (không phải viết
+  tắt của `--domains`), còn `--tag`, `--ta`, `--root_pas`, `--linode_i` vẫn được
+  nhận đúng. Field lồng nhau lấy thành phần cuối: `--devices.linodes`,
+  `--interfaces.vpc_id`, `--placement_group.id` đều trỏ tới resource thứ hai và
+  bị soi như id chính.
+- Thư mục làm việc lấy từ trường `cwd` của payload (nơi Bash tool thực sự chạy),
+  và một `cd` trong lệnh dời nó cho các đoạn sau — `.linode/project.json` được tìm
+  từ đó, không phải từ nơi Claude Code khởi động.
 - Hook biết cờ toàn cục nào **không** ăn giá trị (`--json`, `--suppress-warnings`,
   `--pretty`, …) nên `linodes reboot --suppress-warnings 123` vẫn thấy id `123`,
   còn `volumes --format nodebalancers delete 555` không nhầm `nodebalancers`
@@ -128,9 +148,20 @@ Nhóm bên phải dùng sổ `.linode/owned.json`.
   `restore`, `revoke`… luôn hỏi lại API. Cache là một canh bạc rằng không có gì
   đổi trong một phút vừa rồi; với những lệnh này thì canh bạc đó không đáng.
 - Ngoài id chính, hook còn soi **resource thứ hai** mà lệnh nhắc tới:
-  `--linode_id`, `--linodes`, `--firewall_id`, `--volume_id`, và cặp
+  `--linode_id`, `--linodes`, `--firewall_id(s)`, `--volume_id`, `--vpc_id`,
+  `--devices.linodes`, `--interfaces.vpc_id`, `--placement_group.id`, và cặp
   `--id`/`--type` của `firewalls device-create`. Gắn một volume của project vào
-  một Linode của project khác cũng là ghi lên resource của họ.
+  một Linode của project khác cũng là ghi lên resource của họ. Giá trị không đọc
+  được (`$ID`, danh sách JSON) → từ chối, không bỏ qua.
+- **Sink tính theo từng đoạn.** Với lệnh đọc credential, stdout phải kết thúc ở
+  một file (`> …`) hoặc ở `opgate` sau khi đi hết pipeline; `2>/dev/null`,
+  `< file`, hay pipe vào một lệnh vẫn in ra màn hình đều **không** tính. Với create
+  loại dùng sổ thì ngược lại: stdout **không được** đi vào file hay pipe, và lệnh
+  phải đứng **một mình** trong lần gọi Bash — vì hook ghi sổ đọc id từ stdout của
+  cả lần gọi.
+- `ask` không kết thúc việc xét: hook đi hết mọi đoạn, và một `deny` ở đoạn sau
+  thắng `ask` ở đoạn trước. Xác nhận một lệnh không bao giờ thả kèm một lệnh khác
+  chưa được kiểm tra.
 
 ## Khi bị chặn
 

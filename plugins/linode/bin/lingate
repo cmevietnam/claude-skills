@@ -33,7 +33,8 @@ lingate — ranh giới project và môi trường cho Linode
 Env của một lệnh lấy theo thứ tự: tiền tố LINODE_ENV=... ngay trên dòng lệnh,
 rồi biến môi trường LINODE_ENV, rồi defaultEnv trong .linode/project.json.
 
-Biến môi trường: LINGATE_GUARD=off tắt hàng rào, LINGATE_TTL=<giây> đổi TTL cache.
+Biến môi trường: LINGATE_GUARD=off tắt hàng rào, LINGATE_TTL=<giây> đổi TTL cache,
+LINGATE_BUDGET=<giây> ngân sách tổng cho các lookup API trong một lần hook.
 USAGE
 }
 
@@ -101,7 +102,19 @@ cmd_init() {
     fi
     printf '\n}\n'
   } > "$root/$LINGATE_CONFIG"
-  [[ -f "$root/$LINGATE_LEDGER" ]] || printf '' | ledger_save "$root" "$tag"
+  # A ledger that names another project is set aside, not adopted: carrying its
+  # entries forward would hand that project's resources to this one.
+  if [[ -f "$root/$LINGATE_LEDGER" ]]; then
+    local old
+    old=$(json_str_file "$root/$LINGATE_LEDGER" tag)
+    if [[ "$old" != "$tag" ]]; then
+      mv -f -- "$root/$LINGATE_LEDGER" "$root/$LINGATE_LEDGER.${old:-unknown}.bak"
+      warn "$LINGATE_LEDGER cũ khai báo project '${old:-?}' — đã cất sang $LINGATE_LEDGER.${old:-unknown}.bak và tạo sổ mới cho '$tag'"
+      printf '' | ledger_save "$root" "$tag"
+    fi
+  else
+    printf '' | ledger_save "$root" "$tag"
+  fi
 
   info "project '$tag' — $root/$LINGATE_CONFIG"
   [[ -n "$envs" ]] && info "env: [${envs//,/ }], mặc định '$default_env', bảo vệ [${protect//,/ }]" || true
@@ -135,7 +148,7 @@ cmd_whoami() {
   printf 'env chung  %s\n' "$([[ "$proj_shared" == true ]] && printf 'cho phép (allowSharedEnvs)' || printf 'không')"
   printf 'config     %s\n' "$proj_root/$LINGATE_CONFIG"
   printf 'ledger     %s (%s mục)\n' "$proj_root/$LINGATE_LEDGER" \
-    "$(ledger_entries "$proj_root" | grep -c . || true)"
+    "$(ledger_entries "$proj_root" "$proj_tag" | grep -c . || true)"
 }
 
 # --- ls ---------------------------------------------------------------------
@@ -144,16 +157,18 @@ cmd_ls() {
   local want="${1:-}" g rows rc
   for g in $LINGATE_TAGGABLE; do
     if [[ -n "$want" && "$want" != "$g" ]]; then continue; fi
-    rows=$(lin "$g" "$(list_action_for "$g")" --tags "$proj_tag" \
-             --text --no-headers --format 'id,label,tags' 2>/dev/null); rc=$?
     # An empty list and a failed call look identical downstream, and a silent
-    # empty list is how you conclude a project owns nothing.
+    # empty list is how you conclude a project owns nothing. The if-form matters:
+    # under set -e a plain `rows=$(...)` that fails ends the script right here.
+    if rows=$(lin "$g" "$(list_action_for "$g")" --tags "$proj_tag" \
+                --text --no-headers --format 'id,label,tags' 2>/dev/null); then rc=0; else rc=$?; fi
     (( rc == 0 )) || { warn "không đọc được $g (linode-cli exit $rc) — danh sách dưới đây KHÔNG đầy đủ"; continue; }
     printf '%s\n' "$rows" | awk -v g="$g" -F'\t' 'NF { printf "%-14s %-12s %-34s %s\n", g, $1, $2, $3 }'
   done
   for g in $LINGATE_LEDGER_GROUPS; do
     if [[ -n "$want" && "$want" != "$g" ]]; then continue; fi
-    ledger_entries "$proj_root" | grep -F "\"type\": \"$g\"" 2>/dev/null | while IFS= read -r e; do
+    ledger_entries "$proj_root" "$proj_tag" | while IFS= read -r e; do
+      [[ "$(json_str "$e" type)" == "$g" ]] || continue
       printf '%-14s %-12s %-34s %s\n' "$g" "$(json_str "$e" id)" \
         "$(json_str "$e" label)" "$(json_str "$e" env)"
     done
@@ -171,8 +186,8 @@ cmd_orphans() {
     # Linode's own distro images are public, untagged and not anyone's to adopt.
     local -a extra=()
     [[ "$g" == images ]] && extra=(--is_public false)
-    rows=$(lin "$g" "$(list_action_for "$g")" ${extra[@]+"${extra[@]}"} \
-             --text --no-headers --format 'id,label,tags' 2>/dev/null); rc=$?
+    if rows=$(lin "$g" "$(list_action_for "$g")" ${extra[@]+"${extra[@]}"} \
+                --text --no-headers --format 'id,label,tags' 2>/dev/null); then rc=0; else rc=$?; fi
     (( rc == 0 )) || { warn "không đọc được $g (linode-cli exit $rc) — danh sách dưới đây KHÔNG đầy đủ"; continue; }
     printf '%s\n' "$rows" | awk -v g="$g" -F'\t' '
         $3 == "" || $3 == "[]" {
@@ -208,7 +223,10 @@ cmd_adopt() {
     || die "không tra được $group $id — kiểm tra: linode-cli $group $(view_action_for "$group") $id --json"
 
   local -a tags=() args=()
-  while IFS= read -r t; do [[ -n "$t" ]] && tags[${#tags[@]}]="$t"; done <<< "$tags_out"
+  while IFS= read -r t; do
+    case "$t" in ''|@*) continue ;; esac
+    tags[${#tags[@]}]="$t"
+  done <<< "$tags_out"
 
   local -a want=()
   (( ${#tags[@]} > 0 )) && tags_contain "$proj_tag" "${tags[@]}" || want[${#want[@]}]="$proj_tag"
@@ -267,8 +285,10 @@ cmd_own() {
     *) die "'$group' gắn tag được trên API, đừng ghi sổ — dùng 'lingate adopt $group $id'" ;;
   esac
   case "$id" in
-    *[!A-Za-z0-9._-]*|"") die "id chỉ nên gồm chữ, số, . _ - — nhận được: $id" ;;
+    *[!A-Za-z0-9._/-]*|"") die "id chỉ nên gồm chữ, số, . _ - / — nhận được: $id" ;;
   esac
+  ledger_is_ours "$proj_root" "$proj_tag" || [[ ! -f "$proj_root/$LINGATE_LEDGER" ]] || die \
+    "$proj_root/$LINGATE_LEDGER khai báo project '$(json_str_file "$proj_root/$LINGATE_LEDGER" tag)', không phải '$proj_tag'. Chạy 'lingate init $proj_tag' để cất sổ cũ sang một bên và tạo sổ mới."
   env=$(resolve_env "$env")
 
   local existing
@@ -282,7 +302,7 @@ cmd_own() {
      Nếu đó là chủ ý, đặt \"allowSharedEnvs\": true trong $proj_root/$LINGATE_CONFIG."
   fi
 
-  { ledger_entries "$proj_root"
+  { ledger_entries "$proj_root" "$proj_tag"
     printf '{"type": "%s", "id": "%s", "env": "%s", "label": "%s", "at": "%s"}\n' \
       "$group" "$id" "$env" "$(json_escape "$label")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   } | ledger_save "$proj_root" "$proj_tag" \
@@ -292,11 +312,17 @@ cmd_own() {
 
 cmd_disown() {
   require_project
-  local group="${1:-}" id="${2:-}"
+  local group="${1:-}" id="${2:-}" e
   [[ -n "$group" && -n "$id" ]] || die "cú pháp: lingate disown <group> <id>"
-  ledger_entries "$proj_root" \
-    | grep -vF "\"type\": \"$group\", \"id\": \"$id\"" \
-    | ledger_save "$proj_root" "$proj_tag" \
+  ledger_is_ours "$proj_root" "$proj_tag" || die \
+    "$proj_root/$LINGATE_LEDGER khai báo project khác — chạy 'lingate init $proj_tag' trước"
+  ledger_has "$proj_root" "$proj_tag" "$group" "$id" || die "$group $id không có trong sổ"
+  # Compare parsed fields: a human who reformats the file must not turn this
+  # into a silent no-op.
+  ledger_entries "$proj_root" "$proj_tag" | while IFS= read -r e; do
+    [[ "$(json_str "$e" type)" == "$group" && "$(json_str "$e" id)" == "$id" ]] && continue
+    printf '%s\n' "$e"
+  done | ledger_save "$proj_root" "$proj_tag" \
     || die "không ghi được $proj_root/$LINGATE_LEDGER"
   info "xoá $group $id khỏi sổ"
 }
@@ -342,7 +368,7 @@ cmd_doctor() {
     fi
     if [[ -f "$root/$LINGATE_LEDGER" ]]; then
       if [[ "$(json_str_file "$root/$LINGATE_LEDGER" tag)" == "$tag" ]]; then
-        ok "sổ sở hữu: $(ledger_entries "$root" | grep -c . || true) mục"
+        ok "sổ sở hữu: $(ledger_entries "$root" "$tag" | grep -c . || true) mục"
       else
         bad "$LINGATE_LEDGER khai báo project '$(json_str_file "$root/$LINGATE_LEDGER" tag)', không phải '$tag'"; fail=1
       fi
