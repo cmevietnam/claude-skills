@@ -1,0 +1,149 @@
+# Hook chặn gì, và vì sao
+
+Hàng rào là `PreToolUse(Bash)` → `scripts/guard-linode.sh`.
+
+## Fail closed tới đâu
+
+Khi không xác minh được quyền sở hữu — API lỗi, id không tồn tại, action lạ, hoặc
+chính script này gặp lỗi giữa chừng — câu trả lời là **từ chối**. Một cái chốt cửa
+mà lúc nghi ngờ thì tự mở còn tệ hơn không có chốt.
+
+Có đúng **một** trường hợp nó không tự quyết được, và cần nói thẳng: nếu toàn bộ
+hook chạy quá `timeout` khai báo trong `hooks/hooks.json` (15 giây), Claude Code
+huỷ hook và **bỏ qua quyết định** — lệnh đi tiếp theo luồng quyền bình thường.
+Không có cách nào để một hook hết giờ trở thành "chặn". Vì vậy lời gọi API tra tag
+mang deadline riêng, ngắn hơn nhiều (`LINGATE_DEADLINE`, mặc định 8 giây, dùng
+`perl -e alarm`) và chạy với `--no-retry`: hết 8 giây thì `resolve_tags` thất bại
+và guard **từ chối** trong khi vẫn còn thời gian để trả lời. Cửa sổ fail-open thu
+lại còn những sự cố khiến chính bash treo, chứ không phải mạng chậm.
+
+Nó không phải sandbox. Đây là thứ chặn sai sót thường gặp trước khi nó thành sự
+cố, không phải thứ chống lại một tác nhân cố tình phá.
+
+## Bảng luật
+
+| Tình huống | Quyết định |
+|---|---|
+| Mọi lệnh đọc (`list`, `view`, `*-list`, `*-view`…) | cho qua |
+| Đọc credential (`*-creds-view`, `kubeconfig-view`, `keys-list`, `*-ssl-cert`) mà không redirect/pipe | **hỏi** |
+| Create loại gắn tag được, thiếu `--tags <project>` hoặc `--tags <env>` | **từ chối** |
+| Create loại không gắn tag được, thiếu `--json` | **từ chối** (không ghi sổ được) |
+| Ghi lên resource mang đúng tag project và đúng env | cho qua |
+| Ghi lên resource mang tag project khác | **từ chối** |
+| Ghi lên resource chưa mang tag nào | **từ chối**, chỉ sang `lingate adopt` |
+| Ghi lên resource thuộc project này nhưng **khác env** | **từ chối** (CROSS-ENV) |
+| Resource mang nhiều env tag, project **chưa** bật `allowSharedEnvs` | **từ chối** |
+| Resource dùng chung env, env còn lại **được bảo vệ** | **hỏi** (mỗi lần) |
+| Resource dùng chung env, env còn lại **không** được bảo vệ | cho qua |
+| Resource thứ hai trên dòng lệnh (`--linode_id`, `--firewall_id`, `--id --type`, `--linodes`) không thuộc project/env | **từ chối** |
+| Sổ sở hữu khai báo `"tag"` khác với project hiện tại | **từ chối** |
+| Ghi ở env nằm trong `protectedEnvs` | **hỏi** |
+| `--tags` trên lệnh ghi làm rơi tag project hoặc tag env | **từ chối** |
+| `--tags` gắn thêm một env tag thứ hai | **từ chối** (resource mơ hồ) |
+| Bất kỳ lệnh nào có `--help`, hoặc trang trợ giúp cục bộ (`commands`, `env-vars`, `plugins`) | cho qua (không chạm API) |
+| `tags create/delete` với label không phải tag project hoặc env | **từ chối** |
+| `tags create --linodes/--volumes/…` (gắn tag thẳng vào resource) | **từ chối**, chỉ sang `lingate adopt` |
+| `tags delete` chính tag project hoặc env của mình | **hỏi** (xoá tag gỡ nó khỏi mọi resource toàn account) |
+| Create loại dùng sổ mà output bị pipe hoặc redirect | **từ chối** (hook ghi sổ không đọc được id) |
+| Nhiều create loại dùng sổ trong cùng một lệnh Bash | **từ chối** (không biết id nào của cái nào) |
+| `--root_pass` nhận giá trị viết thẳng | **từ chối** |
+| Không tìm thấy `.linode/project.json` | **từ chối** |
+| Không tra được tag (API lỗi, id lạ) | **từ chối** |
+| Action không phân loại được là đọc hay ghi | **từ chối** |
+| Ghi lên tài nguyên cấp account (`account`, `users`, `profile`…) | **từ chối** |
+| `linode-cli configure`, `set-user`, `remove-user` | **hỏi** |
+| `tags create/delete` với label không phải tag project hoặc env | **từ chối** |
+
+## Một resource, một môi trường — và ngoại lệ có khai báo
+
+Mặc định một resource chỉ được mang **một** env tag. Mang hai là mơ hồ, và tệ hơn:
+nó biến mọi lệnh chạy ở staging thành một lệnh chạm được vào prod.
+
+Thực tế đôi khi khác: một máy phục vụ cả hai môi trường để tiết kiệm chi phí. Đó
+là lựa chọn hợp lệ, nhưng phải **nói ra**, trong `.linode/project.json`:
+
+```json
+{ "allowSharedEnvs": true }
+```
+
+Khi đã bật:
+
+- Lệnh chạy ở env nằm trong tập env của resource → cho phép.
+- Nếu resource còn phục vụ một env **được bảo vệ** khác (thường là `prod`) thì
+  **mọi lần ghi đều hỏi**, kèm câu nhắc rằng thay đổi này chạm luôn vào prod.
+  Chia sẻ giữa `dev` và `staging` không hỏi gì cả — không có gì để mất.
+- Lệnh chạy ở env **không** nằm trong tập đó vẫn bị từ chối như thường.
+
+`lingate doctor` liệt kê mọi resource đang dùng chung env và gọi đúng tên nó là
+nợ kỹ thuật. Trạng thái đích vẫn là một resource một môi trường; cờ này chỉ làm
+cho khoảng cách giữa hiện tại và đích trở nên nhìn thấy được, thay vì thành thói
+quen vô hình.
+
+## Env lấy từ đâu
+
+Theo thứ tự: tiền tố `LINODE_ENV=…` ngay trên dòng lệnh → biến môi trường
+`LINODE_ENV` → `defaultEnv` trong config.
+
+Tiền tố trên dòng lệnh là cách duy nhất đáng tin: hook chạy trong process riêng và
+không hề thừa hưởng biến môi trường của lệnh sắp chạy — nó đọc chữ `LINODE_ENV=`
+trong chính văn bản của lệnh.
+
+## Loại nào gắn tag được
+
+Kiểm chứng trên `linode-cli` v5.67.0, không phải đọc từ tài liệu:
+
+| Gắn tag được | Không gắn tag được |
+|---|---|
+| `linodes` `volumes` `nodebalancers` `domains` `lke` `firewalls` `images` | `databases` `vpcs` `object-storage` `placement` `stackscripts` `sshkeys` |
+
+Nhóm bên phải dùng sổ `.linode/owned.json`.
+
+## Cách hook đọc một dòng lệnh
+
+- Dòng lệnh được đưa qua một **lexer tôn trọng dấu nháy**: `'...'`, `"..."` và
+  `\` được xử lý đúng, nên `&&` nằm trong một label không cắt lệnh làm đôi, và
+  `--tags="cme --tags staging"` được nhìn thấy đúng là **một** tag.
+- Lexer phát sinh operator riêng, nên `&`, `;`, `|`, `( )`, `` ` `` và `$( )` đều
+  mở một lệnh mới. `bash -c "..."` được mở ra và soi lại như một dòng lệnh riêng.
+- Một token `linode-cli`/`linode`/`lin` chỉ tính là lời gọi khi nó đứng ở chỗ thực
+  sự chạy được: đầu đoạn, hoặc sau `bash -c`, `env`, `sudo -u root`, `xargs`, hoặc
+  sau từ khoá shell như `do`/`then`. So khớp theo **basename**, nên
+  `/opt/homebrew/bin/linode-cli` cũng bị bắt, còn `echo linode-cli` thì không.
+- **Cờ được nhận diện theo tiền tố**, vì `argparse` chấp nhận tiền tố không nhập
+  nhằng: `--tag`, `--ta` đều là `--tags`; `--root_pas` là `--root_pass`;
+  `--linode_i` là `--linode_id`. Khớp đúng nguyên văn từng để lọt chúng.
+- Hook biết cờ toàn cục nào **không** ăn giá trị (`--json`, `--suppress-warnings`,
+  `--pretty`, …) nên `linodes reboot --suppress-warnings 123` vẫn thấy id `123`,
+  còn `volumes --format nodebalancers delete 555` không nhầm `nodebalancers`
+  thành action. Cờ lạ bị coi là ăn giá trị — lệch về phía chặn nhầm, không phải
+  phía cho lọt.
+- **Id định vị theo thứ tự**: token không phải cờ đầu tiên sau lời gọi là group,
+  kế đó là action, còn lại là positional. Với resource lồng nhau
+  (`domains records-update <domainID> <recordID>`), id **đầu tiên** là chủ sở hữu.
+- Node worker của LKE có label dạng `lke<clusterID>-…`; nếu nó không mang tag riêng
+  thì hook lấy tag của cluster.
+- Kết quả tra tag được cache 60 giây tại `~/.cache/lingate` (đổi bằng
+  `LINGATE_TTL`). `lingate adopt` tự xoá cache của resource nó vừa sửa.
+- **Lệnh phá huỷ bỏ qua cache.** `delete`, `rebuild`, `resize`, `recycle`,
+  `restore`, `revoke`… luôn hỏi lại API. Cache là một canh bạc rằng không có gì
+  đổi trong một phút vừa rồi; với những lệnh này thì canh bạc đó không đáng.
+- Ngoài id chính, hook còn soi **resource thứ hai** mà lệnh nhắc tới:
+  `--linode_id`, `--linodes`, `--firewall_id`, `--volume_id`, và cặp
+  `--id`/`--type` của `firewalls device-create`. Gắn một volume của project vào
+  một Linode của project khác cũng là ghi lên resource của họ.
+
+## Khi bị chặn
+
+Lý do từ chối luôn kèm câu lệnh đúng. Ba trường hợp cần dừng lại và hỏi người dùng
+thay vì tự xử lý:
+
+- **"thuộc project khác"** — đây là câu trả lời "không". Đừng tìm đường vòng.
+- **"chưa mang tag nào"** — cần một quyết định về quyền sở hữu, không phải một
+  lệnh. Hỏi rồi mới `lingate adopt`.
+- **"CROSS-ENV"** — hook không tự suy diễn ý định giữa hai môi trường. Xác nhận
+  người dùng thật sự muốn env kia rồi thêm tiền tố `LINODE_ENV=`.
+
+## Tắt hàng rào
+
+`LINGATE_GUARD=off`. Đây là việc của con người, không phải của agent — nếu bạn
+đang định dùng nó để đi vòng qua một lời từ chối thì lời từ chối ấy đúng.
