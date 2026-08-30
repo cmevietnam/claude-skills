@@ -1,16 +1,16 @@
-# Secret trong công việc với Linode
+# Secrets when working with Linode
 
-Mọi thứ in ra terminal đều vào transcript của cuộc hội thoại và được gửi lên model
-provider. Một credential đã lọt vào đó coi như đã lộ và phải rotate. Linode có bốn
-chỗ dễ vấp, cả bốn đều có cách làm đúng.
+Everything printed to the terminal goes into the conversation transcript and up to
+the model provider. A credential that lands there counts as leaked and must be
+rotated. Linode has four places to trip, and each has a right way.
 
-Skill `onepassword` (lệnh `opgate`) là nơi lấy và cất secret. Xem `opgate list` để
-biết project có sẵn biến gì.
+The `onepassword` skill (the `opgate` command) is where secrets are fetched from
+and stored. `opgate list` shows which variables the project already has.
 
-## 1. Root password khi tạo hoặc rebuild Linode
+## 1. Root password when creating or rebuilding a Linode
 
-Không bao giờ viết thẳng giá trị: nó vào transcript, vào lịch sử shell, và vào
-bảng process cùng lúc. Hook từ chối luôn dạng đó.
+Never write the value literally: it lands in the transcript, in shell history, and
+in the process table at once. The hook refuses that form outright.
 
 ```bash
 opgate exec ROOT_PASS=op://Dev/cme/LINODE_ROOT_PASS -- \
@@ -18,14 +18,15 @@ opgate exec ROOT_PASS=op://Dev/cme/LINODE_ROOT_PASS -- \
     --label cme-web-1 --root_pass "$ROOT_PASS"
 ```
 
-Chưa có giá trị trong vault thì thêm dòng `LINODE_ROOT_PASS=op://Dev/cme/LINODE_ROOT_PASS`
-vào `.env.op`, rồi bảo người dùng chạy `opgate put cme LINODE_ROOT_PASS`. Đừng hỏi
-mật khẩu qua chat — câu trả lời sẽ nằm trong transcript.
+If the vault has no value yet, add the line
+`LINODE_ROOT_PASS=op://Dev/cme/LINODE_ROOT_PASS` to `.env.op`, then have the user
+run `opgate put cme LINODE_ROOT_PASS`. Do not ask for the password in chat — the
+answer would sit in the transcript.
 
-## 2. Kubeconfig của LKE
+## 2. LKE kubeconfig
 
-`lke kubeconfig-view` trả về kubeconfig base64, tức là credential đầy đủ vào
-cluster. Cho nó đi thẳng ra file, đừng để qua stdout:
+`lke kubeconfig-view` returns a base64 kubeconfig, i.e. full credentials for the
+cluster. Send it straight to a file; never let it reach stdout:
 
 ```bash
 linode-cli lke kubeconfig-view 580172 --json \
@@ -33,60 +34,63 @@ linode-cli lke kubeconfig-view 580172 --json \
 chmod 600 ~/.kube/cme-prod.yaml
 ```
 
-Hook hỏi khi stdout của lệnh **không** kết thúc ở một file hay ở `opgate` sau khi
-đi hết pipeline. `2>/dev/null` không tính (đó là stderr), và `| base64 -d` cũng
-không — lệnh sau pipe vẫn in ra màn hình.
+The hook asks when the command's stdout does **not** end in a file or in `opgate`
+at the end of the pipeline. `2>/dev/null` does not count (that is stderr), and
+neither does `| base64 -d` — the command after the pipe still prints.
 
-## 3. Credential do Linode sinh ra
+## 3. Credentials that Linode generates
 
-`object-storage keys-create`, `databases *-creds-view`, `*-creds-reset` đều trả về
-giá trị dùng được ngay. Cất vào 1Password trong cùng một pipeline, đừng chép tay:
+`object-storage keys-create`, `databases *-creds-view`, `*-creds-reset` all return
+values that work immediately. Store them in 1Password in the same pipeline; do not
+copy by hand:
 
 ```bash
 linode-cli object-storage keys-create --label cme --json \
   | jq -r .secret_key | opgate put cme LINODE_OBJ_SECRET
 ```
 
-`object-storage keys-create` là ngoại lệ duy nhất được phép pipe: id và secret về
-cùng một lượt, và ép id ra stdout để hook ghi sổ đồng nghĩa ép cả secret vào
-transcript. Đổi lại, id **không** vào sổ tự động — ghi tay ngay sau đó:
+`object-storage keys-create` is the one create allowed to be piped: the id and the
+secret arrive together, and forcing the id onto stdout for the recording hook would
+force the secret into the transcript too. In exchange, the id is **not** recorded
+automatically — record it by hand right after:
 
 ```bash
 linode-cli object-storage keys-list --json | jq -r '.[] | "\(.id)\t\(.label)"'
 lingate own object-storage <id> --env staging
 ```
 
-Mọi create khác của nhóm dùng sổ (VPC, database, placement group…) đều bị **từ
-chối** nếu stdout bị pipe hay redirect, hoặc nếu lệnh đứng chung một lần gọi Bash
-với một lời gọi `linode-cli` khác — vì hook ghi sổ đọc id từ stdout của cả lần gọi
-và sẽ ghi sai. Chạy chúng **một mình**, trần, với `--json`.
+Every other create of a ledger type (VPC, database, placement group…) is
+**refused** when its stdout is piped or redirected, or when it shares a Bash call
+with another `linode-cli` invocation — the recording hook reads the id from the
+whole call's stdout and would record the wrong one. Run them **alone**, bare, with
+`--json`.
 
-Muốn kiểm tra là đã có thì so bên trong process con, đừng in ra:
+To check that a value is present, compare inside a child process; do not print it:
 
 ```bash
 opgate run -- sh -c '[ -n "$LINODE_OBJ_SECRET" ] && echo present'
 ```
 
-## 4. Token của chính linode-cli
+## 4. linode-cli's own token
 
-`LINODE_CLI_TOKEN` nằm trong `~/.config/linode-cli`. Đừng `cat` file đó, đừng
-`echo $LINODE_CLI_TOKEN`, đừng đưa vào lệnh nào có `--debug` (nó in cả header
-`Authorization`). Cần đổi token thì để người dùng chạy `linode-cli configure` —
-hook cũng chỉ hỏi chứ không tự cho qua.
+`LINODE_CLI_TOKEN` lives in `~/.config/linode-cli`. Do not `cat` that file, do not
+`echo $LINODE_CLI_TOKEN`, and do not pass `--debug` to anything (it prints the
+`Authorization` header). To change the token, let the user run
+`linode-cli configure` — the hook only asks there, it never allows on its own.
 
-Kiểm tra token còn dùng được mà không lộ gì:
+To check the token still works without exposing anything:
 
 ```bash
 lingate doctor
 ```
 
-## Nếu lỡ lộ
+## If something leaked
 
-Coi như đã lộ thật, kể cả khi chỉ hiện một lần:
+Treat it as leaked for real, even if it showed once:
 
 - root password → `linode-cli linodes disk-reset-password …`
-- object storage key → `object-storage keys-delete` rồi tạo key mới
+- object storage key → `object-storage keys-delete`, then create a new key
 - database credential → `databases <engine>-creds-reset <id>`
-- API token → xoá ở `profile tokens-list` / tạo lại bằng `linode-cli configure`
+- API token → revoke under `profile tokens-list` / recreate with `linode-cli configure`
 
-Rồi cập nhật giá trị mới vào 1Password bằng `opgate put`.
+Then put the new value into 1Password with `opgate put`.

@@ -1,5 +1,5 @@
 {
-  "description": "Giữ mọi thao tác Linode trong ranh giới tag của project: chặn lệnh ghi lên resource không thuộc project, và ghi sổ sở hữu cho loại resource không gắn tag được.",
+  "description": "Keeps every Linode operation inside the project's tag boundary: refuses writes to resources outside the project, and records ownership for resource types that cannot carry tags.",
   "hooks": {
     "PreToolUse": [
       {

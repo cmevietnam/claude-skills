@@ -59,7 +59,7 @@ done
 
 # The guard refuses a ledger create that shares its Bash call with another
 # invocation; if one got here anyway, do not guess which id is which.
-(( inv <= 1 )) || note "Lenh Bash nay goi linode-cli $inv lan, nen lingate khong biet id nao trong output la cua resource '$group' vua tao. Ghi so tay: lingate own $group <id> --env <env>"
+(( inv <= 1 )) || note "This Bash call invoked linode-cli $inv times, so lingate cannot tell which id in the output belongs to the '$group' just created. Record it by hand: lingate own $group <id> --env <env>"
 
 cwd=$(payload_str "$payload" '.cwd' 'cwd')
 [[ -n "$cwd" ]] || cwd="${CLAUDE_PROJECT_DIR:-$PWD}"
@@ -81,7 +81,7 @@ else
   id=$(json_first_id "$output")
 fi
 if [[ -z "$id" ]]; then
-  note "Vua tao mot resource '$group' - loai nay khong co truong tags tren API nen quyen so huu phai ghi vao .linode/owned.json, nhung lingate khong doc duoc id tu output. Chay ngay: lingate own $group <id> --env <env>"
+  note "A '$group' resource was just created - this type has no tags field on the API, so ownership must be recorded in .linode/owned.json, but lingate could not read its id from the output. Run now: lingate own $group <id> --env <env>"
 fi
 
 ledger_has "$root" "$tag" "$group" "$id" && exit 0
@@ -90,14 +90,14 @@ ledger_has "$root" "$tag" "$group" "$id" && exit 0
 [[ -n "$env" ]] || env=$(json_str_file "$root/$LINGATE_CONFIG" defaultEnv)
 
 if [[ -f "$root/$LINGATE_LEDGER" ]] && ! ledger_is_ours "$root" "$tag"; then
-  note "lingate: KHONG ghi duoc $group $id - $root/$LINGATE_LEDGER khai bao no thuoc project '$(json_str_file "$root/$LINGATE_LEDGER" tag)' chu khong phai '$tag'. Chay 'lingate init $tag' de tao so moi (so cu duoc cat sang mot ben), roi: lingate own $group $id --env $env"
+  note "lingate: could NOT record $group $id - $root/$LINGATE_LEDGER declares project '$(json_str_file "$root/$LINGATE_LEDGER" tag)', not '$tag'. Run 'lingate init $tag' to create a new ledger (the old one is set aside), then: lingate own $group $id --env $env"
 fi
 
 if { ledger_entries "$root" "$tag"
      printf '{"type": "%s", "id": "%s", "env": "%s", "label": "%s", "at": "%s"}\n' \
        "$group" "$id" "$env" "$(json_escape "$label")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
    } | ledger_save "$root" "$tag" && ledger_has "$root" "$tag" "$group" "$id"; then
-  note "lingate: da ghi $group $id (env '$env') vao .linode/owned.json cua project '$tag'. Nho commit file nay."
+  note "lingate: recorded $group $id (env '$env') in .linode/owned.json of project '$tag'. Remember to commit that file."
 fi
 
-note "lingate: KHONG ghi duoc $group $id vao $root/$LINGATE_LEDGER (loi ghi file). Resource da duoc tao roi nhung chua co chu - chay ngay: lingate own $group $id --env $env"
+note "lingate: could NOT record $group $id in $root/$LINGATE_LEDGER (write failed). The resource exists but has no owner - run now: lingate own $group $id --env $env"

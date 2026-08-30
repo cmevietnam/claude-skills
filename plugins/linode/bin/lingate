@@ -18,31 +18,31 @@ here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 
 usage() {
   cat >&2 <<'USAGE'
-lingate — ranh giới project và môi trường cho Linode
+lingate — project and environment boundary for Linode
 
   init <tag> [--envs a,b,c] [--default-env E] [--protect a,b] [--shared-envs]
-                                         Khai báo checkout này thuộc project nào
-  whoami                                 Project/env hiện tại là gì, đọc từ file nào
-  ls [group]                             Resource đang thuộc project này
-  orphans                                Resource chưa mang tag — ứng viên adopt
-  adopt <group> <id> --env E [--yes]     Nhận một resource cũ về project + env
-  own <group> <id> --env E [--label L]   Ghi sổ resource loại không gắn tag được
-  disown <group> <id>                    Xoá khỏi sổ
-  doctor                                 Kiểm tra toàn bộ setup và in cách sửa
+                                         Declare which project this checkout is
+  whoami                                 Current project/env, and which file says so
+  ls [group]                             Resources this project owns
+  orphans                                Resources with no tags — adoption candidates
+  adopt <group> <id> --env E [--yes]     Bring an older resource into project + env
+  own <group> <id> --env E [--label L]   Record an untaggable resource in the ledger
+  disown <group> <id>                    Remove a resource from the ledger
+  doctor                                 Check the whole setup and print the fixes
 
-Env của một lệnh lấy theo thứ tự: tiền tố LINODE_ENV=... ngay trên dòng lệnh,
-rồi biến môi trường LINODE_ENV, rồi defaultEnv trong .linode/project.json.
+A command's env is taken, in order, from a LINODE_ENV=... prefix on the command
+line, then the LINODE_ENV environment variable, then defaultEnv in .linode/project.json.
 
-Biến môi trường: LINGATE_GUARD=off tắt hàng rào, LINGATE_TTL=<giây> đổi TTL cache,
-LINGATE_BUDGET=<giây> ngân sách tổng cho các lookup API trong một lần hook.
+Environment: LINGATE_GUARD=off disables the guard, LINGATE_TTL=<s> changes the cache
+TTL, LINGATE_BUDGET=<s> is the total API lookup budget for one hook run.
 USAGE
 }
 
 require_project() {
   proj_root=$(find_project_root) || die \
-    "không tìm thấy .linode/project.json — chạy 'lingate init <tag>' ở gốc repo trước"
+    "no .linode/project.json found — run 'lingate init <tag>' at the repo root first"
   proj_tag=$(json_str_file "$proj_root/$LINGATE_CONFIG" tag)
-  [[ -n "$proj_tag" ]] || die "$proj_root/$LINGATE_CONFIG thiếu trường \"tag\""
+  [[ -n "$proj_tag" ]] || die "$proj_root/$LINGATE_CONFIG has no \"tag\" field"
   proj_envs=$(json_arr_file "$proj_root/$LINGATE_CONFIG" envs | tr '\n' ' ')
   proj_envs=${proj_envs% }
   proj_protected=$(json_arr_file "$proj_root/$LINGATE_CONFIG" protectedEnvs | tr '\n' ' ')
@@ -59,7 +59,7 @@ resolve_env() {
   [[ -n "$proj_envs" ]] || { printf '%s' "$e"; return 0; }
   case " $proj_envs " in
     *" $e "*) printf '%s' "$e" ;;
-    *) die "env '$e' không nằm trong [$proj_envs] — truyền --env <env>" ;;
+    *) die "env '$e' is not one of [$proj_envs] — pass --env <env>" ;;
   esac
 }
 
@@ -78,19 +78,22 @@ cmd_init() {
       --protect)     protect="${2:-}"; shift 2 ;;
       --shared-envs) shared="true"; shift ;;
       --no-envs)     envs=""; protect=""; default_env=""; shift ;;
-      -*) die "cờ lạ: $1" ;;
-      *) [[ -z "$tag" ]] || die "chỉ nhận một tag"; tag="$1"; shift ;;
+      -*) die "unknown flag: $1" ;;
+      *) [[ -z "$tag" ]] || die "only one tag is accepted"; tag="$1"; shift ;;
     esac
   done
-  [[ -n "$tag" ]] || die "thiếu tag. Ví dụ: lingate init cme --region sg-sin-2"
-  case "$tag" in *[!A-Za-z0-9_.-]*) die "tag chỉ nên gồm chữ, số, - _ . — nhận được: $tag" ;; esac
+  [[ -n "$tag" ]] || die "missing tag. Example: lingate init cme --region sg-sin-2"
+  case "$tag" in *[!A-Za-z0-9_.-]*) die "a tag should contain only letters, digits, - _ . — got: $tag" ;; esac
 
   root=$(git rev-parse --show-toplevel 2>/dev/null) || root="$PWD"
   [[ -n "$prefix" ]] || prefix="$tag-"
   [[ -n "$default_env" || -z "$envs" ]] || default_env="${envs%%,*}"
 
   mkdir -p -- "$root/$LINGATE_DIR"
-  [[ -f "$root/$LINGATE_CONFIG" ]] && warn "$root/$LINGATE_CONFIG đã tồn tại, ghi đè" || true
+  [[ -f "$root/$LINGATE_CONFIG" ]] && warn "$root/$LINGATE_CONFIG already exists, overwriting" || true
+  # The config is staged and moved into place last: if preparing the ledger
+  # fails, nothing is left half-declared.
+  local cfg_tmp="$root/$LINGATE_CONFIG.tmp.$$"
   {
     printf '{\n  "tag": "%s",\n  "labelPrefix": "%s"' "$tag" "$prefix"
     [[ -n "$region" ]] && printf ',\n  "defaultRegion": "%s"' "$region" || true
@@ -101,25 +104,27 @@ cmd_init() {
       printf ',\n  "allowSharedEnvs": %s' "$shared"
     fi
     printf '\n}\n'
-  } > "$root/$LINGATE_CONFIG"
+  } > "$cfg_tmp" || { rm -f -- "$cfg_tmp"; die "cannot write $root/$LINGATE_CONFIG"; }
   # A ledger that names another project is set aside, not adopted: carrying its
   # entries forward would hand that project's resources to this one.
   if [[ -f "$root/$LINGATE_LEDGER" ]]; then
     local old
     old=$(json_str_file "$root/$LINGATE_LEDGER" tag)
     if [[ "$old" != "$tag" ]]; then
-      mv -f -- "$root/$LINGATE_LEDGER" "$root/$LINGATE_LEDGER.${old:-unknown}.bak"
-      warn "$LINGATE_LEDGER cũ khai báo project '${old:-?}' — đã cất sang $LINGATE_LEDGER.${old:-unknown}.bak và tạo sổ mới cho '$tag'"
-      printf '' | ledger_save "$root" "$tag"
+      mv -f -- "$root/$LINGATE_LEDGER" "$root/$LINGATE_LEDGER.${old:-unknown}.bak" \
+        || { rm -f -- "$cfg_tmp"; die "cannot set the old ledger $root/$LINGATE_LEDGER aside"; }
+      warn "the old $LINGATE_LEDGER declared project '${old:-?}' — moved to $LINGATE_LEDGER.${old:-unknown}.bak, creating a new ledger for '$tag'"
+      printf '' | ledger_save "$root" "$tag" || { rm -f -- "$cfg_tmp"; die "cannot create $root/$LINGATE_LEDGER"; }
     fi
   else
-    printf '' | ledger_save "$root" "$tag"
+    printf '' | ledger_save "$root" "$tag" || { rm -f -- "$cfg_tmp"; die "cannot create $root/$LINGATE_LEDGER"; }
   fi
+  mv -f -- "$cfg_tmp" "$root/$LINGATE_CONFIG"
 
   info "project '$tag' — $root/$LINGATE_CONFIG"
-  [[ -n "$envs" ]] && info "env: [${envs//,/ }], mặc định '$default_env', bảo vệ [${protect//,/ }]" || true
-  [[ "$shared" == true ]] && warn "allowSharedEnvs=true — một resource được phép phục vụ nhiều env. Đây là nợ kỹ thuật có chủ đích; 'lingate doctor' sẽ nhắc." || true
-  info "commit thư mục $LINGATE_DIR/ vào git để cả team dùng chung ranh giới này"
+  [[ -n "$envs" ]] && info "envs: [${envs//,/ }], default '$default_env', protected [${protect//,/ }]" || true
+  [[ "$shared" == true ]] && warn "allowSharedEnvs=true — a resource may serve several envs. This is deliberate technical debt; 'lingate doctor' will keep reminding you." || true
+  info "commit the $LINGATE_DIR/ directory so the whole team shares this boundary"
 }
 
 # comma list -> JSON string array body
@@ -140,14 +145,14 @@ cmd_whoami() {
   printf 'tag        %s\n' "$proj_tag"
   printf 'prefix     %s\n' "$(json_str_file "$proj_root/$LINGATE_CONFIG" labelPrefix)"
   printf 'region     %s\n' "$(json_str_file "$proj_root/$LINGATE_CONFIG" defaultRegion)"
-  printf 'envs       %s\n' "${proj_envs:-(không dùng env tag)}"
+  printf 'envs       %s\n' "${proj_envs:-(env tags not used)}"
   local cur note=""
   cur=$(resolve_env "")
-  case " $proj_protected " in *" $cur "*) note="  [ĐƯỢC BẢO VỆ]" ;; esac
+  case " $proj_protected " in *" $cur "*) note="  [PROTECTED]" ;; esac
   printf 'env        %s%s\n' "$cur" "$note"
-  printf 'env chung  %s\n' "$([[ "$proj_shared" == true ]] && printf 'cho phép (allowSharedEnvs)' || printf 'không')"
+  printf 'shared     %s\n' "$([[ "$proj_shared" == true ]] && printf 'allowed (allowSharedEnvs)' || printf 'no')"
   printf 'config     %s\n' "$proj_root/$LINGATE_CONFIG"
-  printf 'ledger     %s (%s mục)\n' "$proj_root/$LINGATE_LEDGER" \
+  printf 'ledger     %s (%s entries)\n' "$proj_root/$LINGATE_LEDGER" \
     "$(ledger_entries "$proj_root" "$proj_tag" | grep -c . || true)"
 }
 
@@ -162,7 +167,7 @@ cmd_ls() {
     # under set -e a plain `rows=$(...)` that fails ends the script right here.
     if rows=$(lin "$g" "$(list_action_for "$g")" --tags "$proj_tag" \
                 --text --no-headers --format 'id,label,tags' 2>/dev/null); then rc=0; else rc=$?; fi
-    (( rc == 0 )) || { warn "không đọc được $g (linode-cli exit $rc) — danh sách dưới đây KHÔNG đầy đủ"; continue; }
+    (( rc == 0 )) || { warn "could not read $g (linode-cli exit $rc) — the list below is INCOMPLETE"; continue; }
     printf '%s\n' "$rows" | awk -v g="$g" -F'\t' 'NF { printf "%-14s %-12s %-34s %s\n", g, $1, $2, $3 }'
   done
   for g in $LINGATE_LEDGER_GROUPS; do
@@ -188,7 +193,7 @@ cmd_orphans() {
     [[ "$g" == images ]] && extra=(--is_public false)
     if rows=$(lin "$g" "$(list_action_for "$g")" ${extra[@]+"${extra[@]}"} \
                 --text --no-headers --format 'id,label,tags' 2>/dev/null); then rc=0; else rc=$?; fi
-    (( rc == 0 )) || { warn "không đọc được $g (linode-cli exit $rc) — danh sách dưới đây KHÔNG đầy đủ"; continue; }
+    (( rc == 0 )) || { warn "could not read $g (linode-cli exit $rc) — the list below is INCOMPLETE"; continue; }
     printf '%s\n' "$rows" | awk -v g="$g" -F'\t' '
         $3 == "" || $3 == "[]" {
           if (g == "linodes" && $2 ~ /^lke[0-9]+-/) next
@@ -205,22 +210,22 @@ cmd_adopt() {
     case "$1" in
       --yes|-y) yes=1; shift ;;
       --env)    env="${2:-}"; shift 2 ;;
-      -*) die "cờ lạ: $1" ;;
+      -*) die "unknown flag: $1" ;;
       *) if [[ -z "$group" ]]; then group="$1"; else id="$1"; fi; shift ;;
     esac
   done
-  [[ -n "$group" && -n "$id" ]] || die "cú pháp: lingate adopt <group> <id> --env <env> [--yes]"
+  [[ -n "$group" && -n "$id" ]] || die "usage: lingate adopt <group> <id> --env <env> [--yes]"
   env=$(resolve_env "$env")
 
   case "$(group_scope "$group")" in
     ledger)   cmd_own "$group" "$id" --env "$env"; return ;;
     taggable) ;;
-    *) die "'$group' không phải loại gắn tag được. Loại gắn tag được: $LINGATE_TAGGABLE" ;;
+    *) die "'$group' is not a taggable type. Taggable types: $LINGATE_TAGGABLE" ;;
   esac
 
   local tags_out t
   tags_out=$(resolve_tags "$group" "$id") \
-    || die "không tra được $group $id — kiểm tra: linode-cli $group $(view_action_for "$group") $id --json"
+    || die "cannot look up $group $id — check: linode-cli $group $(view_action_for "$group") $id --json"
 
   local -a tags=() args=()
   while IFS= read -r t; do
@@ -238,15 +243,15 @@ cmd_adopt() {
       existing=$(env_of_tags "$proj_envs" ${tags[@]+"${tags[@]}"} | tr '\n' ' ')
       existing=${existing% }
       if [[ -n "$existing" && "$proj_shared" != true ]]; then
-        die "$group $id đã ở env '$existing'; thêm '$env' sẽ biến nó thành resource dùng chung.
-     Nếu đó là chủ ý (một máy phục vụ hai env để tiết kiệm), đặt \"allowSharedEnvs\": true
-     trong $proj_root/$LINGATE_CONFIG. Nếu không, gỡ '$existing' trước."
+        die "$group $id is already in env '$existing'; adding '$env' would make it a shared resource.
+     If that is intended (one box serving two envs to save cost), set \"allowSharedEnvs\": true
+     in $proj_root/$LINGATE_CONFIG. Otherwise remove '$existing' first."
       fi
       want[${#want[@]}]="$env"
     fi
   fi
   if (( ${#want[@]} == 0 )); then
-    info "$group $id đã mang đủ tag '$proj_tag'${proj_envs:+ và '$env'}, không phải làm gì"
+    info "$group $id already carries '$proj_tag'${proj_envs:+ and '$env'}, nothing to do"
     return 0
   fi
 
@@ -254,17 +259,21 @@ cmd_adopt() {
   for t in "${want[@]}";             do args[${#args[@]}]="--tags"; args[${#args[@]}]="$t"; done
 
   if (( yes == 0 )); then
-    info "sẽ chạy: linode-cli $group $(update_action_for "$group") $id ${args[*]}"
-    info "tag: [${tags[*]-}] → [${tags[*]-} ${want[*]}]"
-    info "hỏi người dùng trước, rồi chạy lại với --yes"
+    info "would run: linode-cli $group $(update_action_for "$group") $id ${args[*]}"
+    info "tags: [${tags[*]-}] → [${tags[*]-} ${want[*]}]"
+    info "ask the user first, then rerun with --yes"
     return 0
   fi
+  # The cached answer goes first: once the API has changed, a stale cache is the
+  # one thing that could still make the guard refuse what was just adopted.
+  rm -f -- "$LINGATE_CACHE_HOME/$group-${id//\//_}.json" 2>/dev/null || true
   # update is a PUT that replaces the whole array, so every existing tag is sent
   # back alongside the new ones.
   lin "$group" "$(update_action_for "$group")" "$id" "${args[@]}" \
-    --text --no-headers --format 'id,label,tags' >&2
-  rm -f -- "$LINGATE_CACHE_HOME/$group-${id//\//_}.json"
-  info "$group $id giờ thuộc project '$proj_tag'${proj_envs:+, env '$env'}"
+    --text --no-headers --format 'id,label,tags' >&2 \
+    || die "linode-cli $group $(update_action_for "$group") $id failed — tags unchanged"
+  rm -f -- "$LINGATE_CACHE_HOME/$group-${id//\//_}.json" 2>/dev/null || true
+  info "$group $id now belongs to project '$proj_tag'${proj_envs:+, env '$env'}"
 }
 
 # --- own / disown -----------------------------------------------------------
@@ -279,72 +288,72 @@ cmd_own() {
       *) shift ;;
     esac
   done
-  [[ -n "$group" && -n "$id" ]] || die "cú pháp: lingate own <group> <id> --env <env> [--label L]"
+  [[ -n "$group" && -n "$id" ]] || die "usage: lingate own <group> <id> --env <env> [--label L]"
   case " $LINGATE_LEDGER_GROUPS " in
     *" $group "*) ;;
-    *) die "'$group' gắn tag được trên API, đừng ghi sổ — dùng 'lingate adopt $group $id'" ;;
+    *) die "'$group' can carry tags on the API, do not ledger it — use 'lingate adopt $group $id'" ;;
   esac
   case "$id" in
-    *[!A-Za-z0-9._/-]*|"") die "id chỉ nên gồm chữ, số, . _ - / — nhận được: $id" ;;
+    *[!A-Za-z0-9._/-]*|"") die "an id should contain only letters, digits, . _ - / — got: $id" ;;
   esac
   ledger_is_ours "$proj_root" "$proj_tag" || [[ ! -f "$proj_root/$LINGATE_LEDGER" ]] || die \
-    "$proj_root/$LINGATE_LEDGER khai báo project '$(json_str_file "$proj_root/$LINGATE_LEDGER" tag)', không phải '$proj_tag'. Chạy 'lingate init $proj_tag' để cất sổ cũ sang một bên và tạo sổ mới."
+    "$proj_root/$LINGATE_LEDGER declares project '$(json_str_file "$proj_root/$LINGATE_LEDGER" tag)', not '$proj_tag'. Run 'lingate init $proj_tag' to set the old ledger aside and create a new one."
   env=$(resolve_env "$env")
 
   local existing
   existing=$(ledger_envs_of "$proj_root" "$proj_tag" "$group" "$id" | tr '\n' ' ')
   existing=${existing% }
   case " $existing " in
-    *" $env "*) info "$group $id (env '$env') đã có trong sổ"; return 0 ;;
+    *" $env "*) info "$group $id (env '$env') is already in the ledger"; return 0 ;;
   esac
   if [[ -n "$existing" && "$proj_shared" != true ]]; then
-    die "$group $id đã ở env '$existing' trong sổ; thêm '$env' sẽ biến nó thành resource dùng chung.
-     Nếu đó là chủ ý, đặt \"allowSharedEnvs\": true trong $proj_root/$LINGATE_CONFIG."
+    die "$group $id is already in env '$existing' in the ledger; adding '$env' would make it a shared resource.
+     If that is intended, set \"allowSharedEnvs\": true in $proj_root/$LINGATE_CONFIG."
   fi
 
   { ledger_entries "$proj_root" "$proj_tag"
     printf '{"type": "%s", "id": "%s", "env": "%s", "label": "%s", "at": "%s"}\n' \
       "$group" "$id" "$env" "$(json_escape "$label")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   } | ledger_save "$proj_root" "$proj_tag" \
-    || die "không ghi được $proj_root/$LINGATE_LEDGER"
-  info "ghi sổ $group $id (env '$env') → $proj_root/$LINGATE_LEDGER (nhớ commit)"
+    || die "cannot write $proj_root/$LINGATE_LEDGER"
+  info "recorded $group $id (env '$env') → $proj_root/$LINGATE_LEDGER (remember to commit)"
 }
 
 cmd_disown() {
   require_project
   local group="${1:-}" id="${2:-}" e
-  [[ -n "$group" && -n "$id" ]] || die "cú pháp: lingate disown <group> <id>"
+  [[ -n "$group" && -n "$id" ]] || die "usage: lingate disown <group> <id>"
   ledger_is_ours "$proj_root" "$proj_tag" || die \
-    "$proj_root/$LINGATE_LEDGER khai báo project khác — chạy 'lingate init $proj_tag' trước"
-  ledger_has "$proj_root" "$proj_tag" "$group" "$id" || die "$group $id không có trong sổ"
+    "$proj_root/$LINGATE_LEDGER declares another project — run 'lingate init $proj_tag' first"
+  ledger_has "$proj_root" "$proj_tag" "$group" "$id" || die "$group $id is not in the ledger"
   # Compare parsed fields: a human who reformats the file must not turn this
   # into a silent no-op.
   ledger_entries "$proj_root" "$proj_tag" | while IFS= read -r e; do
     [[ "$(json_str "$e" type)" == "$group" && "$(json_str "$e" id)" == "$id" ]] && continue
     printf '%s\n' "$e"
   done | ledger_save "$proj_root" "$proj_tag" \
-    || die "không ghi được $proj_root/$LINGATE_LEDGER"
-  info "xoá $group $id khỏi sổ"
+    || die "cannot write $proj_root/$LINGATE_LEDGER"
+  info "removed $group $id from the ledger"
 }
 
 # --- doctor -----------------------------------------------------------------
 cmd_doctor() {
   local fail=0 root tag out envs
-  info "kiểm tra setup"
+  info "checking the setup"
 
   if command -v linode-cli >/dev/null 2>&1; then
     ok "linode-cli: $(linode-cli --version 2>/dev/null | head -1)"
   else
-    bad "chưa có linode-cli → pip3 install linode-cli"; fail=1
+    bad "linode-cli not installed → pip3 install linode-cli"; fail=1
   fi
 
   if out=$(linode-cli account view --text --no-headers --format 'email' 2>&1); then
-    ok "token dùng được (account: $(printf '%s' "$out" | tail -1))"
+    ok "token works (account: $(printf '%s' "$out" | tail -1))"
   else
-    bad "gọi API thất bại → chạy 'linode-cli configure'"; fail=1
+    bad "API call failed → run 'linode-cli configure'"; fail=1
   fi
   if printf '%s' "${out:-}" | grep -q "newer than the CLI"; then
-    warn "spec của CLI cũ hơn API → pip3 install --upgrade linode-cli"
+    warn "the CLI spec is older than the API → pip3 install --upgrade linode-cli"
   fi
 
   if root=$(find_project_root); then
@@ -352,38 +361,38 @@ cmd_doctor() {
     if [[ -n "$tag" ]]; then
       ok "project '$tag' — $root/$LINGATE_CONFIG"
     else
-      bad "$root/$LINGATE_CONFIG thiếu trường \"tag\""; fail=1
+      bad "$root/$LINGATE_CONFIG has no \"tag\" field"; fail=1
     fi
     envs=$(json_arr_file "$root/$LINGATE_CONFIG" envs | tr '\n' ' ')
     if [[ -n "${envs// /}" ]]; then
       local prot; prot=$(json_arr_file "$root/$LINGATE_CONFIG" protectedEnvs | tr '\n' ' ')
-      ok "env: [${envs% }], mặc định '$(json_str_file "$root/$LINGATE_CONFIG" defaultEnv)', bảo vệ [${prot% }]"
+      ok "envs: [${envs% }], default '$(json_str_file "$root/$LINGATE_CONFIG" defaultEnv)', protected [${prot% }]"
     else
-      warn "project không khai báo envs — hàng rào cross-env đang tắt"
+      warn "the project declares no envs — the cross-env guard is off"
     fi
     if linode-cli tags list --text --no-headers --suppress-warnings 2>/dev/null | grep -qx "$tag"; then
-      ok "tag '$tag' đã có trên account"
+      ok "tag '$tag' exists on the account"
     else
-      warn "tag '$tag' chưa gắn vào resource nào — bình thường nếu project còn mới"
+      warn "tag '$tag' is attached to nothing yet — normal for a new project"
     fi
     if [[ -f "$root/$LINGATE_LEDGER" ]]; then
       if [[ "$(json_str_file "$root/$LINGATE_LEDGER" tag)" == "$tag" ]]; then
-        ok "sổ sở hữu: $(ledger_entries "$root" "$tag" | grep -c . || true) mục"
+        ok "ledger: $(ledger_entries "$root" "$tag" | grep -c . || true) entries"
       else
-        bad "$LINGATE_LEDGER khai báo project '$(json_str_file "$root/$LINGATE_LEDGER" tag)', không phải '$tag'"; fail=1
+        bad "$LINGATE_LEDGER declares project '$(json_str_file "$root/$LINGATE_LEDGER" tag)', not '$tag'"; fail=1
       fi
     else
-      warn "chưa có $LINGATE_LEDGER — sẽ tự tạo khi cần"
+      warn "no $LINGATE_LEDGER yet — it is created when needed"
     fi
     cmd_shared_debt "$root" "$tag" "$envs"
   else
-    bad "không tìm thấy .linode/project.json → lingate init <tag>"; fail=1
+    bad "no .linode/project.json found → lingate init <tag>"; fail=1
   fi
 
   if [[ "$LINGATE_GUARD" == off ]]; then
-    warn "LINGATE_GUARD=off — hàng rào đang TẮT, mọi lệnh ghi đều lọt"
+    warn "LINGATE_GUARD=off — the guard is OFF, every write goes through"
   else
-    ok "hàng rào PreToolUse đang bật"
+    ok "the PreToolUse guard is on"
   fi
   return "$fail"
 }
@@ -404,15 +413,15 @@ cmd_shared_debt() {
         case " $rtags " in *" $e "*) hits=$((hits + 1)) ;; esac
       done
       if (( hits > 1 )); then
-        warn "dùng chung env: $g $rid ($rlabel) → [$rtags]"
+        warn "shared envs: $g $rid ($rlabel) → [$rtags]"
         n=$((n + 1))
       fi
     done <<< "$rows"
   done
   if (( n > 0 )); then
-    warn "$n resource đang phục vụ nhiều môi trường. Hợp lệ nếu allowSharedEnvs=true, nhưng mỗi cái là một chỗ mà lệnh staging chạm được vào prod — tách ra khi đủ ngân sách."
+    warn "$n resource(s) serve several environments. Fine when allowSharedEnvs=true, but each one is a place where a staging command reaches prod — split them when the budget allows."
   else
-    ok "không có resource nào phục vụ nhiều môi trường"
+    ok "no resource serves several environments"
   fi
 }
 

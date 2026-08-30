@@ -33,7 +33,7 @@
       "name": "linode",
       "source": "./plugins/linode",
       "displayName": "Linode (project-scoped)",
-      "description": "Làm việc với Linode trong ranh giới tag của project: resource tạo ra luôn mang tag project, và mọi thao tác ghi lên resource của project khác đều bị chặn.",
+      "description": "Work with Linode inside the project's tag boundary: resources are created with the project tag, and writes to another project's resources are refused.",
       "version": "0.1.0",
       "author": {
         "name": "hieuvo"

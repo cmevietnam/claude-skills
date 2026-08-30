@@ -1,180 +1,193 @@
-# Hook chặn gì, và vì sao
+# What the hook refuses, and why
 
-Hàng rào là `PreToolUse(Bash)` → `scripts/guard-linode.sh`.
+The guard is `PreToolUse(Bash)` → `scripts/guard-linode.sh`.
 
-## Fail closed tới đâu
+## How far "fail closed" goes
 
-Khi không xác minh được quyền sở hữu — API lỗi, id không tồn tại, action lạ, hoặc
-chính script này gặp lỗi giữa chừng — câu trả lời là **từ chối**. Một cái chốt cửa
-mà lúc nghi ngờ thì tự mở còn tệ hơn không có chốt.
+When ownership cannot be verified — the API fails, the id does not exist, the
+action is unknown, or this script itself errors halfway — the answer is
+**refuse**. A latch that opens itself when in doubt is worse than no latch.
 
-Có đúng **một** trường hợp nó không tự quyết được, và cần nói thẳng: nếu toàn bộ
-hook chạy quá `timeout` khai báo trong `hooks/hooks.json` (15 giây), Claude Code
-huỷ hook và **bỏ qua quyết định** — lệnh đi tiếp theo luồng quyền bình thường.
-Không có cách nào để một hook hết giờ trở thành "chặn". Vì vậy mọi lời gọi API
-trong một lần hook dùng chung **một ngân sách** (`LINGATE_BUDGET`, mặc định 11
-giây); mỗi lời gọi nhận phần còn lại, tối đa `LINGATE_DEADLINE` (8 giây), qua
-`perl -e alarm` và `--no-retry`. Hết ngân sách thì `resolve_tags` thất bại và
-guard **từ chối** trong khi vẫn còn thời gian để trả lời — dù lệnh có phải tra 3
-resource (chủ + đích + cluster cha) đi nữa. Cửa sổ fail-open thu lại còn những sự
-cố khiến chính bash treo, chứ không phải mạng chậm.
+There is exactly **one** case it cannot decide, and it deserves saying plainly: if
+the whole hook exceeds the `timeout` declared in `hooks/hooks.json` (15 seconds),
+Claude Code kills the hook and **discards its decision** — the command proceeds
+through the normal permission flow. There is no way for a timed-out hook to mean
+"block". So every API call in one hook run shares **one budget**
+(`LINGATE_BUDGET`, default 11 seconds); each call gets what is left, capped at
+`LINGATE_DEADLINE` (8 seconds), via `perl -e alarm` and `--no-retry`. When the
+budget is spent, `resolve_tags` fails and the guard **refuses** while there is
+still time to answer — even when a command has to look up three resources (owner,
+target, parent cluster). What remains of the fail-open window is bash itself
+hanging, not a slow network.
 
-Nó không phải sandbox. Đây là thứ chặn sai sót thường gặp trước khi nó thành sự
-cố, không phải thứ chống lại một tác nhân cố tình phá.
+And one limitation that is inherent, not a bug: the hook reads the **text** of a
+command; it does not execute it. Content held in a variable is invisible to it —
+`bash -c "$CMD"`, `eval "$SCRIPT"`, `$RUNNER linodes delete 1` pass as unrelated
+commands. Ids and tags in variables are the opposite: a visible `$` is a
+**refusal**, because there, unreadable means unverifiable. And an unknown head
+with `linode-cli` behind it **asks**. Three different treatments for three
+different situations, and the first is the one this hook can never close by
+reading strings.
 
-## Bảng luật
+It is not a sandbox. It stops the ordinary mistake before it becomes an incident;
+it does not resist a deliberate actor.
 
-| Tình huống | Quyết định |
-|---|---|
-| Mọi lệnh đọc (`list`, `view`, `*-list`, `*-view`…) | cho qua |
-| Đọc credential (`*-creds-view`, `kubeconfig-view`, `keys-list`, `*-ssl-cert`) mà không redirect/pipe | **hỏi** |
-| Create loại gắn tag được, thiếu `--tags <project>` hoặc `--tags <env>` | **từ chối** |
-| Create loại không gắn tag được, thiếu `--json` | **từ chối** (không ghi sổ được) |
-| Ghi lên resource mang đúng tag project và đúng env | cho qua |
-| Ghi lên resource mang tag project khác | **từ chối** |
-| Ghi lên resource chưa mang tag nào | **từ chối**, chỉ sang `lingate adopt` |
-| Ghi lên resource thuộc project này nhưng **khác env** | **từ chối** (CROSS-ENV) |
-| Resource mang nhiều env tag, project **chưa** bật `allowSharedEnvs` | **từ chối** |
-| Resource dùng chung env, env còn lại **được bảo vệ** | **hỏi** (mỗi lần) |
-| Resource dùng chung env, env còn lại **không** được bảo vệ | cho qua |
-| Resource thứ hai trên dòng lệnh (`--linode_id`, `--firewall_id`, `--id --type`, `--linodes`) không thuộc project/env | **từ chối** |
-| Sổ sở hữu khai báo `"tag"` khác với project hiện tại | **từ chối** |
-| Id của resource đích là biến shell hay JSON (`--linode_id $ID`) | **từ chối** (không đọc được thì không xác minh được) |
-| `--tags $VAR` | **từ chối** |
-| `linode-cli` đứng sau một wrapper hook **không biết** (`mystery-tool linode-cli …`) | **hỏi** |
-| Create loại dùng sổ nằm chung lệnh Bash với một lời gọi `linode-cli` khác | **từ chối** (hook ghi sổ không biết id nào của cái nào) |
-| Đọc credential rồi pipe vào lệnh vẫn in ra màn hình (`\| base64 -d`), hay chỉ redirect stderr | **hỏi** (chưa phải sink) |
-| Ghi ở env nằm trong `protectedEnvs` | **hỏi** |
-| `--tags` trên lệnh ghi làm rơi tag project hoặc tag env | **từ chối** |
-| `--tags` gắn thêm một env tag thứ hai | **từ chối** (resource mơ hồ) |
-| Bất kỳ lệnh nào có `--help`, hoặc trang trợ giúp cục bộ (`commands`, `env-vars`, `plugins`) | cho qua (không chạm API) |
-| `tags create/delete` với label không phải tag project hoặc env | **từ chối** |
-| `tags create --linodes/--volumes/…` (gắn tag thẳng vào resource) | **từ chối**, chỉ sang `lingate adopt` |
-| `tags delete` chính tag project hoặc env của mình | **hỏi** (xoá tag gỡ nó khỏi mọi resource toàn account) |
-| Create loại dùng sổ mà output bị pipe hoặc redirect | **từ chối** (hook ghi sổ không đọc được id) |
-| Nhiều create loại dùng sổ trong cùng một lệnh Bash | **từ chối** (không biết id nào của cái nào) |
-| `--root_pass` nhận giá trị viết thẳng | **từ chối** |
-| Không tìm thấy `.linode/project.json` | **từ chối** |
-| Không tra được tag (API lỗi, id lạ) | **từ chối** |
-| Action không phân loại được là đọc hay ghi | **từ chối** |
-| Ghi lên tài nguyên cấp account (`account`, `users`, `profile`…) | **từ chối** |
-| `linode-cli configure`, `set-user`, `remove-user` | **hỏi** |
-| `tags create/delete` với label không phải tag project hoặc env | **từ chối** |
+## Rule table
 
-## Một resource, một môi trường — và ngoại lệ có khai báo
+| Situation                                                                                                          | Decision                                                              |
+| ------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |
+| Any read (`list`, `view`, `*-list`, `*-view`…)                                                                     | pass                                                                  |
+| A credential read (`*-creds-view`, `kubeconfig-view`, `keys-list`, `*-ssl-cert`) without a redirect/pipe           | **ask**                                                               |
+| Create of a taggable type missing `--tags <project>` or `--tags <env>`                                             | **refuse**                                                            |
+| Create of an untaggable type missing `--json`                                                                      | **refuse** (cannot be recorded)                                       |
+| Write to a resource with the right project tag and the right env                                                   | pass                                                                  |
+| Write to a resource tagged with another project                                                                    | **refuse**                                                            |
+| Write to a resource with no tags                                                                                   | **refuse**, pointing at `lingate adopt`                               |
+| Write to this project's resource in a **different env**                                                            | **refuse** (CROSS-ENV)                                                |
+| Resource with several env tags, project **without** `allowSharedEnvs`                                              | **refuse**                                                            |
+| Shared-env resource whose other env **is protected**                                                               | **ask** (every time)                                                  |
+| Shared-env resource whose other env is **not** protected                                                           | pass                                                                  |
+| A second resource on the line (`--linode_id`, `--firewall_id`, `--id --type`, `--linodes`) outside the project/env | **refuse**                                                            |
+| Ledger declares a `"tag"` other than the current project                                                           | **refuse**                                                            |
+| Target id is a shell variable or JSON (`--linode_id $ID`)                                                          | **refuse** (unreadable is unverifiable)                               |
+| `--tags $VAR`                                                                                                      | **refuse**                                                            |
+| `linode-cli` behind a wrapper the hook **does not know** (`mystery-tool linode-cli …`)                             | **ask**                                                               |
+| Ledger create sharing a Bash call with another `linode-cli` invocation                                             | **refuse** (the recording hook cannot tell which id is which)         |
+| Credential read piped into something that still prints (`\| base64 -d`), or with only stderr redirected            | **ask** (not a sink yet)                                              |
+| Write in an env listed in `protectedEnvs`                                                                          | **ask**                                                               |
+| `--tags` on a write dropping the project tag or the env tag                                                        | **refuse**                                                            |
+| `--tags` adding a second env tag                                                                                   | **refuse** (ambiguous resource)                                       |
+| Anything with `--help`, or a local help topic (`commands`, `env-vars`, `plugins`)                                  | pass (never reaches the API)                                          |
+| `tags create/delete` with a label that is neither the project tag nor an env                                       | **refuse**                                                            |
+| `tags create --linodes/--volumes/…` (attaching a tag directly to resources)                                        | **refuse**, pointing at `lingate adopt`                               |
+| `tags delete` of the project's own project or env tag                                                              | **ask** (deleting a tag strips it from every resource on the account) |
+| Ledger create with stdout piped or redirected                                                                      | **refuse** (the recording hook cannot read the id)                    |
+| Several ledger creates in one Bash call                                                                            | **refuse** (cannot tell which id is which)                            |
+| `--root_pass` with a literal value                                                                                 | **refuse**                                                            |
+| No `.linode/project.json` found                                                                                    | **refuse**                                                            |
+| Tags cannot be read (API error, unknown id)                                                                        | **refuse**                                                            |
+| Action not classifiable as read or write                                                                           | **refuse**                                                            |
+| Write to account-level state (`account`, `users`, `profile`…)                                                      | **refuse**                                                            |
+| `linode-cli configure`, `set-user`, `remove-user`                                                                  | **ask**                                                               |
 
-Mặc định một resource chỉ được mang **một** env tag. Mang hai là mơ hồ, và tệ hơn:
-nó biến mọi lệnh chạy ở staging thành một lệnh chạm được vào prod.
+## One resource, one environment — and the declared exception
 
-Thực tế đôi khi khác: một máy phục vụ cả hai môi trường để tiết kiệm chi phí. Đó
-là lựa chọn hợp lệ, nhưng phải **nói ra**, trong `.linode/project.json`:
+By default a resource may carry **one** env tag. Two is ambiguous, and worse: it
+turns every command run in staging into one that can reach prod.
+
+Reality sometimes differs: one box serves both environments to save cost. That is
+a legitimate choice, but it must be **stated**, in `.linode/project.json`:
 
 ```json
 { "allowSharedEnvs": true }
 ```
 
-Khi đã bật:
+Once enabled:
 
-- Lệnh chạy ở env nằm trong tập env của resource → cho phép.
-- Nếu resource còn phục vụ một env **được bảo vệ** khác (thường là `prod`) thì
-  **mọi lần ghi đều hỏi**, kèm câu nhắc rằng thay đổi này chạm luôn vào prod.
-  Chia sẻ giữa `dev` và `staging` không hỏi gì cả — không có gì để mất.
-- Lệnh chạy ở env **không** nằm trong tập đó vẫn bị từ chối như thường.
+- A command running in an env within the resource's env set → allowed.
+- If the resource also serves another env that is **protected** (usually `prod`),
+  **every write asks**, with a reminder that the change reaches prod as well.
+  Sharing between `dev` and `staging` asks nothing — there is nothing to lose.
+- A command running in an env **outside** that set is still refused as usual.
 
-`lingate doctor` liệt kê mọi resource đang dùng chung env và gọi đúng tên nó là
-nợ kỹ thuật. Trạng thái đích vẫn là một resource một môi trường; cờ này chỉ làm
-cho khoảng cách giữa hiện tại và đích trở nên nhìn thấy được, thay vì thành thói
-quen vô hình.
+`lingate doctor` lists every shared-env resource and calls it what it is:
+technical debt. The target state is still one resource, one environment; the
+flag only makes the gap between now and that target visible, instead of letting
+it become an invisible habit.
 
-## Env lấy từ đâu
+## Where the env comes from
 
-Theo thứ tự: tiền tố `LINODE_ENV=…` ngay trên dòng lệnh → biến môi trường
-`LINODE_ENV` → `defaultEnv` trong config.
+In order: a `LINODE_ENV=…` prefix on the command line → the `LINODE_ENV`
+environment variable → `defaultEnv` in the config.
 
-Tiền tố trên dòng lệnh là cách duy nhất đáng tin: hook chạy trong process riêng và
-không hề thừa hưởng biến môi trường của lệnh sắp chạy — nó đọc chữ `LINODE_ENV=`
-trong chính văn bản của lệnh.
+The prefix on the command line is the only reliable one: the hook runs in its own
+process and inherits nothing from the command about to run — it reads the text
+`LINODE_ENV=` out of the command itself.
 
-## Loại nào gắn tag được
+## Which types can carry tags
 
-Kiểm chứng trên `linode-cli` v5.67.0, không phải đọc từ tài liệu:
+Verified against `linode-cli` v5.67.0, not read from the docs:
 
-| Gắn tag được | Không gắn tag được |
-|---|---|
+| Taggable                                                                 | Not taggable                                                             |
+| ------------------------------------------------------------------------ | ------------------------------------------------------------------------ |
 | `linodes` `volumes` `nodebalancers` `domains` `lke` `firewalls` `images` | `databases` `vpcs` `object-storage` `placement` `stackscripts` `sshkeys` |
 
-Nhóm bên phải dùng sổ `.linode/owned.json`.
+The right-hand group uses the `.linode/owned.json` ledger.
 
-## Cách hook đọc một dòng lệnh
+## How the hook reads a command line
 
-- Dòng lệnh được đưa qua một **lexer shell thật**: `'...'`, `"..."` và `\` được
-  xử lý đúng (nên `&&` trong một label không cắt lệnh làm đôi, `--tags="cme --tags
-  staging"` là **một** tag); **xuống dòng** là ranh giới lệnh; `$( )` và backtick
-  được mở ra **kể cả trong nháy kép**; target của redirect (`> file`) bị nuốt chứ
-  không thành id; thân heredoc bị bỏ qua; `\` cuối dòng là nối dòng.
-- `bash -c "..."`, `sh -lc`, `eval …`, `env -S "…"` được mở ra và soi lại như
-  một dòng lệnh riêng.
-- Một token `linode-cli`/`linode`/`lin` (so theo **basename**) chỉ tính là lời gọi
-  khi nó ở chỗ thực sự chạy được: đầu đoạn, sau từ khoá shell (`do`, `then`, `!`,
-  `{`, `time`), sau gán biến (`LINODE_ENV=prod`), hoặc sau một wrapper hook **biết
-  arity cờ** của nó: `env`, `sudo`/`doas`, `command`, `exec`, `nohup`, `nice`,
-  `stdbuf`, `timeout`, `xargs`, `watch`, `caffeinate`, và `opgate exec|run … --`.
-  `sudo -u root`, `timeout 10`, `xargs -I{}` đều đáp đúng chỗ. `echo linode-cli`,
-  `grep linode`, `cat linode-notes.txt` là dữ liệu → bỏ qua. Một head hook
-  **không biết** mà phía sau có `linode-cli` → **hỏi**, vì không biết nó có chạy
-  lệnh phía sau hay không.
-- **Cờ phân giải như argparse**: tên đầy đủ khớp trước, rồi mới tới tiền tố không
-  nhập nhằng. Nên `--domain` là field thật của `domains create` (không phải viết
-  tắt của `--domains`), còn `--tag`, `--ta`, `--root_pas`, `--linode_i` vẫn được
-  nhận đúng. Field lồng nhau lấy thành phần cuối: `--devices.linodes`,
-  `--interfaces.vpc_id`, `--placement_group.id` đều trỏ tới resource thứ hai và
-  bị soi như id chính.
-- Thư mục làm việc lấy từ trường `cwd` của payload (nơi Bash tool thực sự chạy),
-  và một `cd` trong lệnh dời nó cho các đoạn sau — `.linode/project.json` được tìm
-  từ đó, không phải từ nơi Claude Code khởi động.
-- Hook biết cờ toàn cục nào **không** ăn giá trị (`--json`, `--suppress-warnings`,
-  `--pretty`, …) nên `linodes reboot --suppress-warnings 123` vẫn thấy id `123`,
-  còn `volumes --format nodebalancers delete 555` không nhầm `nodebalancers`
-  thành action. Cờ lạ bị coi là ăn giá trị — lệch về phía chặn nhầm, không phải
-  phía cho lọt.
-- **Id định vị theo thứ tự**: token không phải cờ đầu tiên sau lời gọi là group,
-  kế đó là action, còn lại là positional. Với resource lồng nhau
-  (`domains records-update <domainID> <recordID>`), id **đầu tiên** là chủ sở hữu.
-- Node worker của LKE có label dạng `lke<clusterID>-…`; nếu nó không mang tag riêng
-  thì hook lấy tag của cluster.
-- Kết quả tra tag được cache 60 giây tại `~/.cache/lingate` (đổi bằng
-  `LINGATE_TTL`). `lingate adopt` tự xoá cache của resource nó vừa sửa.
-- **Lệnh phá huỷ bỏ qua cache.** `delete`, `rebuild`, `resize`, `recycle`,
-  `restore`, `revoke`… luôn hỏi lại API. Cache là một canh bạc rằng không có gì
-  đổi trong một phút vừa rồi; với những lệnh này thì canh bạc đó không đáng.
-- Ngoài id chính, hook còn soi **resource thứ hai** mà lệnh nhắc tới:
-  `--linode_id`, `--linodes`, `--firewall_id(s)`, `--volume_id`, `--vpc_id`,
-  `--devices.linodes`, `--interfaces.vpc_id`, `--placement_group.id`, và cặp
-  `--id`/`--type` của `firewalls device-create`. Gắn một volume của project vào
-  một Linode của project khác cũng là ghi lên resource của họ. Giá trị không đọc
-  được (`$ID`, danh sách JSON) → từ chối, không bỏ qua.
-- **Sink tính theo từng đoạn.** Với lệnh đọc credential, stdout phải kết thúc ở
-  một file (`> …`) hoặc ở `opgate` sau khi đi hết pipeline; `2>/dev/null`,
-  `< file`, hay pipe vào một lệnh vẫn in ra màn hình đều **không** tính. Với create
-  loại dùng sổ thì ngược lại: stdout **không được** đi vào file hay pipe, và lệnh
-  phải đứng **một mình** trong lần gọi Bash — vì hook ghi sổ đọc id từ stdout của
-  cả lần gọi.
-- `ask` không kết thúc việc xét: hook đi hết mọi đoạn, và một `deny` ở đoạn sau
-  thắng `ask` ở đoạn trước. Xác nhận một lệnh không bao giờ thả kèm một lệnh khác
-  chưa được kiểm tra.
+- The line goes through a **real shell lexer**: `'...'`, `"..."` and `\` are
+  handled correctly (so a `&&` inside a label does not split the command, and
+  `--tags="cme --tags staging"` is **one** tag); a **newline** is a command
+  boundary; `$( )` and backticks are opened **even inside double quotes**; a
+  redirection's target (`> file`) is swallowed rather than taken as an id; heredoc
+  bodies are skipped; a trailing `\` is line continuation.
+- `bash -c "..."`, `sh -lc`, `eval …`, `env -S "…"` are opened and inspected as
+  command lines of their own.
+- A `linode-cli`/`linode`/`lin` token (matched by **basename**) only counts as an
+  invocation where it would actually run: at the head of a segment, after a shell
+  keyword (`do`, `then`, `!`, `{`, `time`), after an assignment
+  (`LINODE_ENV=prod`), or after a wrapper whose **flag arity** the hook knows:
+  `env`, `sudo`/`doas`, `command`, `exec`, `nohup`, `nice`, `stdbuf`, `timeout`,
+  `xargs`, `watch`, `caffeinate`, and `opgate exec|run … --`. `sudo -u root`,
+  `timeout 10`, `xargs -I{}` all land on the right word. `echo linode-cli`,
+  `grep linode`, `cat linode-notes.txt` are data → ignored. An **unknown** head
+  with `linode-cli` behind it → **ask**, because whether it executes what follows
+  is unknown.
+- **Flags resolve like argparse**: the full name matches first, then an
+  unambiguous prefix. So `--domain` is the real field of `domains create` (not an
+  abbreviation of `--domains`), while `--tag`, `--ta`, `--root_pas`, `--linode_i`
+  are still recognised. Nested fields take their last component: `--devices.linodes`,
+  `--interfaces.vpc_id`, `--placement_group.id` all point at a second resource and
+  are checked like the primary id.
+- The working directory comes from the payload's `cwd` field (where the Bash tool
+  actually runs), and a `cd` inside the command moves it for later segments —
+  `.linode/project.json` is searched from there, not from where Claude Code was
+  launched.
+- The hook knows which global flags take **no** value (`--json`,
+  `--suppress-warnings`, `--pretty`, …), so `linodes reboot --suppress-warnings 123`
+  still sees id `123`, and `volumes --format nodebalancers delete 555` does not
+  mistake `nodebalancers` for the action. Unknown flags are assumed to take a
+  value — erring toward a false refusal, never toward a miss.
+- **Ids are positional**: the first non-flag token after the invocation is the
+  group, the next is the action, the rest are positionals. For nested resources
+  (`domains records-update <domainID> <recordID>`) the **first** id is the owner.
+- LKE worker nodes have labels of the form `lke<clusterID>-…`; when a node carries
+  no tags of its own, the hook uses the cluster's.
+- Tag lookups are cached for 60 seconds under `~/.cache/lingate` (change with
+  `LINGATE_TTL`). `lingate adopt` clears the cache of the resource it just changed.
+- **Destructive actions bypass the cache.** `delete`, `rebuild`, `resize`,
+  `recycle`, `restore`, `revoke`… always re-ask the API. A cached answer is a bet
+  that nothing changed in the last minute; for these the bet is not worth taking.
+- Beyond the primary id, the hook checks every **second resource** a command
+  names: `--linode_id`, `--linodes`, `--firewall_id(s)`, `--volume_id`, `--vpc_id`,
+  `--devices.linodes`, `--interfaces.vpc_id`, `--placement_group.id`, and the
+  `--id`/`--type` pair of `firewalls device-create`. Attaching the project's volume
+  to another project's Linode is a write to their resource too. A value that
+  cannot be read (`$ID`, a JSON list) → refuse, not skip.
+- **Sinks are per segment.** For a credential read, stdout must end in a file
+  (`> …`) or in `opgate` at the end of the pipeline; `2>/dev/null`, `< file`, or a
+  pipe into a command that still prints do **not** count. For a ledger create the
+  rule inverts: stdout must **not** go to a file or a pipe, and the command must be
+  **alone** in the Bash call — the recording hook reads the id from the whole call's
+  stdout.
+- `ask` does not end the review: the hook walks every segment, and a `deny` in a
+  later segment beats an `ask` in an earlier one. Confirming one command never
+  releases another that was not checked.
 
-## Khi bị chặn
+## When refused
 
-Lý do từ chối luôn kèm câu lệnh đúng. Ba trường hợp cần dừng lại và hỏi người dùng
-thay vì tự xử lý:
+A refusal always comes with the correct command. Three cases call for stopping and
+asking the user instead of handling it yourself:
 
-- **"thuộc project khác"** — đây là câu trả lời "không". Đừng tìm đường vòng.
-- **"chưa mang tag nào"** — cần một quyết định về quyền sở hữu, không phải một
-  lệnh. Hỏi rồi mới `lingate adopt`.
-- **"CROSS-ENV"** — hook không tự suy diễn ý định giữa hai môi trường. Xác nhận
-  người dùng thật sự muốn env kia rồi thêm tiền tố `LINODE_ENV=`.
+- **"belongs to another project"** — that is the answer "no". Do not look for a
+  way around.
+- **"carries no tags"** — this needs a decision about ownership, not a command.
+  Ask, then `lingate adopt`.
+- **"CROSS-ENV"** — the hook does not guess intent between two environments.
+  Confirm the user really means the other env, then add the `LINODE_ENV=` prefix.
 
-## Tắt hàng rào
+## Disabling the guard
 
-`LINGATE_GUARD=off`. Đây là việc của con người, không phải của agent — nếu bạn
-đang định dùng nó để đi vòng qua một lời từ chối thì lời từ chối ấy đúng.
+`LINGATE_GUARD=off`. That is a decision for a person, not for the agent — if you
+are reaching for it to get around a refusal, the refusal was right.

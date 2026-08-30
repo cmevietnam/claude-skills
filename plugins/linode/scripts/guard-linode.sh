@@ -44,7 +44,7 @@ emit() {
 # From here on the payload mentions Linode, so falling over silently would mean
 # letting a write through. Anything that reaches EXIT without a decision refuses.
 guard_done=0
-trap '[[ $guard_done -eq 1 ]] || emit deny "lingate: hook gap loi giua chung nen khong xac minh duoc lenh nay thuoc project/env nao. Day la tu choi co chu dich (fail closed). Chay: bash plugins/linode/scripts/test-guard.sh de xem hong o dau."' EXIT
+trap '[[ $guard_done -eq 1 ]] || emit deny "lingate: the hook hit an internal error and could not verify which project/env this command touches. This refusal is deliberate (fail closed). Run: bash plugins/linode/scripts/test-guard.sh to see what broke."' EXIT
 
 # `ask` is remembered, not issued: a later segment on the same line may still
 # deserve a refusal, and a refusal outranks a prompt. Only deny exits early.
@@ -60,7 +60,7 @@ decide() {
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)
 for f in "$here/lib/common.sh" "$here/lib/linode.sh"; do
   [[ -r "$f" ]] || decide deny \
-    "lingate: thieu file $f nen hang rao khong chay duoc. Cai lai plugin hoac chay 'claude plugin validate ./plugins/linode'."
+    "lingate: $f is missing, so the guard cannot run. Reinstall the plugin or run 'claude plugin validate ./plugins/linode'."
 done
 # shellcheck source=lib/common.sh
 . "$here/lib/common.sh" 2>/dev/null
@@ -69,14 +69,22 @@ done
 # A library that failed to parse leaves these undefined; without this check the
 # script would fall through to "nothing to guard" and let the write go.
 type lin_split_all >/dev/null 2>&1 && type json_str_file >/dev/null 2>&1 || decide deny \
-  "lingate: scripts/lib/*.sh khong nap duoc (loi cu phap?). Chay: bash -n plugins/linode/scripts/lib/common.sh plugins/linode/scripts/lib/linode.sh"
+  "lingate: scripts/lib/*.sh failed to load (syntax error?). Run: bash -n plugins/linode/scripts/lib/common.sh plugins/linode/scripts/lib/linode.sh"
 
 if [[ "$LINGATE_GUARD" == off ]]; then guard_done=1; exit 0; fi
+
+# bash 3.2 backs every here-string with a temp file. If that cannot be created
+# (TMPDIR gone, disk full) the parsing loops below silently never run, and an
+# empty set of segments would read as "nothing to guard". Prove it works first.
+_probe=""
+read -r _probe <<< "probe" 2>/dev/null
+[[ "$_probe" == probe ]] || decide deny \
+  "lingate: cannot create the temp file a here-string needs (TMPDIR=${TMPDIR:-/tmp} is full or not writable), so the command cannot be parsed. Free up TMPDIR and retry."
 
 command_line=$(hook_command "$payload")
 if [[ -z "$command_line" ]]; then
   case "$payload" in
-    *'"command"'*) decide deny "lingate: payload co truong command nhung khong doc duoc noi dung, nen khong xac minh duoc lenh. Kiem tra jq/awk tren may." ;;
+    *'"command"'*) decide deny "lingate: the payload has a command field but its contents could not be read, so the command cannot be verified. Check jq/awk on this machine." ;;
   esac
   guard_done=1; exit 0
 fi
@@ -89,6 +97,10 @@ eff_cwd=$(payload_str "$payload" '.cwd' 'cwd')
 
 # --- split the command line into real invocations ---------------------------
 lin_split_all "$command_line"
+# A non-empty command always lexes to at least one token plus the trailing
+# newline, i.e. two segments. Fewer means the lexer or its read loop failed.
+(( ${#segs[@]} >= 2 )) || decide deny \
+  "lingate: could not split the command line into commands (awk or here-string failed), so nothing could be verified."
 
 # Project identity, resolved when a write needs it, per working directory.
 proj_root=""; proj_tag=""; proj_envs=""; proj_default_env=""; proj_protected=""
@@ -97,10 +109,10 @@ need_project() {
   [[ -n "$proj_tag" && "$proj_for_cwd" == "$eff_cwd" ]] && return 0
   proj_for_cwd="$eff_cwd"
   proj_root=$(find_project_root "$eff_cwd") || decide deny \
-    "Khong tim thay .linode/project.json tinh tu $eff_cwd tro len, nen khong biet resource sap dung den thuoc project nao. Chay 'lingate init <tag>' o goc repo truoc (vi du: lingate init cme), roi chay lai lenh. Doc: skills/linode/references/project-setup.md"
+    "No .linode/project.json found from $eff_cwd upward, so there is no way to tell which project the target resource belongs to. Run 'lingate init <tag>' at the repo root first (e.g. lingate init cme), then retry. See: skills/linode/references/project-setup.md"
   proj_tag=$(json_str_file "$proj_root/$LINGATE_CONFIG" tag)
   [[ -n "$proj_tag" ]] || decide deny \
-    "File $proj_root/$LINGATE_CONFIG khong co truong 'tag'. Sua lai hoac chay 'lingate init <tag>' de tao lai."
+    "$proj_root/$LINGATE_CONFIG has no 'tag' field. Fix it or run 'lingate init <tag>' to recreate it."
   proj_envs=$(json_arr_file "$proj_root/$LINGATE_CONFIG" envs | tr '\n' ' ')
   proj_envs=${proj_envs% }
   proj_protected=$(json_arr_file "$proj_root/$LINGATE_CONFIG" protectedEnvs | tr '\n' ' ')
@@ -126,10 +138,10 @@ env_verdict() {
 
   if (( ${#renv[@]} == 0 )); then
     decide deny \
-      "$subject khong mang env tag nao trong [$proj_envs], nen khong biet no la moi truong nao - va mot lenh ghi mu moi truong la cach kinh dien de sua nham prod. Gan env truoc: lingate adopt <group> <id> --env <env> --yes"
+      "$subject carries none of the env tags [$proj_envs], so its environment is unknown - and a write that is blind to environment is the classic way to change prod by mistake. Assign an env first: lingate adopt <group> <id> --env <env> --yes"
   fi
   tags_contain "$cur_env" "${renv[@]}" || decide deny \
-    "CROSS-ENV: $subject nam o env '${renv[*]}' nhung lenh nay dang chay o env '$cur_env'. Lingate khong bao gio tu suy dien y dinh giua hai moi truong. Neu that su muon thao tac tren '${renv[0]}', hay noi ro ngay tren dong lenh: LINODE_ENV=${renv[0]} linode-cli $LIN_GROUP $LIN_ACTION ... - va hoi nguoi dung truoc neu do la env duoc bao ve."
+    "CROSS-ENV: $subject lives in env '${renv[*]}' but this command runs in env '$cur_env'. lingate never guesses intent between two environments. If you really mean '${renv[0]}', say so on the command line: LINODE_ENV=${renv[0]} linode-cli $LIN_GROUP $LIN_ACTION ... - and ask the user first if that env is protected."
 
   (( ${#renv[@]} > 1 )) || return 0
 
@@ -141,14 +153,14 @@ env_verdict() {
 
   if [[ "$proj_shared" != true ]]; then
     decide deny \
-      "$subject mang nhieu env tag cung luc: ${renv[*]}. Mot resource chi duoc thuoc mot moi truong. Neu day la co y - mot may phuc vu ca hai env de tiet kiem - hay khai bao ro trong .linode/project.json: allowSharedEnvs = true, roi lingate se cho phep nhung van hoi truoc moi lan ghi neu env con lai duoc bao ve."
+      "$subject carries several env tags at once: ${renv[*]}. A resource belongs to one environment. If this is deliberate - one box serving both envs to save cost - declare it in .linode/project.json: allowSharedEnvs = true; lingate will then allow it but still ask before every write when the other env is protected."
   fi
 
   for e in $other; do
     case " $proj_protected " in
       *" $e "*)
         decide ask \
-          "$subject dung chung cho nhieu moi truong: ${renv[*]}. Lenh nay chay o '$cur_env', nhung cung chinh resource do dang phuc vu env duoc bao ve '$e' - moi thay doi o day se cham vao $e ngay lap tuc. Lenh: 'linode-cli $LIN_GROUP $LIN_ACTION ${LIN_IDS[*]-}'. Nguoi dung xac nhan."
+          "$subject is shared between environments: ${renv[*]}. This command runs in '$cur_env', but the same resource also serves the protected env '$e' - any change here reaches $e immediately. Command: 'linode-cli $LIN_GROUP $LIN_ACTION ${LIN_IDS[*]-}'. The user confirms."
         ;;
     esac
   done
@@ -161,7 +173,7 @@ check_owner() {
   # $1 = group, $2 = id, $3 = extra wording for the message
   local g="$1" rid="$2" what="$3" tags_out t e src="" og="$g" oid="$rid" hdr
   tags_out=$(resolve_tags "$g" "$rid" "$lookup_fresh") || decide deny \
-    "Khong tra duoc tag cua $g $rid trong ngan sach $LINGATE_BUDGET giay (linode-cli loi, id khong ton tai, mang cham, hoac da het thoi gian cho cac lookup truoc). Khi chua biet chac resource thuoc ve ai thi lingate tu choi chu khong doan. Kiem tra bang: linode-cli $g $(view_action_for "$g") $rid --json"
+    "Could not read the tags of $g $rid within the $LINGATE_BUDGET s budget (linode-cli failed, the id does not exist, the network is slow, or earlier lookups used up the time). When ownership is uncertain lingate refuses rather than guesses. Check with: linode-cli $g $(view_action_for "$g") $rid --json"
 
   # First line names the resource whose tags were actually read: for an untagged
   # LKE worker that is its cluster, and the message should point there.
@@ -171,7 +183,7 @@ check_owner() {
         og=${hdr#@}; oid=${og#*/}; og=${og%%/*} ;;
   esac
   if [[ "$og $oid" != "$g $rid" ]]; then
-    src=" (no la node cua $og $oid va khong mang tag rieng, nen quyen so huu lay theo cluster)"
+    src=" (it is a worker node of $og $oid and carries no tags of its own, so ownership follows the cluster)"
   fi
 
   local -a tags=()
@@ -179,10 +191,10 @@ check_owner() {
 
   if (( ${#tags[@]} == 0 )); then
     decide deny \
-      "$what $g $rid chua mang tag nao$src, nen no khong thuoc project nao ca va lingate khong ghi len no. Neu day la resource cu cua project '$proj_tag', nhan no ve bang: lingate adopt $og $oid --env $cur_env --yes (hoi nguoi dung truoc). Xem tat ca resource chua tag: lingate orphans"
+      "$what $g $rid carries no tags$src, so it belongs to no project and lingate will not write to it. If it is an older resource of project '$proj_tag', adopt it: lingate adopt $og $oid --env $cur_env --yes (ask the user first). All untagged resources: lingate orphans"
   fi
   tags_contain "$proj_tag" "${tags[@]}" || decide deny \
-    "$what $g $rid mang tag '${tags[*]}'$src, khong phai '$proj_tag' - no thuoc project khac. Day la ranh gioi cung cua plugin nay: khong ghi len resource cua project khac, khong ngoai le. Resource cua project nay: linode-cli $g list --tags $proj_tag"
+    "$what $g $rid carries tags '${tags[*]}'$src, not '$proj_tag' - it belongs to another project. This is the hard boundary of this plugin: no writes to another project's resources, no exceptions. This project's resources: linode-cli $g list --tags $proj_tag"
 
   [[ -n "$proj_envs" ]] || return 0
 
@@ -197,15 +209,15 @@ check_ledger() {
   # $1 = group, $2 = id, $3 = extra wording
   local g="$1" rid="$2" what="$3"
   ledger_is_ours "$proj_root" "$proj_tag" || decide deny \
-    "$proj_root/$LINGATE_LEDGER khai bao no thuoc project '$(json_str_file "$proj_root/$LINGATE_LEDGER" tag)' chu khong phai '$proj_tag'. Mot so so huu chi noi thay cho dung project cua no. Chay 'lingate init $proj_tag' - no se cat so cu sang mot ben va tao so moi."
+    "$proj_root/$LINGATE_LEDGER declares project '$(json_str_file "$proj_root/$LINGATE_LEDGER" tag)', not '$proj_tag'. A ledger only speaks for its own project. Run 'lingate init $proj_tag' - it sets the old ledger aside and creates a new one."
   ledger_has "$proj_root" "$proj_tag" "$g" "$rid" || decide deny \
-    "$what $g $rid khong co trong so so huu .linode/owned.json cua project '$proj_tag'. Neu no dung la cua project, ghi so bang 'lingate own $g $rid --env $cur_env' roi chay lai. Neu khong phai, dung dung den no."
+    "$what $g $rid is not in the ownership ledger .linode/owned.json of project '$proj_tag'. If it really belongs to the project, record it with 'lingate own $g $rid --env $cur_env' and retry. If not, leave it alone."
   [[ -n "$proj_envs" ]] || return 0
   local -a lenv=()
   local e
   while IFS= read -r e; do [[ -n "$e" ]] && lenv[${#lenv[@]}]="$e"; done \
     <<< "$(ledger_envs_of "$proj_root" "$proj_tag" "$g" "$rid")"
-  env_verdict "$what $g $rid (theo so so huu)" ${lenv[@]+"${lenv[@]}"}
+  env_verdict "$what $g $rid (per the ledger)" ${lenv[@]+"${lenv[@]}"}
 }
 
 # Whichever source of truth applies to the group.
@@ -213,7 +225,7 @@ check_target() {
   case "$(group_scope "$1")" in
     taggable) check_owner "$1" "$2" "$3" ;;
     ledger)   check_ledger "$1" "$2" "$3" ;;
-    *)        decide deny "Khong biet cach xac minh quyen so huu cua $1 $2." ;;
+    *)        decide deny "No way to verify ownership of $1 $2." ;;
   esac
 }
 
@@ -223,10 +235,10 @@ check_refs() {
   local i=0
   if (( ${#LIN_BAD_REFS[@]} > 0 )); then
     decide deny \
-      "Lenh nay tro toi mot resource khac qua gia tri lingate khong doc duoc: '${LIN_BAD_REFS[0]}' (bien shell hoac danh sach JSON). Khong doc duoc thi khong xac minh duoc chu so huu. Viet id ro rang tren dong lenh."
+      "This command points at another resource through a value lingate cannot read: '${LIN_BAD_REFS[0]}' (a shell variable or a JSON list). Unreadable means unverifiable. Write the id literally on the command line."
   fi
   while (( i < ${#LIN_REF_GROUPS[@]} )); do
-    check_target "${LIN_REF_GROUPS[i]}" "${LIN_REF_IDS[i]}" "Resource dich"
+    check_target "${LIN_REF_GROUPS[i]}" "${LIN_REF_IDS[i]}" "Target resource"
     i=$((i + 1))
   done
 }
@@ -237,7 +249,7 @@ protected_gate() {
   case " $proj_protected " in
     *" $cur_env "*)
       decide ask \
-        "Env '$cur_env' duoc danh dau la bao ve trong .linode/project.json. Lenh ghi: 'linode-cli $LIN_GROUP $LIN_ACTION ${LIN_IDS[*]-}'. Moi rang buoc ve project va env deu da thoa - chi con nguoi dung xac nhan day dung la thu ho muon chay tren $cur_env."
+        "Env '$cur_env' is marked protected in .linode/project.json. Write: 'linode-cli $LIN_GROUP $LIN_ACTION ${LIN_IDS[*]-}'. Every project and env check has passed - only the user's confirmation that this is what they want on $cur_env remains."
       ;;
   esac
 }
@@ -286,7 +298,7 @@ for segment in "${segs[@]}"; do
     2) continue ;;   # a nested script; its segments were appended and are checked in turn
     3)
       decide ask \
-        "'$LIN_HEAD_UNKNOWN' dung truoc linode-cli tren dong lenh nay, va lingate khong biet no co chay lenh phia sau hay khong - neu co thi hang rao dang bi bo qua. Neu '$LIN_HEAD_UNKNOWN' chi doc chuoi do nhu du lieu thi cu xac nhan; neu no thuc su chay linode-cli, hay chay linode-cli truc tiep de lingate kiem tra duoc."
+        "'$LIN_HEAD_UNKNOWN' precedes linode-cli on this line, and lingate does not know whether it executes what follows - if it does, the guard is being bypassed. If '$LIN_HEAD_UNKNOWN' only reads that text as data, confirm; if it really runs linode-cli, run linode-cli directly so lingate can check it."
       continue ;;
   esac
 
@@ -303,14 +315,14 @@ for segment in "${segs[@]}"; do
   if [[ "$scope" == unknown ]]; then
     [[ "$kind" == read ]] && continue
     decide deny \
-      "lingate chua biet command group '$LIN_GROUP', nen khong the xac minh lenh nay nam trong pham vi project. Neu day la group moi cua linode-cli, cap nhat plugins/linode/scripts/lib/linode.sh. Neu chi can doc, dung mot action list/view."
+      "lingate does not know the command group '$LIN_GROUP', so it cannot verify this command stays inside the project. If this is a new linode-cli group, update plugins/linode/scripts/lib/linode.sh. If you only need to read, use a list/view action."
   fi
 
   # --- reads ----------------------------------------------------------------
   if [[ "$kind" == read ]]; then
     if [[ "$LIN_ACTION" =~ $LINGATE_SECRET_READ_RE ]] && ! stdout_is_kept_private "$idx"; then
       decide ask \
-        "Lenh nay in credential ra stdout, tuc la vao transcript cua cuoc hoi thoai va len model provider - lo roi thi phai rotate. Muon giu kin thi cho no di thang toi noi can den: '... --json | jq -r <field> > <file da git-ignore>', hoac cat vao 1Password bang '... | opgate put <item> <FIELD>'. Chuyen huong stderr hay pipe vao mot lenh khac van in ra man hinh thi khong tinh. Doc: skills/linode/references/secrets.md"
+        "This command prints a credential to stdout, i.e. into the conversation transcript and up to the model provider - once leaked it must be rotated. Send it straight to where it is needed instead: '... --json | jq -r <field> > <git-ignored file>', or into 1Password with '... | opgate put <item> <FIELD>'. Redirecting stderr, or piping into another command that still prints, does not count. See: skills/linode/references/secrets.md"
     fi
     continue
   fi
@@ -328,7 +340,7 @@ for segment in "${segs[@]}"; do
     case " $proj_envs " in
       *" $cur_env "*) ;;
       *) decide deny \
-           "Env '$cur_env' khong nam trong danh sach env cua project '$proj_tag' ([$proj_envs]). Noi ro env ngay tren dong lenh: LINODE_ENV=<env> linode-cli $LIN_GROUP $LIN_ACTION ..." ;;
+           "Env '$cur_env' is not one of the envs of project '$proj_tag' ([$proj_envs]). State the env on the command line: LINODE_ENV=<env> linode-cli $LIN_GROUP $LIN_ACTION ..." ;;
     esac
   fi
 
@@ -339,7 +351,7 @@ for segment in "${segs[@]}"; do
 
   if [[ "$scope" == cli ]]; then
     decide ask \
-      "Lenh nay doi credential hoac identity cua linode-cli chu khong phai mot resource cua project '$proj_tag'. Nguoi dung tu quyet dinh."
+      "This command changes linode-cli's credentials or identity, not a resource of project '$proj_tag'. The user decides."
     continue
   fi
 
@@ -351,35 +363,36 @@ for segment in "${segs[@]}"; do
       label="${LIN_LABEL:-${LIN_IDS[0]:-}}"
       if (( LIN_TAG_ATTACH == 1 )); then
         decide deny \
-          "Lenh nay gan tag thang vao resource duoc liet ke tren dong lenh, di vong qua toan bo kiem tra quyen so huu - resource do co the thuoc project khac. Muon dua mot resource vao project thi dung: lingate adopt <group> <id> --env <env> --yes"
+          "This command attaches a tag directly to the resources listed on the line, bypassing every ownership check - they may belong to another project. To bring a resource into the project use: lingate adopt <group> <id> --env <env> --yes"
       fi
       case " $proj_tag $proj_envs " in
         *" $label "*) ;;
         *) decide deny \
-             "Tag '$label' khong phai tag cua project nay ('$proj_tag') cung khong phai env cua no ([$proj_envs]). Tag la ranh gioi giua cac project - tao hay xoa tag cua project khac la cach nhanh nhat de resource cua ho roi ra ngoai moi hang rao." ;;
+             "Tag '$label' is neither this project's tag ('$proj_tag') nor one of its envs ([$proj_envs]). Tags are the boundary between projects - creating or deleting another project's tag is the fastest way to push their resources outside every guard." ;;
       esac
       case "$LIN_ACTION" in
         delete|rm)
           decide ask \
-            "Xoa tag '$label' se go no khoi MOI resource dang mang tag do tren toan account, va vi day la tag project hoac tag env cua '$proj_tag' nen hang rao bien mat cung voi no. Nguoi dung tu quyet dinh."
+            "Deleting tag '$label' strips it from EVERY resource on the account that carries it, and since it is a project or env tag of '$proj_tag' the boundary disappears with it. The user decides."
           ;;
       esac
+      protected_gate
       continue
     fi
     decide deny \
-      "'$LIN_GROUP $LIN_ACTION' ghi len tai nguyen cap account, khong thuoc project '$proj_tag' nao ca, nen lingate khong chay ho. Neu that su can, hay de nguoi dung tu chay."
+      "'$LIN_GROUP $LIN_ACTION' writes account-level state that belongs to no project, '$proj_tag' included, so lingate will not run it. If it is really needed, let the user run it themselves."
   fi
 
   if [[ "$kind" == unknown ]]; then
     decide deny \
-      "lingate khong phan loai duoc action '$LIN_GROUP $LIN_ACTION' la doc hay ghi, nen mac dinh tu choi. Chay 'linode-cli $LIN_GROUP $LIN_ACTION --help' de xem no lam gi; neu la lenh doc, bo sung vao LINGATE_READ_RE trong plugins/linode/scripts/lib/linode.sh."
+      "lingate cannot classify action '$LIN_GROUP $LIN_ACTION' as a read or a write, so it refuses by default. Run 'linode-cli $LIN_GROUP $LIN_ACTION --help' to see what it does; if it only reads, add it to LINGATE_READ_RE in plugins/linode/scripts/lib/linode.sh."
   fi
 
   # A password on the command line lands in the transcript, in the shell history
   # and in the process table at once.
   if [[ -n "$LIN_ROOTPASS" && "$LIN_ROOTPASS" != \$* ]]; then
     decide deny \
-      "--root_pass dang nhan gia tri viet thang tren dong lenh, no se vao transcript va phai rotate ngay. Lay tu 1Password thay vi vay: opgate exec ROOT_PASS=op://Dev/$proj_tag/LINODE_ROOT_PASS -- linode-cli $LIN_GROUP $LIN_ACTION ... --root_pass \$ROOT_PASS. Doc: skills/linode/references/secrets.md"
+      "--root_pass is given a literal value on the command line; it lands in the transcript and must be rotated at once. Take it from 1Password instead: opgate exec ROOT_PASS=op://Dev/$proj_tag/LINODE_ROOT_PASS -- linode-cli $LIN_GROUP $LIN_ACTION ... --root_pass \$ROOT_PASS. See: skills/linode/references/secrets.md"
   fi
 
   # `update --tags` is a PUT that replaces the whole array, so a --tags list that
@@ -388,19 +401,19 @@ for segment in "${segs[@]}"; do
   if (( ${#LIN_TAGS[@]} > 0 )); then
     for _t in "${LIN_TAGS[@]}"; do
       case "$_t" in *'$'*) decide deny \
-        "--tags nhan gia tri '$_t' la bien shell, lingate khong doc duoc nen khong xac minh duoc resource se mang tag gi. Viet tag ro rang: --tags $proj_tag --tags $cur_env" ;; esac
+        "--tags is given '$_t', a shell variable lingate cannot read, so the tags the resource will carry cannot be verified. Write them literally: --tags $proj_tag --tags $cur_env" ;; esac
     done
     tags_contain "$proj_tag" "${LIN_TAGS[@]}" || decide deny \
-      "--tags o day dat lai toan bo tag cua resource thanh '${LIN_TAGS[*]}', khong con '$proj_tag' - resource se roi khoi project va khong con hang rao nao bao ve. Them '--tags $proj_tag' vao danh sach."
+      "--tags here replaces the resource's whole tag set with '${LIN_TAGS[*]}', dropping '$proj_tag' - the resource would leave the project and no guard would cover it. Add '--tags $proj_tag' to the list."
     if [[ -n "$proj_envs" ]]; then
       tags_contain "$cur_env" "${LIN_TAGS[@]}" || decide deny \
-        "--tags o day dat lai toan bo tag thanh '${LIN_TAGS[*]}', khong con env tag '$cur_env' - resource se thanh khong thuoc moi truong nao va moi lenh ghi sau do se bi tu choi. Them '--tags $cur_env'."
+        "--tags here replaces the whole tag set with '${LIN_TAGS[*]}', dropping the env tag '$cur_env' - the resource would belong to no environment and every later write would be refused. Add '--tags $cur_env'."
       # The env tags this command is about to write get the same judgement as the
       # ones a resource already carries.
       _tenv=()
       while IFS= read -r _e; do [[ -n "$_e" ]] && _tenv[${#_tenv[@]}]="$_e"; done \
         <<< "$(env_of_tags "$proj_envs" "${LIN_TAGS[@]}")"
-      env_verdict "Bo tag lenh nay sap dat" ${_tenv[@]+"${_tenv[@]}"}
+      env_verdict "The tag set this command is about to write" ${_tenv[@]+"${_tenv[@]}"}
     fi
   fi
 
@@ -413,7 +426,7 @@ for segment in "${segs[@]}"; do
   if (( is_create == 1 )) && (( ${#LIN_IDS[@]} == 0 )); then
     if [[ "$scope" == taggable ]]; then
       (( ${#LIN_TAGS[@]} > 0 )) || decide deny \
-        "Thieu --tags: resource tao ra se khong thuoc project nao, va tu do khong con lenh nao duoc phep dung den no. Them tag project va tag env: linode-cli $LIN_GROUP $LIN_ACTION --tags $proj_tag --tags $cur_env ..."
+        "Missing --tags: the new resource would belong to no project, and from then on no command would be allowed to touch it. Add the project tag and the env tag: linode-cli $LIN_GROUP $LIN_ACTION --tags $proj_tag --tags $cur_env ..."
       check_refs
       protected_gate
       continue
@@ -429,12 +442,12 @@ for segment in "${segs[@]}"; do
     # time or ownership is lost the moment the command finishes. All three checks
     # below are about that one id actually reaching the PostToolUse hook.
     (( LIN_HAS_JSON == 1 )) || decide deny \
-      "'$LIN_GROUP' khong co truong tags tren API, nen quyen so huu duoc ghi vao .linode/owned.json. Them '--json' de lingate doc duoc id vua tao va ghi so tu dong. Doc: skills/linode/references/guard-rules.md"
+      "'$LIN_GROUP' has no tags field on the API, so ownership is recorded in .linode/owned.json. Add '--json' so lingate can read the new id and record it automatically. See: skills/linode/references/guard-rules.md"
     (( inv_count <= 1 )) || decide deny \
-      "Lenh Bash nay goi linode-cli $inv_count lan, trong do co mot lenh tao resource khong gan tag duoc. Hook ghi so doc id tu stdout cua ca lenh, nen output cua cac lenh kia lam no ghi sai id. Chay lenh tao mot minh voi '--json' truoc, roi dung id do o buoc sau."
+      "This Bash call invokes linode-cli $inv_count times, one of them creating a resource that cannot carry tags. The ledger hook reads the id from the whole call's stdout, so the other invocations' output would make it record the wrong id. Run the create alone with '--json' first, then use that id in the next step."
     if [[ "${seg_stdout[idx]}" == 1 || "${seg_piped[idx]}" == 1 ]]; then
       decide deny \
-        "Stdout cua lenh tao nay bi chuyen huong vao file hoac dua qua pipe, nen hook PostToolUse khong doc duoc id va quyen so huu se mat. Chay lenh tao mot minh voi '--json' (chuyen huong stderr thi khong sao), roi dung id do o buoc sau."
+        "This create's stdout goes to a file or a pipe, so the PostToolUse hook cannot read the id and ownership would be lost. Run the create alone with '--json' (redirecting stderr is fine), then use the id in the next step."
     fi
     check_refs
     protected_gate
@@ -443,7 +456,7 @@ for segment in "${segs[@]}"; do
 
   owner_id=$(lin_owner_id)
   [[ -n "$owner_id" ]] || decide deny \
-    "'$LIN_GROUP $LIN_ACTION' la lenh ghi nhung khong co id resource nao tren dong lenh, nen khong xac minh duoc no cham vao cai gi cua ai. Xem cu phap: linode-cli $LIN_GROUP $LIN_ACTION --help"
+    "'$LIN_GROUP $LIN_ACTION' is a write but names no resource id on the command line, so there is no way to tell whose resource it touches. Syntax: linode-cli $LIN_GROUP $LIN_ACTION --help"
 
   check_target "$LIN_GROUP" "$owner_id" ""
   check_refs

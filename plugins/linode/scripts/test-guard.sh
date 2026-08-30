@@ -72,7 +72,8 @@ cat > "$proj/.linode/owned.json" <<'LEDGER'
   "owned": [
     {"type": "vpcs", "id": "900001", "env": "staging", "label": "cme-vpc", "at": "2026-08-30T00:00:00Z"},
     {"type": "vpcs", "id": "900002", "env": "prod", "label": "cme-vpc-prod", "at": "2026-08-30T00:00:00Z"},
-    {"type": "object-storage", "id": "sg-sin-1/cme-bucket", "env": "staging", "label": "cme-bucket", "at": "2026-08-30T00:00:00Z"}
+    {"type": "object-storage", "id": "sg-sin-1/cme-bucket", "env": "staging", "label": "cme-bucket", "at": "2026-08-30T00:00:00Z"},
+    {"type": "placement", "id": "8801", "env": "staging", "label": "cme-pg", "at": "2026-08-30T00:00:00Z"}
   ]
 }
 LEDGER
@@ -159,7 +160,7 @@ check_in() {  # check_in <project dir> <command> <expected>
   fi
 }
 
-echo "đọc thì không bao giờ bị chặn"
+echo "reads are never blocked"
 check "linode-cli linodes list" pass
 check "linode-cli linodes list --tags cme" pass
 check "linode-cli linodes view 66000001" pass
@@ -168,7 +169,7 @@ check "linode-cli lke pools-list 580172" pass
 check "linode-cli account view" pass
 
 echo
-echo "tạo resource: bắt buộc tag project + tag env"
+echo "create: the project tag and the env tag are mandatory"
 check "linode-cli linodes create --region sg-sin-2 --type g6-standard-1" deny
 check "linode-cli linodes create --tags cme --label cme-web" deny
 check "linode-cli linodes create --tags cme --tags staging --label cme-web" pass
@@ -176,7 +177,7 @@ check "linode-cli volumes create --tags cme --tags staging --label cme-data" pas
 check "linode-cli lke cluster-create --tags cme --tags staging --label cme-k8s" pass
 
 echo
-echo "ghi lên resource đã có: phải đúng project"
+echo "writes to existing resources: must be the right project"
 check "linode-cli linodes reboot 77000001" pass
 check "linode-cli linodes reboot 66000001" deny
 check "linode-cli linodes reboot 55000001" deny
@@ -184,7 +185,7 @@ check "linode-cli linodes delete 99999999" deny
 check "linode-cli linodes reboot 33000001" deny
 
 echo
-echo "cross-env: chặn cứng cả hai chiều"
+echo "cross-env: hard refusal in both directions"
 check "linode-cli linodes reboot 95747451" deny
 check "LINODE_ENV=prod linode-cli linodes reboot 95747451" ask
 check "LINODE_ENV=prod linode-cli linodes reboot 77000001" deny
@@ -193,20 +194,20 @@ check "linode-cli linodes reboot 44000001" deny
 check "LINODE_ENV=prod linode-cli domains records-update 22000001 5 --target 1.2.3.4" ask
 
 echo
-echo "node LKE thừa kế quyền sở hữu từ cluster — nhưng chỉ khi tự nó không có tag"
+echo "LKE workers inherit ownership from the cluster — only when untagged themselves"
 check "linode-cli linodes reboot 94162441" deny
 check "LINODE_ENV=prod linode-cli linodes reboot 94162441" ask
 check "linode-cli linodes reboot 94162442" pass
 check "LINODE_ENV=prod linode-cli linodes reboot 94162442" deny
 
 echo
-echo "--tags trên update là PUT: không được đánh rơi tag"
+echo "--tags on update is a PUT: tags must not be dropped"
 check "linode-cli linodes update 77000001 --tags foo" deny
 check "linode-cli linodes update 77000001 --tags cme" deny
 check "linode-cli linodes update 77000001 --tags cme --tags staging --label x" pass
 
 echo
-echo "loại không gắn tag được: sổ sở hữu"
+echo "untaggable types: the ownership ledger"
 check "linode-cli vpcs create --label cme-vpc" deny
 check "linode-cli vpcs create --label cme-vpc --json" pass
 check "linode-cli vpcs update 900001 --description x" pass
@@ -215,7 +216,7 @@ check "LINODE_ENV=prod linode-cli vpcs update 900002 --description x" ask
 check "linode-cli vpcs delete 900777" deny
 
 echo
-echo "secret không được đi ra stdout"
+echo "secrets must not reach stdout"
 check "linode-cli linodes create --tags cme --tags staging --root_pass hunter2" deny
 check "linode-cli linodes create --tags cme --tags staging --root_pass \$ROOT_PASS" pass
 check "linode-cli lke kubeconfig-view 580172" ask
@@ -224,7 +225,7 @@ check "linode-cli databases mysql-creds-view 1" ask
 check "linode-cli object-storage keys-list" ask
 
 echo
-echo "ngoài phạm vi project"
+echo "outside the project scope"
 check "linode-cli account update --company x" deny
 check "linode-cli users delete bob" deny
 check "linode-cli tags create --label cme" pass
@@ -232,14 +233,14 @@ check "linode-cli tags delete urgentc" deny
 check "linode-cli configure" ask
 
 echo
-echo "không có .linode/project.json thì không ghi được gì"
+echo "no .linode/project.json, no writes"
 ( export CLAUDE_PROJECT_DIR="$nowhere"
   got=$(decision "$guard" "$(json 'linode-cli linodes create --tags cme --tags staging')")
-  [[ "${got:-pass}" == deny ]] && printf '  ok   %-72s %s\n' "ngoài project" deny \
-                               || printf '  FAIL %-72s got=%s want=deny\n' "ngoài project" "${got:-pass}" )
+  [[ "${got:-pass}" == deny ]] && printf '  ok   %-72s %s\n' "outside any project" deny \
+                               || printf '  FAIL %-72s got=%s want=deny\n' "outside any project" "${got:-pass}" )
 
 echo
-echo "trường hợp hiểm"
+echo "tricky cases"
 check 'bash -c "linode-cli linodes delete 66000001"' deny
 check "echo linode-cli linodes delete 66000001" pass
 check "lingate adopt linodes 55000001 --yes" pass
@@ -250,14 +251,14 @@ check "linode-cli linodes ips-list 66000001" pass
 
 
 echo
-echo "cờ viết tắt: argparse chấp nhận --tag là --tags"
+echo "abbreviated flags: argparse accepts --tag for --tags"
 check "linode-cli linodes update 77000001 --tag urgentc" deny
 check "linode-cli linodes update 77000001 --ta cme --ta staging" pass
 check "linode-cli linodes create --tags cme --tags staging --root_pas hunter2" deny
 check "linode-cli volumes attach 556 --linode_i 66000001" deny
 
 echo
-echo "cờ đứng trước id, và giá trị của cờ không phải là id"
+echo "flags before ids, and flag values are not ids"
 check "linode-cli linodes reboot --suppress-warnings 77000001" pass
 check "linode-cli linodes reboot --suppress-warnings 66000001" deny
 check "linode-cli volumes --format nodebalancers delete 555" deny
@@ -267,7 +268,7 @@ check "linode-cli vpcs subnet-create --json 900001 --ipv4 10.0.0.0/24" pass
 check "linode-cli vpcs subnet-create --json 900002 --ipv4 10.0.0.0/24" deny
 
 echo
-echo "lời gọi nấp trong vòng lặp, subshell, nền, đường dẫn tuyệt đối"
+echo "invocations hidden in loops, subshells, background jobs, absolute paths"
 check "for id in 10 11; do linode-cli linodes reboot 66000001; done" deny
 check "result=\$(linode-cli linodes delete 66000001)" deny
 check "( linode-cli linodes delete 66000001 )" deny
@@ -277,53 +278,53 @@ check "/opt/homebrew/bin/linode-cli linodes reboot 66000001" deny
 check "xargs -I{} linode-cli linodes delete 66000001" deny
 
 echo
-echo "dấu nháy giữ nguyên ranh giới đối số"
+echo "quotes preserve argument boundaries"
 check "linode-cli linodes update 77000001 --tags='cme --tags staging'" deny
 check "linode-cli linodes create --tags cme --tags staging --label 'web && api'" pass
 
 echo
-echo "nhóm tags sửa chính hàng rào"
+echo "the tags group edits the boundary itself"
 check "linode-cli tags create --label cme --linodes 66000001" deny
 check "linode-cli tags create --label cme" pass
 check "linode-cli tags rm prod" ask
 check "linode-cli tags delete urgentc" deny
 
 echo
-echo "--help và trang trợ giúp cục bộ không bao giờ chạm API"
+echo "--help and local help topics never reach the API"
 check "linode-cli linodes delete --help" pass
 check "linode-cli linodes unfamiliar-action --help" pass
 check "linode-cli commands" pass
 check "linode-cli linodes --help" pass
 
 echo
-echo "một resource chỉ được thuộc một môi trường"
+echo "one resource, one environment"
 check "linode-cli linodes create --tags cme --tags staging --tags prod" deny
 check "linode-cli linodes reboot 22000002" deny
 
 echo
-echo "tạo resource dùng sổ: id phải đến được hook ghi sổ"
+echo "ledger creates: the id must reach the recording hook"
 check "linode-cli vpcs create --label cme-vpc --json" pass
 check "linode-cli vpcs create --label cme-vpc --json > vpc.json" deny
 check "linode-cli vpcs create --label a --json && linode-cli databases mysql-create --label b --json" deny
 
 echo
-echo "hết hạn tra cứu thì từ chối, không im lặng"
+echo "a timed-out lookup refuses, never stays silent"
 check "linode-cli linodes reboot 11111111" deny
 
 echo
-echo "hook hỏng thì từ chối"
+echo "a broken hook refuses"
 broken="$work/broken"; mkdir -p "$broken"
 cp "$guard" "$broken/guard-linode.sh"
 got=$(decision "$broken/guard-linode.sh" "$(json 'linode-cli linodes delete 66000001')")
 if [[ "${got:-pass}" == deny ]]; then
-  pass=$((pass + 1)); printf '  ok   %-72s %s\n' "thiếu scripts/lib/ → deny" deny
+  pass=$((pass + 1)); printf '  ok   %-72s %s\n' "scripts/lib/ missing → deny" deny
 else
-  fail=$((fail + 1)); printf '  FAIL %-72s got=%s want=deny\n' "thiếu scripts/lib/" "${got:-pass}"
+  fail=$((fail + 1)); printf '  FAIL %-72s got=%s want=deny\n' "scripts/lib/ missing" "${got:-pass}"
 fi
 
 
 echo
-echo "env dùng chung: mặc định cấm, khai báo rồi thì cho nhưng luôn hỏi nếu chạm prod"
+echo "shared envs: refused by default; once declared, allowed but always asks when prod is involved"
 check "linode-cli linodes reboot 22000003" deny
 check_in "$shared" "linode-cli linodes reboot 22000003" ask
 check_in "$shared" "linode-cli linodes reboot 22000004" pass
@@ -332,39 +333,39 @@ check_in "$shared" "linode-cli linodes create --tags cme --tags staging --tags p
 check_in "$shared" "linode-cli linodes create --tags cme --tags dev --tags staging" pass
 
 echo
-echo "resource thứ hai trên cùng dòng lệnh cũng bị soi"
+echo "the second resource on the line is checked too"
 check "linode-cli volumes attach 556 --linode_id 66000001" deny
 check "linode-cli volumes attach 556 --linode_id 77000001" pass
 check "linode-cli firewalls device-create 999 --id 66000001 --type linode" deny
 check "linode-cli linodes create --tags cme --tags staging --firewall_id 66000001" deny
 
 echo
-echo "sổ sở hữu chỉ nói thay cho đúng project của nó"
+echo "a ledger only speaks for its own project"
 check_in "$foreign" "linode-cli vpcs update 900001 --description x" deny
 
 echo
-echo "lệnh phá huỷ không tin cache"
+echo "destructive actions do not trust the cache"
 check "linode-cli linodes reboot 33000009" pass
 check "linode-cli linodes delete 33000009" deny
 
 
-echo "output của hook phải luôn là JSON hợp lệ, kể cả khi tag/label chứa nháy"
+echo "hook output must always be valid JSON, even with quotes in tags/labels"
 check "linode-cli linodes delete 44000009" deny
 raw=$(printf '%s' "$(json 'linode-cli linodes delete 44000009')" | bash "$guard")
 if printf '%s' "$raw" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
-  pass=$((pass + 1)); printf '  ok   %-72s %s\n' "JSON hợp lệ với label chứa nháy" valid
+  pass=$((pass + 1)); printf '  ok   %-72s %s\n' "valid JSON with a quoted label" valid
 else
-  fail=$((fail + 1)); printf '  FAIL %-72s %s\n' "JSON hợp lệ với label chứa nháy" invalid
+  fail=$((fail + 1)); printf '  FAIL %-72s %s\n' "valid JSON with a quoted label" invalid
 fi
 
 
 echo
-echo "xuống dòng là ranh giới lệnh"
+echo "a newline is a command boundary"
 check $'linode-cli linodes list\nlinode-cli linodes delete 66000001' deny
 check $'linode-cli linodes list\nlinode-cli linodes reboot 77000001' pass
 
 echo
-echo "wrapper có đối số — kể cả pattern opgate exec của chính plugin"
+echo "wrappers with arguments — including the plugin's own opgate exec pattern"
 check "timeout 10 linode-cli linodes delete 66000001" deny
 check 'bash -lc "linode-cli linodes delete 66000001"' deny
 check 'eval "linode-cli linodes delete 66000001"' deny
@@ -378,40 +379,40 @@ check "cat linode-cli-notes.txt" pass
 check "command -v linode-cli" pass
 
 echo
-echo "\$( ) và backtick trong nháy kép"
+echo "\$( ) and backticks inside double quotes"
 check 'result="$(linode-cli linodes delete 66000001)"' deny
 check 'echo "$(linode-cli linodes delete 66000001)"' deny
 check 'echo "`linode-cli linodes delete 66000001`"' deny
 
 echo
-echo "ask không được chặn việc xét các đoạn sau — deny luôn thắng"
+echo "ask must not stop later segments from being checked — deny always wins"
 check "LINODE_ENV=prod linode-cli linodes reboot 95747451 && linode-cli linodes reboot 66000001" deny
 check "linode-cli lke kubeconfig-view 580172; linode-cli linodes delete 66000001" deny
 check "linode-cli lke kubeconfig-view 580172; linode-cli linodes reboot 77000001" ask
 
 echo
-echo "cờ dotted trỏ tới resource khác"
+echo "dotted flags that point at another resource"
 check "linode-cli firewalls create --tags cme --tags staging --label fw --rules.inbound_policy DROP --devices.linodes 66000001" deny
 check "linode-cli firewalls create --tags cme --tags staging --label fw --devices.linodes 77000001" pass
 check "linode-cli linodes create --tags cme --tags staging --interfaces.purpose vpc --interfaces.vpc_id 900002 --interfaces.subnet_id 1" deny
 check "linode-cli linodes create --tags cme --tags staging --interfaces.purpose vpc --interfaces.vpc_id 900001" pass
 
 echo
-echo "id của resource đích là biến thì không đoán"
+echo "a target id in a variable is never guessed"
 check 'ID=66000001; linode-cli volumes attach 556 --linode_id $ID' deny
 check 'linode-cli firewalls device-create 999 --id $ID --type linode' deny
 check 'linode-cli linodes create --tags cme --tags staging --firewall_id $FW' deny
 check 'linode-cli linodes update 77000001 --tags $TAGS' deny
 
 echo
-echo "ngân sách thời gian là tổng cho mọi lookup, không phải từng cái"
+echo "the time budget covers all lookups, not each one"
 rm -rf "$XDG_CACHE_HOME"
 CHECK_ENV="LINGATE_DEADLINE=3 LINGATE_BUDGET=3" check "linode-cli volumes attach 557 --linode_id 11111112" deny
 rm -rf "$XDG_CACHE_HOME"
 CHECK_ENV="LINGATE_DEADLINE=3 LINGATE_BUDGET=20" check "linode-cli volumes attach 557 --linode_id 11111112" pass
 
 echo
-echo "sink tính theo từng đoạn, và chỉ stdout mới tính"
+echo "sinks are per segment, and only stdout counts"
 check "linode-cli lke kubeconfig-view 580172 2>/dev/null" ask
 check "linode-cli lke kubeconfig-view 580172 < /dev/null" ask
 check "linode-cli lke kubeconfig-view 580172 --text | base64 -d" ask
@@ -421,20 +422,20 @@ check "linode-cli object-storage keys-create --label cme --json | jq -r .secret_
 check "linode-cli vpcs create --label x --json 2>/dev/null" pass
 
 echo
-echo "--domain là field thật của domains create, không phải viết tắt của --domains"
+echo "--domain is a real field of domains create, not an abbreviation of --domains"
 check "linode-cli domains create --tags cme --tags staging --domain cme.example --type master --soa_email a@b.c" pass
 check "linode-cli domains update 22000006 --domain x.example" pass
 
 echo
-echo "lib nạp hỏng thì từ chối, không lọt"
+echo "a library that fails to load refuses, never lets through"
 broken2="$work/broken2"; mkdir -p "$broken2/lib"
 cp "$guard" "$broken2/"; cp "$here/lib/linode.sh" "$broken2/lib/"
 printf 'this is not bash (\n' > "$broken2/lib/common.sh"
 got=$(decision "$broken2/guard-linode.sh" "$(json 'linode-cli linodes delete 66000001')")
-[[ "${got:-pass}" == deny ]]; verdict "lib có lỗi cú pháp → deny" $?
+[[ "${got:-pass}" == deny ]]; verdict "lib with a syntax error → deny" $?
 
 echo
-echo "fast-path, cwd, bucket, nối dòng, redirect"
+echo "fast path, cwd, buckets, line continuation, redirects"
 check "x=1;lin linodes delete 66000001" deny
 check "(lin linodes delete 66000001)" deny
 check_cwd "$nowhere" "linode-cli linodes create --tags cme --tags staging" deny
@@ -447,39 +448,64 @@ check "linode-cli linodes list > out.txt; linode-cli linodes create --tags cme -
 check "linode-cli linodes reboot 66000001 > out.txt" deny
 check "linode-cli vpcs list --json && linode-cli vpcs create --label x --json" deny
 raw=$(printf '%s' "$(json 'linode-cli linodes reboot 94162441')" | bash "$guard")
-printf '%s' "$raw" | grep -q 'node cua lke 580172'; verdict "thông báo chỉ đúng cluster của node LKE" $?
+printf '%s' "$raw" | grep -q 'worker node of lke 580172'; verdict "the message names the LKE worker's cluster" $?
 
 echo
-echo "record-owned: --help không phải create, sổ project khác không bị chiếm, bucket, id lồng"
+echo "record-owned: --help is not a create, foreign ledgers are not taken over, buckets, nested ids"
 rec="$here/record-owned.sh"
 post() { python3 -c 'import json,sys; print(json.dumps({"tool_input":{"command":sys.argv[1]},"tool_response":{"stdout":sys.argv[2]},"cwd":sys.argv[3]}))' "$1" "$2" "$3"; }
 rp="$work/recproj"; mkdir -p "$rp/.linode"; cp "$proj/.linode/project.json" "$rp/.linode/"
 printf '{"tag": "cme", "owned": []}\n' > "$rp/.linode/owned.json"
 post 'linode-cli vpcs create --help' '[{"id": 123}]' "$rp" | bash "$rec" >/dev/null
-! grep -q '"123"' "$rp/.linode/owned.json"; verdict "--help không ghi sổ" $?
+! grep -q '"123"' "$rp/.linode/owned.json"; verdict "--help records nothing" $?
 post 'linode-cli object-storage bucket-create --label cme-b --region sg-sin-1 --json' '[{"label": "cme-b", "region": "sg-sin-1"}]' "$rp" | bash "$rec" >/dev/null
-grep -q 'sg-sin-1/cme-b' "$rp/.linode/owned.json"; verdict "bucket ghi sổ dạng region/label" $?
+grep -q 'sg-sin-1/cme-b' "$rp/.linode/owned.json"; verdict "a bucket is recorded as region/label" $?
 post 'linode-cli vpcs create --label v --json' '[{"id": 900123, "subnets": [{"id": 900001}]}]' "$rp" | bash "$rec" >/dev/null
-grep -q '"900123"' "$rp/.linode/owned.json" && ! grep -q '"900001"' "$rp/.linode/owned.json"; verdict "id của resource cha, không phải subnet con" $?
+grep -q '"900123"' "$rp/.linode/owned.json" && ! grep -q '"900001"' "$rp/.linode/owned.json"; verdict "the parent id, not the child subnet id" $?
 out=$(post 'linode-cli vpcs create --label v --json' '[{"id": 700}]' "$foreign" | bash "$rec")
-grep -q '"tag": "urgentc"' "$foreign/.linode/owned.json" && ! grep -q '"700"' "$foreign/.linode/owned.json" && printf '%s' "$out" | grep -q 'KHONG ghi'
-verdict "sổ của project khác không bị ghi đè" $?
+grep -q '"tag": "urgentc"' "$foreign/.linode/owned.json" && ! grep -q '"700"' "$foreign/.linode/owned.json" && printf '%s' "$out" | grep -q 'could NOT record'
+verdict "another project's ledger is not overwritten" $?
 
 echo
-echo "lingate: ls không chết khi API lỗi, disown sau khi format lại, init cất sổ lạ"
+echo "lingate: ls survives an API failure, disown after reformatting, init sets a foreign ledger aside"
 LG="$here/../bin/lingate"
 lp="$work/lgproj"; mkdir -p "$lp"; ( cd "$lp" && git init -q . )
 ( cd "$lp" && CLAUDE_PROJECT_DIR="$lp" "$LG" init cme --envs staging,prod >/dev/null 2>&1 )
-( cd "$lp" && CLAUDE_PROJECT_DIR="$lp" "$LG" ls >/dev/null 2>&1 ); verdict "lingate ls thoát 0 dù linode-cli lỗi" $?
+( cd "$lp" && CLAUDE_PROJECT_DIR="$lp" "$LG" ls >/dev/null 2>&1 ); verdict "lingate ls exits 0 even when linode-cli fails" $?
 ( cd "$lp" && CLAUDE_PROJECT_DIR="$lp" "$LG" own vpcs 1 --env staging >/dev/null 2>&1 )
 python3 -c 'import json,sys; f=sys.argv[1]; d=json.load(open(f)); json.dump(d, open(f,"w"), indent=4)' "$lp/.linode/owned.json"
 ( cd "$lp" && CLAUDE_PROJECT_DIR="$lp" "$LG" disown vpcs 1 >/dev/null 2>&1 )
-! grep -q '"1"' "$lp/.linode/owned.json"; verdict "disown vẫn xoá được sau khi file bị format lại" $?
+! grep -q '"1"' "$lp/.linode/owned.json"; verdict "disown still removes after the file is reformatted" $?
 printf '{"tag": "urgentc", "owned": [{"type": "vpcs", "id": "5", "env": "prod", "label": "x", "at": "t"}]}\n' > "$lp/.linode/owned.json"
-( cd "$lp" && CLAUDE_PROJECT_DIR="$lp" "$LG" own vpcs 6 --env staging >/dev/null 2>&1 ); [[ $? -ne 0 ]]; verdict "own từ chối ghi vào sổ của project khác" $?
+( cd "$lp" && CLAUDE_PROJECT_DIR="$lp" "$LG" own vpcs 6 --env staging >/dev/null 2>&1 ); [[ $? -ne 0 ]]; verdict "own refuses to write into another project's ledger" $?
 ( cd "$lp" && CLAUDE_PROJECT_DIR="$lp" "$LG" init cme --envs staging,prod >/dev/null 2>&1 )
 grep -q '"tag": "cme"' "$lp/.linode/owned.json" && [[ -f "$lp/.linode/owned.json.urgentc.bak" ]] && ! grep -q '"5"' "$lp/.linode/owned.json"
-verdict "init cất sổ lạ sang .bak và tạo sổ mới" $?
+verdict "init moves a foreign ledger to .bak and creates a new one" $?
+
+
+echo
+echo "Codex low: the -rm alias, tags in a protected env, a broken lexer, empty HOME"
+check "linode-cli placement group-rm 8801" pass
+check "linode-cli placement group-rm 8809" deny
+check "linode-cli placement group-delete 8801" pass
+check "LINODE_ENV=prod linode-cli tags create --label prod" ask
+# The lexer is awk; when it produces nothing the guard must refuse, not conclude
+# there was nothing to guard. (bash 3.2 quietly falls back when TMPDIR is bad,
+# so a broken here-string cannot be simulated — a broken lexer can.)
+noawk="$work/noawk"; mkdir -p "$noawk"; printf '#!/bin/sh\nexit 1\n' > "$noawk/awk"; chmod 755 "$noawk/awk"
+# A minimal PATH: the real one may contain spaces, which the unquoted CHECK_ENV
+# expansion in decision() would split. Without jq on it the payload falls back
+# to awk too, which is an equally valid fail-closed path.
+CHECK_ENV="PATH=$noawk:/usr/bin:/bin" check "linode-cli linodes reboot 77000001" deny
+raw=$(printf '%s' "$(json 'linode-cli linodes reboot 77000001')" | env PATH="$noawk:/usr/bin:/bin" bash "$guard")
+printf '%s' "$raw" | grep -Eq 'could not split the command line|could not be read'; verdict "a broken lexer → refused for the right reason" $?
+( cd "$lp" && env -u HOME -u XDG_CACHE_HOME CLAUDE_PROJECT_DIR="$lp" "$LG" whoami >/dev/null 2>&1 ); verdict "lingate runs with HOME and XDG_CACHE_HOME unset" $?
+# init must not leave a half-declared project when the ledger cannot be written
+lq="$work/lqproj"; mkdir -p "$lq/.linode"; ( cd "$lq" && git init -q . )
+printf '{"tag": "urgentc", "owned": []}\n' > "$lq/.linode/owned.json"; chmod 555 "$lq/.linode"
+( cd "$lq" && CLAUDE_PROJECT_DIR="$lq" "$LG" init cme --envs staging,prod >/dev/null 2>&1 ); rc=$?
+chmod 755 "$lq/.linode"
+[[ $rc -ne 0 && ! -f "$lq/.linode/project.json" ]]; verdict "a failed init leaves no half-written project.json" $?
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
