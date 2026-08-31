@@ -1,122 +1,127 @@
 ---
 name: onepassword
-description: Truy cập secrets của project từ 1Password qua `opgate`, có Touch ID gate mỗi lần dùng. Dùng khi cần API key / DB URL / token để chạy lệnh, khi app lỗi vì thiếu biến môi trường, khi setup secrets cho project mới, hoặc khi thấy secret plaintext trong repo.
+description: Reach a project's secrets in 1Password through `opgate`, behind a Touch ID gate on every use. Use when you need an API key / DB URL / token to run something, when an app fails for a missing environment variable, when setting up secrets for a new project, or when you find a plaintext secret in a repo.
 ---
 
-# 1Password secrets qua `opgate`
+# 1Password secrets through `opgate`
 
-Secrets của project nằm trong 1Password, không nằm trên đĩa. Mỗi lần chạm vào một
-secret sẽ hiện sheet Touch ID trên máy của người dùng — bạn không thể tự approve
-thay họ, và điều đó là cố ý.
+A project's secrets live in 1Password, not on disk. Every time something reaches for
+one, a Touch ID sheet appears on the user's machine — you cannot approve it for
+them, and that is the point.
 
-## Luật quan trọng nhất
+## The rule that matters most
 
-**Không bao giờ để giá trị secret đi ra stdout.** Mọi thứ in ra terminal đều vào
-transcript của cuộc hội thoại và được gửi lên model provider. Một secret đã lọt vào
-đó coi như đã lộ và phải rotate — vault trở nên vô nghĩa.
+**Never let a secret value reach stdout.** Anything printed to the terminal goes
+into the conversation transcript and is shipped to the model provider. A secret
+that lands there is disclosed and has to be rotated — which makes the vault
+pointless.
 
-Vì vậy `opgate` **không có lệnh `read`**. Secret chỉ đi tới ba nơi: env của một
-process con, clipboard, hoặc một file đã được git ignore. (`opgate import --backup`
-tạo thêm một bản sao plaintext — mặc định tắt, và nếu bật thì bạn phải tự xoá.)
+That is why `opgate` has **no `read` command**. A secret only ever travels to three
+places: the environment of a child process, the clipboard, or a git-ignored file.
+(`opgate import --backup` makes one more plaintext copy — off by default, and if
+you turn it on, deleting it is your job.)
 
-## Việc không được làm
+## What not to do
 
-- `op read …`, `op item get …`, `op run …` gọi trực tiếp → dùng `opgate` thay thế.
-  Hook sẽ chặn, nhưng đừng để nó phải chặn.
-- `cat .env`, `grep TOKEN .env`, đọc `.env` bằng tool Read → giá trị vào transcript.
-  Cần biết project có biến gì thì `opgate list`.
-- In secret ra "để kiểm tra". Muốn kiểm tra thì so sánh bên trong process con:
+- Calling `op read …`, `op item get …`, `op run …` directly → use `opgate` instead.
+  The hook blocks it, but do not make it block you.
+- `cat .env`, `grep TOKEN .env`, opening `.env` with the Read tool → the values go
+  into the transcript. To learn which variables a project has, use `opgate list`.
+- Printing a secret "just to check". Check inside the child process instead:
   `opgate run -- sh -c '[ -n "$JWT_SECRET" ] && echo present'`.
-- Viết secret vào file bạn tạo, vào commit message, vào comment, vào issue.
-- Thêm secret vào `.claude/settings*.json` dưới dạng allow-rule.
+- Writing a secret into a file you create, a commit message, a comment, an issue.
+- Adding a secret to `.claude/settings*.json` as an allow rule.
 
-## Lệnh
+## Commands
 
-| Lệnh | Dùng khi |
-|---|---|
-| `opgate list` | Xem project có secret gì. **Không hiện giá trị**, không cần Touch ID — cứ gọi thoải mái. |
-| `opgate scan` | Tìm mọi `.env` trong project và secret nhúng trong file cấu hình. Chạy được cả khi 1Password đang khoá. Không in giá trị. |
-| `opgate import <file>` | Đưa một file `.env` vào vault và sinh `.env.op`. Một lần Touch ID cho cả file. |
-| `opgate items -p <project>` | Liệt kê item của một project trong vault (lọc theo tag). |
-| `opgate run -- <cmd>` | Lệnh chủ đạo. Chạy `<cmd>` với toàn bộ secrets nạp vào env. 1Password tự mask giá trị trong output. |
-| `opgate exec VAR=op://… -- <cmd>` | Chỉ cần đúng một secret. |
-| `opgate copy op://…` | Người dùng cần tự dán secret vào đâu đó. Vào clipboard, tự xoá sau 90s. |
-| `opgate inject -i tpl -o out` | Công cụ bắt buộc phải có file thật. Từ chối ghi nếu `out` chưa được git ignore. |
-| `opgate put <ITEM> <FIELD>` | Đưa một secret **vào** 1Password. Đọc giá trị từ stdin. Thêm `--multiline` cho PEM key / JSON nhiều dòng. |
-| `opgate doctor` | Có gì đó không chạy. Kiểm tra toàn bộ setup và in cách sửa. |
-| `opgate audit -n 20` | Xem gần đây đã truy cập secret nào. |
-| `opgate grants` | Xem hook đang mở cửa sổ approve cho file nào, còn bao lâu. Không cần Touch ID. |
-| `opgate unlock -m 60 <file>` | Mở trước một cửa sổ để hook thôi hỏi về đúng file đó. Một lần Touch ID. |
-| `opgate lock [file]` | Đóng cửa sổ ngay. Không tham số = đóng tất cả. Không cần Touch ID. |
+| Command                           | Use it when                                                                                                                                  |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `opgate list`                     | You want to know which secrets a project has. **Shows no values**, needs no Touch ID — call it freely.                                       |
+| `opgate scan`                     | Find every `.env` in the project and any secret embedded in a config or source file. Works even while 1Password is locked. Prints no values. |
+| `opgate import <file>`            | Move a `.env` into the vault and generate `.env.op`. One Touch ID for the whole file.                                                        |
+| `opgate items -p <project>`       | List a project's items in the vault (filtered by tag).                                                                                       |
+| `opgate run -- <cmd>`             | The main one. Runs `<cmd>` with all the secrets in its environment. 1Password masks the values in the output.                                |
+| `opgate exec VAR=op://… -- <cmd>` | You need exactly one secret.                                                                                                                 |
+| `opgate copy op://…`              | The user needs to paste a secret somewhere themselves. Goes to the clipboard, clears after 90s.                                              |
+| `opgate inject -i tpl -o out`     | A tool insists on a real file. Refuses to write unless `out` is git ignored.                                                                 |
+| `opgate put <ITEM> <FIELD>`       | Put a secret **into** 1Password. Reads the value from stdin. Add `--multiline` for a PEM key or multi-line JSON.                             |
+| `opgate doctor`                   | Something is not working. Checks the whole setup and prints how to fix it.                                                                   |
+| `opgate audit -n 20`              | Which secrets were reached for recently.                                                                                                     |
+| `opgate grants`                   | Which files the hook currently has an approval window open for, and for how long. No Touch ID.                                               |
+| `opgate unlock -m 60 <file>`      | Open a window up front so the hook stops asking about that one file. One Touch ID.                                                           |
+| `opgate lock [file]`              | Close a window now. No argument closes every one. No Touch ID.                                                                               |
 
-## Quy trình thường gặp
+## Common workflows
 
-**App cần secret để chạy** — đừng đi tìm `.env`:
+**An app needs secrets to run** — do not go hunting for `.env`:
 
 ```bash
-opgate list                  # xem có gì
-opgate run -- npm run dev    # chạy; Touch ID hiện một lần lúc khởi động
+opgate list                  # see what there is
+opgate run -- npm run dev    # run it; one Touch ID at startup
 ```
 
-**Một lệnh dùng đúng một secret**:
+**One command needs exactly one secret**:
 
 ```bash
 opgate exec DATABASE_URL=op://Dev/cme-api/DATABASE_URL -- \
   sh -c 'psql "$DATABASE_URL" -c "\dt"'
 ```
 
-`sh -c '…'` là bắt buộc: viết `-- psql "$DATABASE_URL"` sẽ để shell **bên ngoài**
-expand biến trước khi opgate kịp nạp secret, và psql nhận chuỗi rỗng.
+The `sh -c '…'` is required: writing `-- psql "$DATABASE_URL"` lets the **outer**
+shell expand the variable before opgate has loaded anything, and psql gets an empty
+string.
 
-**Thiếu một biến**: thêm dòng `VAR=op://Dev/<project>/VAR` vào `.env.op`, rồi bảo
-người dùng chạy `opgate put <project> VAR` để nhập giá trị. Đừng tự hỏi họ giá trị
-qua chat — nó sẽ nằm trong transcript.
+**A variable is missing**: add a `VAR=op://Dev/<project>/VAR` line to `.env.op`, then
+ask the user to run `opgate put <project> VAR` to enter the value. Do not ask them
+for the value in chat — it would land in the transcript.
 
-**Thấy `.env` plaintext trong repo**: chạy `opgate scan` — nó liệt kê file, đếm
-biến và đề xuất tên item, không đọc giá trị nào ra ngoài. Rồi đề xuất
-`opgate import <file>`. Đừng tự `cat` file đó để "xem có gì".
+**A plaintext `.env` in the repo**: run `opgate scan` — it lists the files, counts the
+variables and suggests item names without reading a single value out. Then propose
+`opgate import <file>`. Do not `cat` the file "to see what's in it".
 
-`opgate import` hỏi bạn về những biến nó không chắc, và câu hỏi chỉ mô tả **hình
-dạng** giá trị (`30 ký tự · thường/HOA/ký hiệu`) chứ không in giá trị. Nếu chạy
-không có terminal, nó **dừng lại** thay vì đoán — trừ khi có `--yes`. Nó cũng dừng
-khi file có BOM, nháy không đóng, hoặc `$VAR` ngoài nháy đơn — đừng "sửa" bằng cách
-bỏ qua, hãy báo người dùng sửa file.
+`opgate import` asks you about the variables it is unsure of, and the question
+describes only the **shape** of the value (`30 chars · lower/UPPER/symbols`), never
+the value. With no terminal to ask on it **stops** rather than guessing — unless you
+pass `--yes`. It also stops when the file has a BOM, an unclosed quote, or a `$VAR`
+outside single quotes; do not "fix" that by skipping it, tell the user to fix the
+file.
 
-**Cách nhóm**: mỗi file env thành một item, đặt tên `<project>-<thư mục>-<môi
-trường>` (`cme-api`, `cme-web-production`), tất cả mang tag `project:<tên>`. Nhóm
-bằng tag chứ không chỉ bằng cách đặt tên, nên lọc được trong app lẫn CLI.
+**How to group things**: one item per env file, named `<project>-<directory>-<environment>`
+(`cme-api`, `cme-web-production`), all carrying the tag `project:<name>`. Group by
+tag rather than by naming alone, so filtering works in the app as well as the CLI.
 
-**Hook hỏi rồi người dùng approve** — lần sau nó sẽ **không hỏi lại trong 60 phút**
-cho đúng file đó. Điều này nghĩa là: một `cat .env` đi lọt không có nghĩa là bạn
-được phép đọc thoải mái, chỉ là người dùng đã đồng ý gần đây. Luật "không đưa giá
-trị secret ra stdout" không đổi. Nếu cần biết project có biến gì thì vẫn là
-`opgate list`.
+**The hook asked and the user approved** — it will **not ask again for 60 minutes**
+for that one file. Which means: a `cat .env` going through does not mean you are now
+free to read as you like, only that the user agreed recently. The rule about never
+putting a secret value on stdout does not change. To learn which variables a project
+has, it is still `opgate list`.
 
-Cửa sổ chỉ mở cho **một file**, theo đường dẫn đã resolve. Nó không bao giờ mở cho
-`op read` / `op item get` — những lệnh đó luôn bị chặn. Người dùng gõ `opgate lock`
-là đóng ngay.
+A window covers **one file**, by resolved path. It never covers `op read` or
+`op item get` — those stay blocked. `opgate lock` closes it immediately.
 
-**Lệnh trả về exit 77**: người dùng đã từ chối ở sheet Touch ID. Đó là câu trả lời
-"không" — dừng lại và hỏi, đừng thử lại hay tìm đường vòng. Exit 78 nghĩa là không
-hiện được prompt (hoặc gate binary bị thay đổi) — chạy `opgate doctor`.
+**A command exits 77**: the user declined at the Touch ID sheet. That is a "no" —
+stop and ask, do not retry or look for a way around. Exit 78 means the prompt could
+not be shown (or the gate binary changed) — run `opgate doctor`.
 
-## Quy ước lưu trữ
+## Storage convention
 
-Vault `Dev`, mỗi project một item (Secure Note), mỗi biến môi trường một field:
+Vault `Dev`, one item per project (a Secure Note), one field per environment
+variable:
 
 ```
-op://Dev/<tên-project>/<TÊN_BIẾN>
+op://Dev/<project-name>/<VARIABLE_NAME>
 ```
 
-File `.env.op` nằm trong repo và **commit được** vì chỉ chứa reference:
+The `.env.op` file lives in the repo and is **safe to commit**, because it holds
+only references:
 
 ```
 DATABASE_URL=op://Dev/cme-api/DATABASE_URL
 JWT_SECRET=op://Dev/cme-api/JWT_SECRET
 ```
 
-## Đọc thêm
+## Further reading
 
-- `references/project-setup.md` — đưa một project từ `.env` plaintext lên 1Password
-- `references/secret-references.md` — cú pháp `op://`, `.env.op`, lỗi thường gặp
-- `references/security-model.md` — gate bảo vệ được gì và **không** bảo vệ được gì
+- `references/project-setup.md` — taking a project from a plaintext `.env` to 1Password
+- `references/secret-references.md` — `op://` syntax, `.env.op`, the usual mistakes
+- `references/security-model.md` — what the gate protects and what it does **not**

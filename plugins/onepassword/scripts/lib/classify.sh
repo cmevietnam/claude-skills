@@ -173,18 +173,18 @@ _url_token_segment() {
   return 1
 }
 
-# describe_value <value> -> a redacted shape, e.g. "36 ký tự · thường/HOA/số"
+# describe_value <value> -> a redacted shape, e.g. "36 chars · lower/UPPER/digits"
 # Used when asking you about an ambiguous variable. Enough to decide, not enough
 # to leak.
 describe_value() {
   local v="$1" cls=""
-  [[ "$v" =~ [a-z] ]] && cls+="thường"
+  [[ "$v" =~ [a-z] ]] && cls+="lower"
   [[ "$v" =~ [A-Z] ]] && cls+="${cls:+/}HOA"
-  [[ "$v" =~ [0-9] ]] && cls+="${cls:+/}số"
-  [[ "$v" =~ [^A-Za-z0-9] ]] && cls+="${cls:+/}ký hiệu"
+  [[ "$v" =~ [0-9] ]] && cls+="${cls:+/}digits"
+  [[ "$v" =~ [^A-Za-z0-9] ]] && cls+="${cls:+/}symbols"
   local shape=""
-  [[ "$v" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*:// ]] && shape=" · dạng URL"
-  [[ "$v" =~ [[:space:]] ]] && shape+=" · có khoảng trắng"
-  [[ "$v" == *$'\n'* ]] && shape+=" · nhiều dòng"
-  printf '%d ký tự · %s%s' "${#v}" "${cls:-?}" "$shape"
+  [[ "$v" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*:// ]] && shape=" · URL-shaped"
+  [[ "$v" =~ [[:space:]] ]] && shape+=" · has whitespace"
+  [[ "$v" == *$'\n'* ]] && shape+=" · multiline"
+  printf '%d chars · %s%s' "${#v}" "${cls:-?}" "$shape"
 }

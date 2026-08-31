@@ -1,75 +1,79 @@
-# Đưa một project lên 1Password
+# Moving a project onto 1Password
 
-Làm một lần cho mỗi project. `opgate scan` và `opgate import` lo phần cơ học, còn
-hai quyết định vẫn là của bạn và không tự động hoá được: biến nào thật sự là bí mật,
-và secret nào nên **rotate** thay vì chép nguyên sang chỗ mới. Bất cứ giá trị nào
-từng nằm trong git, trong log, hay trong một settings file thì coi như đã lộ.
+Once per project. `opgate scan` and `opgate import` handle the mechanical part; two
+decisions stay yours and cannot be automated: which variables are genuinely secret,
+and which secrets should be **rotated** rather than copied across intact. Any value
+that has ever been in git, in a log, or in a settings file should be treated as
+disclosed.
 
-## 0. Chuẩn bị một lần cho cả máy
+## 0. One-time setup for the machine
 
 ```bash
-op vault create Dev          # nếu chưa có
-opgate doctor                # phải xanh hết trước khi đi tiếp
+op vault create Dev          # if it does not exist yet
+opgate doctor                # everything green before going further
 ```
 
-## 1. Xem project có gì
+## 1. See what the project has
 
 ```bash
 opgate scan
 ```
 
-Liệt kê mọi `.env`, đếm biến theo phân loại, đề xuất tên item — và báo cả secret
-nằm trong file cấu hình hoặc source. Không đọc giá trị nào ra ngoài, và chạy được
-cả khi 1Password đang khoá.
+Lists every `.env`, counts variables by classification, suggests item names — and
+also reports secrets sitting inside config or source files. It reads no value out,
+and works even while 1Password is locked.
 
-## 2. Import từng file
+## 2. Import one file at a time
 
 ```bash
 opgate import api/.env
 ```
 
-Một lần Touch ID cho cả file; sheet liệt kê mọi biến sắp được ghi. Việc nó làm:
+One Touch ID for the whole file; the sheet lists every variable about to be written.
+What it does:
 
-- tạo/cập nhật item `<project>-<thư mục>-<môi trường>` trong vault `Dev`, tag
-  `opgate` và `project:<tên>`
-- sinh file reference cạnh file gốc: `.env` → `.env.op`,
-  `.env.production` → `.env.production.op`. Secret thành `op://` ref, biến không
-  bí mật giữ nguyên literal (được quote khi cần)
-- **không** xoá và **không** sao lưu bản gốc. Bản gốc vẫn nằm đó, nên một bản sao
-  plaintext thứ hai chỉ nới rộng vùng lộ. Cần thì `--backup`, rồi tự xoá.
+- creates or updates the item `<project>-<directory>-<environment>` in the `Dev`
+  vault, tagged `opgate` and `project:<name>`
+- writes a reference file next to the original: `.env` → `.env.op`,
+  `.env.production` → `.env.production.op`. Secrets become `op://` refs; non-secret
+  variables stay as literals (quoted where needed)
+- **neither** deletes **nor** backs up the original. The original is still there, so
+  a second plaintext copy would only widen the exposure. If you want one, pass
+  `--backup` — and delete it yourself.
 
-Nó dừng lại thay vì ghi đè khi: item đã tồn tại nhưng không do opgate tạo, hai file
-khác nhau cùng suy ra một tên item, hoặc file `.op` đích đang được sinh từ nguồn
-khác. `--force` bỏ qua các chốt đó.
+It stops rather than overwriting when: the item exists but was not created by opgate,
+two different files derive the same item name, or the target `.op` file is being
+generated from a different source. `--force` skips those checks.
 
-Biến nó không chắc thì nó hỏi, và câu hỏi chỉ mô tả hình dạng giá trị chứ không in
-giá trị. Không có terminal thì nó dừng thay vì đoán — `--yes` để đưa hết những ca
-mơ hồ vào vault. Chỉ tên nằm trong allowlist khớp chính xác (`NODE_ENV`, `PORT`,
-`API_URL`…) mới tự động ở lại dạng literal; bạn sẽ được hỏi khá nhiều ở lần đầu.
+For variables it is unsure about it asks you, and the question describes only the
+shape of the value, never the value. With no terminal it stops rather than guessing —
+`--yes` sends every ambiguous case to the vault. Only names on an exact-match
+allowlist (`NODE_ENV`, `PORT`, `API_URL`…) stay literal automatically, so expect a
+fair number of questions the first time.
 
-`import` **từ chối** file mà `op run` cũng từ chối, thay vì đoán: BOM ở đầu, dấu
-nháy không đóng, byte NUL. Nó cũng từ chối giá trị chứa `$VAR` ngoài nháy đơn —
-`op run` sẽ expand nó còn vault thì không, nên import sẽ đổi nghĩa giá trị. Bọc
-trong nháy đơn nếu muốn giữ nguyên chữ `$`.
+`import` **refuses** the files that `op run` also refuses, instead of guessing: a BOM
+at the start, an unclosed quote, a NUL byte. It also refuses a value containing `$VAR`
+outside single quotes — `op run` expands it and the vault does not, so importing would
+change what the value means. Wrap it in single quotes to keep a literal `$`.
 
-Xem trước mà không ghi gì: `opgate import api/.env --dry-run`.
+To preview without writing anything: `opgate import api/.env --dry-run`.
 
-Với secret cần rotate (key đã từng nằm trong git, trong settings file, trong log):
-**tạo key mới ở nhà cung cấp trước**, sửa `.env`, rồi mới import.
+For secrets that need rotating (a key that has been in git, in a settings file, in a
+log): **create the new key at the provider first**, edit `.env`, and import after that.
 
-### Thêm một biến lẻ về sau
+### Adding a single variable later
 
 ```bash
-opgate put cme-api NEW_TOKEN                    # prompt ẩn
+opgate put cme-api NEW_TOKEN                    # hidden prompt
 opgate put cme-api GOOGLE_SA_JSON --multiline < service-account.json
 ```
 
-Rồi thêm dòng `NEW_TOKEN=op://Dev/cme-api/NEW_TOKEN` vào `.env.op`.
+Then add the line `NEW_TOKEN=op://Dev/cme-api/NEW_TOKEN` to `.env.op`.
 
-## 3. Kiểm tra `.env.op`
+## 3. Check the `.env.op`
 
-`import` đã sinh file này cạnh file gốc. Nó commit được — secret là `op://` ref,
-biến không bí mật giữ nguyên literal:
+`import` already wrote this next to the original. It is safe to commit — secrets are
+`op://` refs, non-secret variables stay literal:
 
 ```
 NODE_ENV=development
@@ -77,64 +81,66 @@ DATABASE_URL=op://Dev/cme-api/DATABASE_URL
 JWT_SECRET=op://Dev/cme-api/JWT_SECRET
 ```
 
-Xác nhận trước khi bỏ bản gốc:
+Confirm before dropping the original:
 
 ```bash
-opgate list -f api/.env.op                    # tên + ref, không có giá trị
-opgate run -f api/.env.op -- npm run dev      # app phải chạy được
+opgate list -f api/.env.op                    # names + refs, no values
+opgate run -f api/.env.op -- npm run dev      # the app has to actually run
 ```
 
-`opgate list` cảnh báo nếu còn biến nào mang tên kiểu secret mà vẫn là literal —
-đó là dấu hiệu phân loại sai, và là thứ duy nhất có thể biến `.env.op` từ file
-commit được thành file rò rỉ.
+`opgate list` warns if a variable with a secret-looking name is still a literal. That
+is a sign of a misclassification, and it is the one thing that can turn `.env.op` from
+a committable file into a leaking one.
 
-## 4. Dọn plaintext
+## 4. Clean up the plaintext
 
-`import` giữ nguyên bản gốc. Sau khi chắc chắn app chạy được bằng file `.op`:
+`import` leaves the original alone. Once you are sure the app runs from the `.op` file:
 
 ```bash
 git check-ignore .env || echo ".env" >> .gitignore
 rm api/.env
 ```
 
-Đừng xoá sớm. Nếu sót một biến mà không còn bản gốc thì không có đường quay lại —
-đó là lý do `import` giữ nguyên file thay vì tự dọn.
+Do not delete it early. If a variable was missed and the original is gone, there is no
+way back — which is why `import` leaves the file in place rather than tidying up for
+you.
 
-Nếu `.env` từng bị commit thì giá trị vẫn nằm trong lịch sử git; thêm vào
-`.gitignore` không xoá nó. Những secret đó phải rotate.
+If `.env` was ever committed, the values are still in git history; adding it to
+`.gitignore` does not remove them. Those secrets have to be rotated.
 
-## 5. Đổi cách chạy app
+## 5. Change how the app is started
 
 ```diff
 -npm run dev
 +opgate run -- npm run dev
 ```
 
-Trong `package.json`, nếu muốn `npm run dev` tự đi qua gate:
+In `package.json`, if you want `npm run dev` to go through the gate by itself:
 
 ```json
 { "scripts": { "dev": "opgate run -- vite", "dev:raw": "vite" } }
 ```
 
-Docker Compose và các công cụ bắt buộc có file thật:
+Docker Compose, and other tools that insist on a real file:
 
 ```bash
 opgate inject -i .env.op -o .env.local && docker compose up
 rm .env.local
 ```
 
-`.env.local` phải nằm trong `.gitignore` — `opgate inject` từ chối ghi nếu chưa.
+`.env.local` has to be in `.gitignore` — `opgate inject` refuses to write otherwise.
 
-## 6. Cho Codex
+## 6. For Codex
 
-Codex không có hook system, nên luật phải nằm trong `AGENTS.md` của project:
+Codex has no hook system, so the rules have to live in the project's `AGENTS.md`:
 
 ```markdown
 ## Secrets
 
-Secrets nằm trong 1Password, không có trên đĩa. Chạy app bằng `opgate run -- <cmd>`.
-Không đọc `.env`, không gọi `op` trực tiếp, không in giá trị secret ra stdout.
-`opgate list` cho biết project có biến gì mà không lộ giá trị.
+Secrets live in 1Password, not on disk. Run the app with `opgate run -- <cmd>`.
+Do not open `.env`, do not call `op` directly, and never print a secret value to
+stdout. `opgate list` shows which variables the project has without exposing values.
 ```
 
-Touch ID gate vẫn chặn Codex như chặn Claude — nó nằm ở tầng CLI chứ không ở tầng hook.
+The Touch ID gate stops Codex exactly as it stops Claude — it sits at the CLI level,
+not at the hook level.

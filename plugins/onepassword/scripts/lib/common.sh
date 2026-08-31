@@ -52,7 +52,7 @@ die()  { printf '%sopgate:%s %s\n' "$_c_red" "$_c_reset" "$*" >&2; exit 1; }
 # --- validation -------------------------------------------------------------
 
 require_int() { # <value> <what>
-  [[ "$1" =~ ^[0-9]+$ ]] || die "$2 phải là số nguyên, nhận được '$1'"
+  [[ "$1" =~ ^[0-9]+$ ]] || die "$2 must be an integer, got '$1'"
 }
 
 # Environment variables that change how this script or its children resolve
@@ -62,9 +62,9 @@ OPGATE_UNSAFE_VARS='^(PATH|IFS|BASH_ENV|ENV|SHELL|LD_[A-Z_]*|DYLD_[A-Z_]*|OPGATE
 
 require_safe_var_name() { # <name>
   [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
-    || die "'$1' không phải tên biến môi trường hợp lệ"
+    || die "'$1' is not a valid environment variable name"
   [[ "$1" =~ $OPGATE_UNSAFE_VARS ]] \
-    && die "từ chối gán secret cho \$$1 — biến này đổi cách phân giải chương trình/thư viện"
+    && die "refusing to bind a secret to \$$1 — that variable changes how programs and libraries get resolved"
   return 0
 }
 
@@ -144,14 +144,14 @@ parse_env_file() { # <file>
 
   local size; size=$(wc -c <"$file" | tr -d ' ')
   (( size > OPGATE_MAX_ENV_BYTES )) \
-    && die "$file lớn hơn $((OPGATE_MAX_ENV_BYTES / 1024))KB — không phải file env; parser thuần bash sẽ rất chậm"
+    && die "$file is larger than $((OPGATE_MAX_ENV_BYTES / 1024))KB — that is not an env file, and the pure-bash parser would crawl through it"
 
   # NUL anywhere: op refuses to build the environment. Detect before parsing —
   # bash drops NULs silently, which would store a truncated value.
   # ($'\x00' is the EMPTY string in bash — a grep for it matches every file.
   # Compare byte counts with and without NULs instead.)
   if [[ "$(LC_ALL=C tr -d '\000' <"$file" | wc -c)" != "$(wc -c <"$file")" ]]; then
-    die "$file chứa byte NUL — op run từ chối file này; sửa file trước"
+    die "$file contains a NUL byte — op run rejects this file; fix it first"
   fi
 
   local first=1
@@ -162,7 +162,7 @@ parse_env_file() { # <file>
     if (( first )); then
       first=0
       if [[ "$line" == $'\xef\xbb\xbf'* ]]; then
-        die "$file bắt đầu bằng BOM — op run từ chối file này; lưu lại dạng UTF-8 không BOM"
+        die "$file starts with a BOM — op run rejects this file; save it as UTF-8 with no BOM"
       fi
     fi
 
@@ -187,7 +187,7 @@ parse_env_file() { # <file>
       local after="${line#export}"
       after="${after#"${after%%[![:space:]]*}"}"
       if [[ "$after" =~ ^[A-Za-z0-9_] ]]; then
-        [[ "${line:6:1}" =~ [[:space:]] ]] || warn "dòng $lineno: 'export' dính liền tên biến — op đọc thành '${after%%=*}'"
+        [[ "${line:6:1}" =~ [[:space:]] ]] || warn "line $lineno: 'export' is glued to the variable name — op reads it as '${after%%=*}'"
         line="$after"
       fi
     fi
@@ -219,7 +219,7 @@ parse_env_file() { # <file>
   # op rejects a file with an unterminated quote. Guessing here would vault
   # whatever text happened to follow.
   if [[ -n "$in_quote" ]]; then
-    die "$file: dấu nháy mở ở biến $pending không được đóng — op run từ chối file này; sửa file trước"
+    die "$file: the quote opened at $pending is never closed — op run rejects this file; fix it first"
   fi
 }
 
@@ -243,8 +243,8 @@ _refuse_expansion() { # <name> <value> <lineno>
   # literal `\$` in unquoted context and is fine; in double quotes op does not
   # decode `\$` either, so it stays `\$` — also not expanded.
   if [[ "$v" =~ (^|[^\\])\$([A-Za-z_{]) ]]; then
-    die "dòng $3: giá trị của $1 chứa \$VAR — op run sẽ expand nó, còn vault thì không, nên sau khi import giá trị đổi nghĩa.
-       Muốn giữ nguyên chữ \$ thì bọc trong nháy ĐƠN; muốn giá trị đã expand thì sửa file trước."
+    die "line $3: the value of $1 contains \$VAR — op run expands it and the vault does not, so importing would change what the value means.
+       To keep a literal \$, wrap the value in SINGLE quotes; to store the expanded value, fix the file first."
   fi
 }
 
@@ -344,6 +344,6 @@ summarize_list() {
     printf '%s' "$(IFS=', '; printf '%s' "${items[*]}")"
   else
     local -a head=("${items[@]:0:shown}")
-    printf '%d biến: %s +%d nữa' "$count" "$(IFS=', '; printf '%s' "${head[*]}")" "$((count - shown))"
+    printf '%d variables: %s +%d more' "$count" "$(IFS=', '; printf '%s' "${head[*]}")" "$((count - shown))"
   fi
 }

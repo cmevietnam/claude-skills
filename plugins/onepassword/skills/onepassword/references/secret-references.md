@@ -1,79 +1,83 @@
-# Secret reference `op://` và file `.env.op`
+# `op://` secret references and the `.env.op` file
 
-## Cú pháp
+## Syntax
 
 ```
 op://<vault>/<item>/<field>
 op://<vault>/<item>/<section>/<field>
 ```
 
-Quy ước của repo này: `op://Dev/<tên-project>/<TÊN_BIẾN>` — không dùng section, vì
-một tầng nữa chỉ thêm chỗ để gõ sai mà không đổi được gì.
+This repo's convention: `op://Dev/<project-name>/<VARIABLE_NAME>` — no sections,
+because another level only adds somewhere to make a typo without changing anything.
 
-Vault, item và field có thể dùng tên hoặc ID. Tên dễ đọc hơn nhưng đổi tên item
-trong 1Password sẽ làm hỏng mọi reference; ID thì bền nhưng không đọc được. Dùng tên,
-và đừng đổi tên item.
+Vault, item and field accept either a name or an ID. Names read better, but renaming
+an item in 1Password breaks every reference to it; IDs are durable and unreadable.
+Use names, and do not rename items.
 
-Tên có khoảng trắng thì bọc reference trong nháy kép. Tốt hơn là đừng đặt tên item
-có khoảng trắng.
+If a name contains a space, wrap the reference in double quotes. Better still, do not
+put spaces in item names.
 
 ## `.env.op`
 
 ```
-# commit được — chỉ chứa reference, không chứa giá trị
+# safe to commit — references only, no values
 DATABASE_URL=op://Dev/cme-api/DATABASE_URL
 JWT_SECRET=op://Dev/cme-api/JWT_SECRET
 
-# giá trị không bí mật cứ để thẳng
+# non-secret values can sit here directly
 NODE_ENV=development
 PORT=3000
 ```
 
-`opgate list` cảnh báo nếu có dòng nào chứa giá trị literal trông như secret — đó là
-lỗi thường gặp nhất khi mới chuyển sang, và nó biến một file lẽ ra commit được thành
-một file rò rỉ.
+`opgate list` warns when a line holds a literal value that looks like a secret. That
+is the most common mistake when moving over, and it turns a file that is supposed to
+be committable into a leak.
 
-`opgate` tìm `.env.op` ở thư mục hiện tại rồi tới gốc git repo. Dùng file khác thì
-`-f`, hoặc đặt `OPGATE_ENV_FILE`.
+`opgate` looks for `.env.op` in the current directory, then at the git repository
+root. To use a different file, pass `-f` or set `OPGATE_ENV_FILE`.
 
-Parser của `opgate` được đo đối chiếu với `op run` 2.34.1 (xem `test-parser.sh`)
-chứ không viết theo "spec dotenv", vì thứ duy nhất quan trọng là khớp với `op`. Nếu
-parser bỏ sót một dòng mà `op run` vẫn phân giải, sheet Touch ID sẽ **báo thiếu**
-phạm vi bạn đang approve. Những điểm đã đo:
+The `opgate` parser was measured against `op run` 2.34.1 (see `test-parser.sh`)
+rather than written from a "dotenv spec", because the only thing that matters is
+agreeing with `op`. If the parser missed a line that `op run` still resolves, the
+Touch ID sheet would **under-report** the scope you are approving. What was measured:
 
-- khoảng trắng quanh `=` được chấp nhận; tên có thể bắt đầu bằng số
-- `export` bị bỏ kể cả khi dính liền tên (`exportHIDDEN=1` → `HIDDEN`), có cảnh báo
-- ngoài nháy: `#` bắt đầu comment
-- nháy đơn: giữ nguyên tuyệt đối, có thể nhiều dòng
-- nháy kép: chỉ `\n`, `\"`, `\\` được giải mã; `\t` giữ nguyên **hai** ký tự
-- `$VAR` / `${VAR}` ngoài nháy đơn: `op` expand → `opgate` **từ chối** (xem trên)
-- BOM, nháy không đóng, NUL: `op` từ chối cả file → `opgate` cũng từ chối
-- tên trùng: giá trị cuối thắng, sheet chỉ hiện tên một lần
+- whitespace around `=` is accepted; a name may start with a digit
+- `export` is stripped even with no space after it (`exportHIDDEN=1` → `HIDDEN`),
+  with a warning
+- unquoted: `#` starts a comment
+- single quotes: taken absolutely literally, and may span lines
+- double quotes: only `\n`, `\"` and `\\` are decoded; `\t` stays as **two**
+  characters
+- `$VAR` / `${VAR}` outside single quotes: `op` expands it → `opgate` **refuses**
+  (see above)
+- BOM, unclosed quote, NUL: `op` rejects the whole file → `opgate` rejects it too
+- duplicate names: the last value wins, and the sheet shows the name once
 
-## Lỗi thường gặp
+## Common errors
 
-**`could not resolve item`** — sai tên vault/item/field, hoặc item nằm ở vault khác.
-Kiểm tra: `op item list --vault Dev`.
+**`could not resolve item`** — wrong vault, item or field name, or the item lives in a
+different vault. Check with `op item list --vault Dev`.
 
-**`authorization timeout`** — phiên uỷ quyền của 1Password hết hạn. Unlock lại app
-1Password rồi chạy lại.
+**`authorization timeout`** — the 1Password authorization session expired. Unlock the
+1Password app and run it again.
 
-**Biến rỗng trong process con** — reference đúng nhưng field không tồn tại trên item.
-1Password trả chuỗi rỗng chứ không báo lỗi. Kiểm tra bằng
-`op item get <item> --vault Dev --format json | jq -r '.fields[].label'` (chỉ in
-**nhãn** field, không in giá trị).
+**An empty variable in the child process** — the reference is right but the field does
+not exist on the item. 1Password returns an empty string rather than an error. Check
+with `op item get <item> --vault Dev --format json | jq -r '.fields[].label'` (which
+prints field **labels** only, never values).
 
-**Biến không expand trong chính lệnh truyền cho `opgate run`** — `opgate run -- echo
-$FOO` expand `$FOO` ở shell *ngoài*, trước khi secret tồn tại. Bọc trong subshell:
-`opgate run -- sh -c 'echo "$FOO"'`. Lưu ý 1Password sẽ mask giá trị trong output.
+**A variable not expanding inside the command you passed to `opgate run`** —
+`opgate run -- echo $FOO` expands `$FOO` in the _outer_ shell, before the secret
+exists. Wrap it in a subshell: `opgate run -- sh -c 'echo "$FOO"'`. Note that
+1Password will mask the value in the output.
 
-**Giá trị hiện ra là `<concealed by 1Password>`** — đó là masking hoạt động đúng, không
-phải lỗi. Process con nhận giá trị thật; chỉ output bị che. Đừng dùng `--no-masking`
-để "gỡ" nó.
+**The value appears as `<concealed by 1Password>`** — that is masking working
+correctly, not a bug. The child process receives the real value; only the output is
+concealed. Do not reach for `--no-masking` to "fix" it.
 
-## Nhiều môi trường
+## Several environments
 
-Một item cho mỗi môi trường, đặt tên rõ ràng:
+One item per environment, named explicitly:
 
 ```
 .env.op          -> op://Dev/cme-api/…
@@ -84,6 +88,6 @@ Một item cho mỗi môi trường, đặt tên rõ ràng:
 opgate run -f .env.staging.op -- npm run migrate
 ```
 
-Secret production không nên nằm trong tầm với của một agent trên máy dev. Nếu cần
-đưa vào CI thì dùng 1Password service account với scope đúng một vault — service
-account không có Touch ID, nên đừng dùng nó trên máy cá nhân.
+Production secrets should not be within reach of an agent on a dev machine. If CI
+needs them, use a 1Password service account scoped to exactly one vault — a service
+account has no Touch ID, so do not use one on a personal machine.

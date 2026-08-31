@@ -1,7 +1,7 @@
 {
   "name": "onepassword",
-  "description": "Truy cập secrets từ 1Password với Touch ID gate mỗi lần dùng, và giữ giá trị secret không lọt vào transcript của model.",
-  "version": "0.6.0",
+  "description": "Reach 1Password secrets behind a Touch ID gate on every use, and keep secret values out of the model transcript.",
+  "version": "0.7.0",
   "author": {
     "name": "hieuvo"
   },

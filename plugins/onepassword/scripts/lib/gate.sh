@@ -29,7 +29,7 @@ audit() {
 _verify_gate_binary() {
   [[ -x "$OPGATE_GATE_BIN" ]] || return 1
   [[ -f "$OPGATE_GATE_SUM" ]] || {
-    warn "chưa có hash tham chiếu cho gate binary — chạy \`opgate build\` để ghi lại"
+    warn "no reference hash for the gate binary yet — run \`opgate build\` to record one"
     return 0
   }
   local want got
@@ -37,10 +37,10 @@ _verify_gate_binary() {
   got=$(/usr/bin/shasum -a 256 <"$OPGATE_GATE_BIN" | cut -d' ' -f1)
   if [[ "$want" != "$got" ]]; then
     audit "TAMPER" "gate" "touchid-gate hash mismatch"
-    printf '%sopgate: gate binary đã bị thay đổi kể từ lần build.%s\n' "$_c_red" "$_c_reset" >&2
-    printf '       mong đợi %s\n       thực tế %s\n' "$want" "$got" >&2
-    printf '       Nếu bạn không cố ý build lại, đây là dấu hiệu bị can thiệp.\n' >&2
-    printf '       Xác nhận rồi chạy: opgate build\n' >&2
+    printf '%sopgate: the gate binary has changed since it was built.%s\n' "$_c_red" "$_c_reset" >&2
+    printf '       expected %s\n       actual   %s\n' "$want" "$got" >&2
+    printf '       If you did not rebuild it on purpose, this is a sign of tampering.\n' >&2
+    printf '       Once you have checked, run: opgate build\n' >&2
     return 2
   fi
   return 0
@@ -60,10 +60,10 @@ gate_require() {
   local action="$1" detail="$2" reason="$3"
 
   if [[ ! -x "$OPGATE_GATE_BIN" ]]; then
-    info "gate binary chưa có, đang build…"
+    info "no gate binary yet, building…"
     bash "$OPGATE_SCRIPT_DIR/build-gate.sh" >&2 || {
       audit "UNAVAILABLE" "$action" "$detail"
-      die "không build được gate binary"
+      die "could not build the gate binary"
     }
   fi
 
@@ -94,13 +94,13 @@ gate_require() {
       ;;
     1)
       audit "DENIED" "$action" "$detail"
-      printf '%sopgate: từ chối — không có approval, lệnh không chạy.%s\n' "$_c_red" "$_c_reset" >&2
+      printf '%sopgate: declined — no approval, so the command did not run.%s\n' "$_c_red" "$_c_reset" >&2
       exit 77
       ;;
     *)
       audit "UNAVAILABLE" "$action" "$detail"
-      printf '%sopgate: không hiện được prompt xác thực (exit %s).%s\n' "$_c_red" "$rc" "$_c_reset" >&2
-      printf '       Chạy `opgate doctor` để chẩn đoán.\n' >&2
+      printf '%sopgate: could not show the authentication prompt (exit %s).%s\n' "$_c_red" "$rc" "$_c_reset" >&2
+      printf '       Run `opgate doctor` to diagnose it.\n' >&2
       exit 78
       ;;
   esac

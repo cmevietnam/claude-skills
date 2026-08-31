@@ -37,35 +37,35 @@ usage() {
   cat >&2 <<'USAGE'
 opgate — Touch ID-gated access to 1Password secrets
 
-  opgate run    [-f FILE] -- CMD...     chạy CMD với secrets nạp vào env (mask sẵn)
-  opgate exec   VAR=op://… -- CMD...    nạp đúng một secret cho một lệnh
-  opgate inject -i TPL -o OUT           render template ra file (bắt buộc gitignored)
-  opgate copy   op://… [--seconds N]    secret -> clipboard, tự xoá sau N giây (mặc định 90)
-  opgate put    ITEM FIELD [--multiline] ghi một secret VÀO 1Password (đọc từ stdin)
+  opgate run    [-f FILE] -- CMD...     run CMD with the secrets in its env (masked)
+  opgate exec   VAR=op://… -- CMD...    load exactly one secret for one command
+  opgate inject -i TPL -o OUT           render a template to a file (must be gitignored)
+  opgate copy   op://… [--seconds N]    secret -> clipboard, cleared after N seconds (90)
+  opgate put    ITEM FIELD [--multiline] write a secret INTO 1Password (value from stdin)
 
-  opgate scan   [PATH]                  tìm .env và secret nhúng trong project (không in giá trị)
-  opgate import FILE [--yes] [--backup] đưa một file .env vào vault + sinh <file>.op
-  opgate items  [-p PROJECT]            liệt kê item trong vault theo project
+  opgate scan   [PATH]                  find .env files and embedded secrets (prints no values)
+  opgate import FILE [--yes] [--backup] move a .env into the vault and write <file>.op
+  opgate items  [-p PROJECT]            list the vault items belonging to a project
 
-  opgate list   [-f FILE]               liệt kê tên biến + ref (không bao giờ in giá trị)
-  opgate doctor [--test-gate]           kiểm tra toàn bộ setup
-  opgate audit  [-n N]                  xem nhật ký truy cập
-  opgate build                          build lại binary Touch ID gate + ghi hash
+  opgate list   [-f FILE]               list variable names + refs (never a value)
+  opgate doctor [--test-gate]           check the whole setup
+  opgate audit  [-n N]                  read the access log
+  opgate build                          rebuild the Touch ID gate binary + record its hash
 
   opgate unlock [-m MIN] PATH...        stop the Read/Grep/Bash hook asking about
                                         these exact files for MIN minutes (60)
   opgate grants                         list the open windows and their time left
   opgate lock   [PATH...]               close them (no argument = close every one)
 
-Không có `opgate read` — cố ý. Xem references/security-model.md.
-Mỗi lệnh chạm vào secret đều hỏi Touch ID; không có cache, không có cách tắt.
+There is no `opgate read` — deliberately. See references/security-model.md.
+Every command that touches a secret asks for Touch ID; no cache, no way to turn it off.
 
 `unlock`/`lock`/`grants` only affect how often the hook re-asks about a plaintext
 file already on your disk. They cannot skip a Touch ID prompt and cannot reach the
 vault. See references/security-model.md.
 
-Env: OPGATE_VAULT (Dev) · OPGATE_ENV_FILE (.env.op) · OPGATE_ALLOW_PASSWORD (1 để
-     cho phép dùng mật khẩu máy thay vân tay)
+Env: OPGATE_VAULT (Dev) · OPGATE_ENV_FILE (.env.op) · OPGATE_ALLOW_PASSWORD (1 to
+     accept the device password in place of a fingerprint)
 USAGE
 }
 
@@ -86,7 +86,7 @@ cmd_summary() {
     out+="[$a]"
   done
   if (( ${#out} > 400 )); then
-    out="${out:0:200}…(${#out} ký tự, giữa bị lược)…${out:${#out}-180}"
+    out="${out:0:200}…(${#out} chars, middle elided)…${out:${#out}-180}"
   fi
   printf '%s' "$out"
 }
@@ -103,11 +103,11 @@ ambient_refs() {
 
 require_op() {
   command -v op >/dev/null 2>&1 \
-    || die "1Password CLI chưa có. Cài: brew install --cask 1password-cli"
+    || die "the 1Password CLI is not installed. Install it: brew install --cask 1password-cli"
 }
 require_jq() {
   command -v jq >/dev/null 2>&1 \
-    || die "opgate put cần jq. Cài: brew install jq"
+    || die "opgate put needs jq. Install it: brew install jq"
 }
 
 # Run a command with a hard time limit. macOS ships no `timeout(1)`, and every
@@ -128,20 +128,20 @@ assert_safe_sink() { # <path> <resolved-path>
   local out="$1" real="$2"
   case "$real" in
     /dev/*|/proc/*)
-      die "từ chối ghi vào $real — đó không phải file, secret sẽ đi thẳng ra stdout/stderr hoặc thiết bị.
-       Cần secret cho một lệnh thì dùng: opgate run -- <cmd>" ;;
+      die "refusing to write to $real — that is not a file, so the secret would go straight to stdout/stderr or a device.
+       If a command needs the secret, use: opgate run -- <cmd>" ;;
   esac
   if [[ -L "$out" ]]; then
-    die "$out là symlink — từ chối, đích thật có thể nằm ngoài chỗ bạn nghĩ (trỏ tới $(readlink -- "$out"))"
+    die "$out is a symlink — refusing, since the real target may not be where you think (it points at $(readlink -- "$out"))"
   fi
   if [[ -e "$real" && ! -f "$real" ]]; then
-    die "$real tồn tại nhưng không phải file thường (FIFO, socket, thiết bị?) — từ chối ghi"
+    die "$real exists but is not a regular file (FIFO, socket, device?) — refusing to write"
   fi
   # A hard link passes both checks above and would redirect the overwrite into
   # another name for the same inode.
   if [[ -f "$real" ]]; then
     local links; links=$(stat -f %l -- "$real" 2>/dev/null || printf 1)
-    (( links > 1 )) && die "$real có $links hard link — ghi vào đây sẽ sửa cả những tên khác trỏ tới cùng nội dung"
+    (( links > 1 )) && die "$real has $links hard links — writing here also changes every other name pointing at the same content"
   fi
 }
 
@@ -156,7 +156,7 @@ dotenv_quote() { # <value>
   [[ -z "$v" ]] && { printf ''; return; }
   [[ "$v" =~ ^[A-Za-z0-9_./:@+-]+$ ]] && { printf '%s' "$v"; return; }
   if [[ "$v" == *'$'* || "$v" == *"$bs"* ]]; then
-    [[ "$v" == *"'"* ]] && die "không ghi được giá trị vừa chứa \$ vừa chứa nháy đơn theo cú pháp op — sửa tay"
+    [[ "$v" == *"'"* ]] && die "a value containing both \$ and a single quote cannot be expressed in op syntax — fix it by hand"
     printf "'%s'" "$v"; return
   fi
   local out="" i c
@@ -175,7 +175,7 @@ dotenv_quote() { # <value>
 resolved_path() {
   local p="$1" dir base
   dir=$(dirname -- "$p"); base=$(basename -- "$p")
-  dir=$(cd -- "$dir" 2>/dev/null && pwd -P) || die "thư mục không tồn tại: $(dirname -- "$p")"
+  dir=$(cd -- "$dir" 2>/dev/null && pwd -P) || die "no such directory: $(dirname -- "$p")"
   printf '%s/%s' "$dir" "$base"
 }
 
@@ -185,9 +185,9 @@ cmd_list() {
   local file=""
   while (( $# )); do
     case "$1" in
-      -f|--env-file) [[ $# -ge 2 ]] || die "-f cần một đường dẫn"; file="$2"; shift 2 ;;
+      -f|--env-file) [[ $# -ge 2 ]] || die "-f needs a path"; file="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
-      *) die "opgate list: tham số lạ '$1'" ;;
+      *) die "opgate list: unknown argument '$1'" ;;
     esac
   done
   file=$(resolve_env_file "$file")
@@ -204,17 +204,17 @@ cmd_list() {
     if [[ -n "$value" ]]; then
       printf '  %s = %s\n' "$name" "$value"
     else
-      printf '  %s = <giá trị literal, không in>\n' "$name"
+      printf '  %s = <literal value, not printed>\n' "$name"
     fi
     n=$((n + 1))
   done < <(env_file_pairs "$file")
 
   local literals; literals=$(env_file_literals "$file" || true)
   if [[ -n "$literals" ]]; then
-    warn "các biến sau chứa giá trị literal chứ không phải op:// ref — đó là secret plaintext trong file lẽ ra commit được:"
+    warn "these variables hold a literal value rather than an op:// ref — that is a plaintext secret in a file the docs call safe to commit:"
     printf '        %s\n' $literals >&2
   fi
-  (( n > 0 )) || warn "không có biến nào trong $file"
+  (( n > 0 )) || warn "no variables in $file"
 }
 
 cmd_run() {
@@ -222,30 +222,30 @@ cmd_run() {
   local file=""; local -a CMD=()
   while (( $# )); do
     case "$1" in
-      -f|--env-file) [[ $# -ge 2 ]] || die "opgate run: -f cần một đường dẫn"
+      -f|--env-file) [[ $# -ge 2 ]] || die "opgate run: -f needs a path"
                      file="$2"; shift 2 ;;
       -h|--help)     usage; exit 0 ;;
       --)            shift; CMD=("$@"); break ;;
-      -*)            die "opgate run: tham số lạ '$1' (cú pháp: opgate run [-f FILE] -- CMD...)" ;;
+      -*)            die "opgate run: unknown argument '$1' (usage: opgate run [-f FILE] -- CMD...)" ;;
       *)             CMD=("$@"); break ;;
     esac
   done
-  (( ${#CMD[@]} )) || die "opgate run: thiếu lệnh cần chạy — ví dụ: opgate run -- npm run dev"
+  (( ${#CMD[@]} )) || die "opgate run: no command to run — for example: opgate run -- npm run dev"
   file=$(resolve_env_file "$file")
 
   local -a vars=(); local v
   while IFS= read -r v; do [[ -n "$v" ]] && vars+=("$v"); done < <(env_file_vars "$file")
-  (( ${#vars[@]} )) || die "$file không khai báo biến nào"
+  (( ${#vars[@]} )) || die "$file declares no variables"
   # `exec` refuses PATH=op://…; `run` must too, or the file is the way around it.
   for v in "${vars[@]}"; do require_safe_var_name "$v"; done
 
   local literals; literals=$(env_file_literals "$file" || true)
-  [[ -n "$literals" ]] && warn "$(basename -- "$file") có giá trị literal ($(printf '%s ' $literals)) — op run KHÔNG che được chúng"
+  [[ -n "$literals" ]] && warn "$(basename -- "$file") has literal values ($(printf '%s ' $literals)) — op run canNOT mask those"
 
   local -a ambient=(); local a
   while IFS= read -r a; do [[ -n "$a" ]] && ambient+=("$a"); done < <(ambient_refs)
   local ambient_note=""
-  (( ${#ambient[@]} )) && ambient_note=" + từ môi trường: $(summarize_list "${ambient[@]}")"
+  (( ${#ambient[@]} )) && ambient_note=" + from the environment: $(summarize_list "${ambient[@]}")"
 
   # Shown relative to the project root, or absolute when outside it:
   # `-f ../prod/.env.op` must not look like the project's own file.
@@ -253,7 +253,7 @@ cmd_run() {
   local shown="$file"; [[ "$file" == "$root"/* ]] && shown="${file#"$root"/}"
 
   gate_require "run" "$shown: $(IFS=,; printf '%s' "${vars[*]}")${ambient_note}" \
-    "$(project_name) → chạy $(cmd_summary "${CMD[@]}") · $shown: $(summarize_list "${vars[@]}")${ambient_note}"
+    "$(project_name) → run $(cmd_summary "${CMD[@]}") · $shown: $(summarize_list "${vars[@]}")${ambient_note}"
 
   # 1Password masks these values in the child's stdout/stderr by default. Never
   # pass --no-masking here.
@@ -271,8 +271,8 @@ cmd_exec() {
                  else CMD=("$@"); break; fi ;;
     esac
   done
-  [[ -n "$spec" ]] || die "opgate exec: thiếu secret reference — ví dụ: opgate exec DB=op://Dev/app/DB -- psql"
-  (( ${#CMD[@]} )) || die "opgate exec: thiếu lệnh cần chạy"
+  [[ -n "$spec" ]] || die "opgate exec: no secret reference — for example: opgate exec DB=op://Dev/app/DB -- psql"
+  (( ${#CMD[@]} )) || die "opgate exec: no command to run"
 
   local name ref
   if [[ "$spec" == *=op://* ]]; then
@@ -280,7 +280,7 @@ cmd_exec() {
   elif [[ "$spec" == op://* ]]; then
     ref="$spec"; name="${ref##*/}"
   else
-    die "opgate exec: '$spec' không phải secret reference (mong đợi op://... hoặc VAR=op://...)"
+    die "opgate exec: '$spec' is not a secret reference (expected op://... or VAR=op://...)"
   fi
   require_safe_var_name "$name"
 
@@ -289,10 +289,10 @@ cmd_exec() {
   local -a ambient=(); local a
   while IFS= read -r a; do [[ -n "$a" ]] && ambient+=("$a"); done < <(ambient_refs)
   local ambient_note=""
-  (( ${#ambient[@]} )) && ambient_note=" + từ môi trường: $(summarize_list "${ambient[@]}")"
+  (( ${#ambient[@]} )) && ambient_note=" + from the environment: $(summarize_list "${ambient[@]}")"
 
   gate_require "exec" "$name=$ref${ambient_note}" \
-    "$(project_name) → chạy $(cmd_summary "${CMD[@]}") với $name = $ref${ambient_note}"
+    "$(project_name) → run $(cmd_summary "${CMD[@]}") with $name = $ref${ambient_note}"
 
   export "$name=$ref"
   exec op run -- "${CMD[@]}"
@@ -303,15 +303,15 @@ cmd_inject() {
   local tpl="" out="" force=0
   while (( $# )); do
     case "$1" in
-      -i|--in-file)  [[ $# -ge 2 ]] || die "-i cần một đường dẫn"; tpl="$2"; shift 2 ;;
-      -o|--out-file) [[ $# -ge 2 ]] || die "-o cần một đường dẫn"; out="$2"; shift 2 ;;
+      -i|--in-file)  [[ $# -ge 2 ]] || die "-i needs a path"; tpl="$2"; shift 2 ;;
+      -o|--out-file) [[ $# -ge 2 ]] || die "-o needs a path"; out="$2"; shift 2 ;;
       --force) force=1; shift ;;
       -h|--help) usage; exit 0 ;;
-      *) die "opgate inject: tham số lạ '$1'" ;;
+      *) die "opgate inject: unknown argument '$1'" ;;
     esac
   done
-  [[ -n "$tpl" && -n "$out" ]] || die "opgate inject cần cả -i TEMPLATE và -o OUTPUT"
-  [[ -f "$tpl" ]] || die "không có template: $tpl"
+  [[ -n "$tpl" && -n "$out" ]] || die "opgate inject needs both -i TEMPLATE and -o OUTPUT"
+  [[ -f "$tpl" ]] || die "no such template: $tpl"
 
   # Where the write really lands, not what the argument looks like. `--force` does
   # NOT relax these: a device node, FIFO or symlink target is how a "file" write
@@ -323,10 +323,10 @@ cmd_inject() {
   # behind, so refuse unless git is already set up to ignore the result.
   if ! git check-ignore -q -- "$out" 2>/dev/null; then
     if (( force )); then
-      warn "$out KHÔNG được git ignore — đang ghi vì có --force. Đừng commit file này."
+      warn "$out is NOT git ignored — writing anyway because of --force. Do not commit this file."
     else
-      die "$out chưa được git ignore. Thêm nó vào .gitignore trước, hoặc dùng --force nếu bạn chắc.
-       Cân nhắc \`opgate run\` thay thế — nó không ghi secret xuống đĩa."
+      die "$out is not git ignored. Add it to .gitignore first, or pass --force if you are sure.
+       Consider \`opgate run\` instead — it never writes a secret to disk."
     fi
   fi
 
@@ -341,9 +341,9 @@ cmd_inject() {
   # the reference count is always shown alongside.
   local scope
   if (( ${#vars[@]} )); then
-    scope="$(summarize_list "${vars[@]}") · $refcount tham chiếu op:// trong file"
+    scope="$(summarize_list "${vars[@]}") · $refcount op:// references in the file"
   else
-    scope="$refcount tham chiếu op://"
+    scope="$refcount op:// references"
   fi
 
   gate_require "inject" "$(basename -- "$tpl") -> $real" \
@@ -351,26 +351,26 @@ cmd_inject() {
 
   ( umask 077; op inject -i "$tpl" -o "$real" -f )
   chmod 600 "$real" 2>/dev/null || true
-  info "đã ghi $real (chmod 600) — xoá khi dùng xong"
+  info "wrote $real (chmod 600) — delete it when you are done"
 }
 
 cmd_copy() {
   require_op
-  command -v pbcopy >/dev/null 2>&1 || die "opgate copy cần pbcopy (macOS)"
+  command -v pbcopy >/dev/null 2>&1 || die "opgate copy needs pbcopy (macOS)"
   local ref="" seconds=90
   while (( $# )); do
     case "$1" in
-      --seconds) [[ $# -ge 2 ]] || die "--seconds cần một số"
+      --seconds) [[ $# -ge 2 ]] || die "--seconds needs a number"
                  require_int "$2" "--seconds"; seconds="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       op://*) ref="$1"; shift ;;
-      *) die "opgate copy: tham số lạ '$1'" ;;
+      *) die "opgate copy: unknown argument '$1'" ;;
     esac
   done
-  [[ -n "$ref" ]] || die "opgate copy cần một secret reference op://..."
+  [[ -n "$ref" ]] || die "opgate copy needs an op://... secret reference"
 
   gate_require "copy" "$ref" \
-    "$(project_name) → chép $ref vào clipboard trong ${seconds}s"
+    "$(project_name) → copy $ref to the clipboard for ${seconds}s"
 
   op read --no-newline "$ref" | pbcopy
 
@@ -379,8 +379,8 @@ cmd_copy() {
   # tool exists to prevent, and which also failed to clear the clipboard whenever
   # the session had expired by then.
   local placed; placed=$(pbpaste 2>/dev/null | /usr/bin/shasum -a 256 | cut -d' ' -f1)
-  info "đã chép ${ref##*/} vào clipboard; sẽ tự xoá sau ${seconds}s"
-  warn "clipboard manager hoặc Universal Clipboard có thể vẫn giữ bản sao"
+  info "copied ${ref##*/} to the clipboard; it clears itself after ${seconds}s"
+  warn "a clipboard manager or Universal Clipboard may still hold a copy"
 
   # Clear only if the clipboard still holds what we put there, so we never wipe
   # something you copied in the meantime.
@@ -400,10 +400,10 @@ cmd_put() {
       -h|--help) usage; exit 0 ;;
       *) if   [[ -z "$item"  ]]; then item="$1";  shift
          elif [[ -z "$field" ]]; then field="$1"; shift
-         else die "opgate put: tham số lạ '$1'"; fi ;;
+         else die "opgate put: unknown argument '$1'"; fi ;;
     esac
   done
-  [[ -n "$item" && -n "$field" ]] || die "cú pháp: opgate put <ITEM> <FIELD> [--multiline]  (giá trị đọc từ stdin)"
+  [[ -n "$item" && -n "$field" ]] || die "usage: opgate put <ITEM> <FIELD> [--multiline]  (the value is read from stdin)"
 
   local value
   if [[ ! -t 0 ]]; then
@@ -411,13 +411,13 @@ cmd_put() {
     # the first newline. Only one trailing newline is stripped.
     value=$(cat; printf x); value="${value%x}"; value="${value%$'\n'}"
   elif (( multiline )); then
-    printf 'Dán giá trị cho %s/%s rồi Ctrl-D:\n' "$item" "$field" >&2
+    printf 'Paste the value for %s/%s, then Ctrl-D:\n' "$item" "$field" >&2
     value=$(cat; printf x); value="${value%x}"; value="${value%$'\n'}"
   else
-    printf 'Giá trị cho %s/%s (ẩn, một dòng; dùng --multiline cho nhiều dòng): ' "$item" "$field" >&2
+    printf 'Value for %s/%s (hidden, single line; use --multiline for more): ' "$item" "$field" >&2
     IFS= read -rs value; printf '\n' >&2
   fi
-  [[ -n "$value" ]] || die "giá trị rỗng, không ghi gì"
+  [[ -n "$value" ]] || die "empty value, nothing written"
 
   # Does the item exist, and is it ours? `op item list` returns title, category
   # and tags only — no field values — so this check reads no secrets. Editing a
@@ -431,15 +431,15 @@ cmd_put() {
     local owned; owned=$(printf '%s' "$meta" \
       | jq -r 'if (.category == "SECURE_NOTE" and ((.tags // []) | index("opgate"))) then "yes" else "no" end')
     [[ "$owned" == "yes" ]] \
-      || die "item \"$item\" đã tồn tại nhưng không do opgate tạo (thiếu tag 'opgate' hoặc không phải Secure Note).
-       Sửa nó bằng template sẽ mất category/section/URL/passkey. Dùng tên item khác."
+      || die "item \"$item\" already exists but was not created by opgate (no 'opgate' tag, or not a Secure Note).
+       Editing it through a template would drop its category, sections, URLs and passkeys. Use a different item name."
   fi
   case "$field" in
-    notesPlain|opgate_source) die "'$field' là field nội bộ, không dùng làm tên biến" ;;
+    notesPlain|opgate_source) die "'$field' is an internal field name and cannot be used as a variable" ;;
   esac
 
   gate_require "put" "$item/$field" \
-    "$(project_name) → lưu $field vào item \"$item\" trong vault $OPGATE_VAULT"
+    "$(project_name) → store $field on item \"$item\" in vault $OPGATE_VAULT"
 
   # The value reaches jq through a file descriptor, never through argv — `op` warns
   # in its own help that command arguments are visible to other processes, and the
@@ -453,7 +453,7 @@ cmd_put() {
                     + [{ id: $f, type: "CONCEALED", label: $f, value: $v }]
             | .tags = (((.tags // []) + ["opgate"]) | unique)'
     ) </dev/null >/dev/null
-    info "đã cập nhật $field trên item \"$item\""
+    info "updated $field on item \"$item\""
   else
     # Fields must be top level (no section) so the reference stays
     # op://<vault>/<item>/<VAR>. notesPlain is part of the stock Secure Note
@@ -464,7 +464,7 @@ cmd_put() {
           fields: [ { id: "notesPlain", type: "STRING", purpose: "NOTES", label: "notesPlain", value: "" },
                     { id: $f, type: "CONCEALED", label: $f, value: $v } ] }'
     ) </dev/null >/dev/null
-    info "đã tạo item \"$item\" với field $field"
+    info "created item \"$item\" with field $field"
   fi
   info "reference: op://$OPGATE_VAULT/$item/$field"
 }
@@ -473,12 +473,12 @@ cmd_audit() {
   local n=20
   while (( $# )); do
     case "$1" in
-      -n) [[ $# -ge 2 ]] || die "-n cần một số"; require_int "$2" "-n"; n="$2"; shift 2 ;;
+      -n) [[ $# -ge 2 ]] || die "-n needs a number"; require_int "$2" "-n"; n="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
-      *) die "opgate audit: tham số lạ '$1'" ;;
+      *) die "opgate audit: unknown argument '$1'" ;;
     esac
   done
-  [[ -f "$OPGATE_AUDIT_LOG" ]] || { info "chưa có nhật ký ($OPGATE_AUDIT_LOG)"; return 0; }
+  [[ -f "$OPGATE_AUDIT_LOG" ]] || { info "no log yet ($OPGATE_AUDIT_LOG)"; return 0; }
   printf 'TIME\tSTATUS\tCALLER\tPROJECT\tACTION\tDETAIL\n'
   tail -n "$n" -- "$OPGATE_AUDIT_LOG"
 }
@@ -489,65 +489,65 @@ cmd_doctor() {
     case "$1" in
       --test-gate) test_gate=1; shift ;;
       -h|--help) usage; exit 0 ;;
-      *) die "opgate doctor: tham số lạ '$1'" ;;
+      *) die "opgate doctor: unknown argument '$1'" ;;
     esac
   done
 
-  info "kiểm tra setup"
+  info "checking the setup"
 
   if command -v op >/dev/null 2>&1; then
     ok "1Password CLI $(op --version 2>/dev/null)"
   else
-    bad "chưa có 1Password CLI → brew install --cask 1password-cli"; fail=1
+    bad "no 1Password CLI → brew install --cask 1password-cli"; fail=1
   fi
 
   if command -v jq >/dev/null 2>&1; then
     ok "jq $(jq --version 2>/dev/null)"
   else
-    bad "chưa có jq (opgate put cần nó) → brew install jq"; fail=1
+    bad "no jq (opgate put needs it) → brew install jq"; fail=1
   fi
 
   if command -v op >/dev/null 2>&1; then
     if op vault list --format json </dev/null >/dev/null 2>&1; then
-      ok "op ủy quyền được (desktop app integration)"
+      ok "op is authorized (desktop app integration)"
       if op vault get "$OPGATE_VAULT" --format json </dev/null >/dev/null 2>&1; then
-        ok "vault \"$OPGATE_VAULT\" tồn tại"
+        ok "vault \"$OPGATE_VAULT\" exists"
       else
-        bad "chưa có vault \"$OPGATE_VAULT\" → op vault create $OPGATE_VAULT"; fail=1
+        bad "no vault \"$OPGATE_VAULT\" → op vault create $OPGATE_VAULT"; fail=1
       fi
     else
-      bad "op không ủy quyền được → mở 1Password, Settings ▸ Developer ▸ Integrate with 1Password CLI, rồi unlock app"; fail=1
+      bad "op cannot authorize → open 1Password, Settings ▸ Developer ▸ Integrate with 1Password CLI, then unlock the app"; fail=1
     fi
   fi
 
   if [[ -x "$OPGATE_GATE_BIN" ]]; then
     local vrc=0; _verify_gate_binary >/dev/null 2>&1 || vrc=$?
     if (( vrc == 2 )); then
-      bad "gate binary khác hash đã ghi lúc build → xác nhận rồi chạy: opgate build"; fail=1
+      bad "the gate binary does not match the hash recorded at build time → check, then run: opgate build"; fail=1
     elif [[ ! -f "$OPGATE_GATE_SUM" ]]; then
       # Reported rather than swallowed: without a recorded hash the check passes
       # unconditionally, so calling the binary "healthy" would be misleading.
-      bad "chưa ghi hash tham chiếu cho gate binary → opgate build"; fail=1
+      bad "no reference hash recorded for the gate binary → opgate build"; fail=1
     else
       ok "gate binary: $OPGATE_GATE_BIN"
     fi
   else
-    bad "chưa build gate binary → opgate build"; fail=1
+    bad "the gate binary is not built → opgate build"; fail=1
   fi
 
   [[ "${OPGATE_ALLOW_PASSWORD:-}" =~ ^(1|true|yes)$ ]] \
-    && warn "OPGATE_ALLOW_PASSWORD bật — mật khẩu máy được chấp nhận thay vân tay"
+    && warn "OPGATE_ALLOW_PASSWORD is on — the device password is accepted instead of a fingerprint"
 
   local file=""
   if file=$(resolve_env_file "" 2>/dev/null); then
     local count; count=$(env_file_vars "$file" | grep -c . || true)
-    ok "$file — $count biến"
+    ok "$file — $count variables"
     local literals; literals=$(env_file_literals "$file" || true)
     if [[ -n "$literals" ]]; then
-      bad "giá trị literal (không phải op:// ref) trong $file: $(printf '%s ' $literals)"; fail=1
+      bad "literal values (not op:// refs) in $file: $(printf '%s ' $literals)"; fail=1
     fi
   else
-    warn "project này chưa có $OPGATE_ENV_FILE_DEFAULT (xem references/project-setup.md)"
+    warn "this project has no $OPGATE_ENV_FILE_DEFAULT yet (see references/project-setup.md)"
   fi
 
   local root; root=$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' "$PWD")
@@ -557,7 +557,7 @@ cmd_doctor() {
     [[ -f "$f" ]] && plaintext+=("${f#"$root"/}")
   done
   if (( ${#plaintext[@]} )); then
-    warn "còn .env plaintext trong repo: $(printf '%s ' "${plaintext[@]}")"
+    warn "plaintext .env still in the repo: $(printf '%s ' "${plaintext[@]}")"
   fi
 
   # An open window is the one piece of state that makes the guards quieter than
@@ -573,16 +573,16 @@ cmd_doctor() {
   fi
 
   if (( test_gate )); then
-    info "đang thử prompt xác thực — chạm vân tay để xác nhận…"
+    info "testing the authentication prompt — touch the sensor to confirm…"
     if gate_require "doctor" "self-test" "$(project_name) → opgate doctor self-test"; then
-      ok "prompt xác thực hoạt động"
+      ok "the authentication prompt works"
     fi
   fi
 
   if (( fail )); then
-    printf '\n' >&2; warn "có mục chưa đạt (xem ✘ ở trên)"; return 1
+    printf '\n' >&2; warn "some checks failed (see ✘ above)"; return 1
   fi
-  printf '\n' >&2; info "tất cả ổn"
+  printf '\n' >&2; info "all good"
 }
 
 cmd_scan() {
@@ -598,7 +598,7 @@ cmd_scan() {
   if [[ -n "$target" ]]; then root=$(cd -- "$target" && pwd -P)
   else root=$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' "$PWD"); fi
   local project; project=$(basename -- "$root")
-  [[ "$root" == *:* ]] && die "đường dẫn project chứa ':' ($root) — không phân tích output file:line an toàn được; chuyển project sang đường dẫn khác"
+  [[ "$root" == *:* ]] && die "the project path contains ':' ($root) — file:line output cannot be parsed safely; move the project somewhere else"
 
   printf 'project: %s\n%s\n\n' "$project" "$root"
 
@@ -610,10 +610,10 @@ cmd_scan() {
   local vault_titles=""
   vault_titles=$(with_timeout 5 op item list --vault "$OPGATE_VAULT" --format json 2>/dev/null \
                  | jq -r '.[].title' 2>/dev/null) || vault_titles=""
-  [[ -n "$vault_titles" ]] || info "không đọc được vault (khoá hoặc chưa cấu hình) — bỏ qua cột trạng thái"
+  [[ -n "$vault_titles" ]] || info "cannot read the vault (locked or not configured) — skipping the status column"
 
   if (( ${#envfiles[@]} == 0 )); then
-    printf 'không tìm thấy file .env nào\n'
+    printf 'no .env files found\n'
   else
     printf 'file env (%d):\n' "${#envfiles[@]}"
     local i n v kind s c pl em item rel
@@ -635,18 +635,18 @@ cmd_scan() {
       if [[ -z "$vault_titles" ]]; then
         printf '\n'
       elif printf '%s' "$vault_titles" | grep -qxF "$item"; then
-        printf '  [đã có trong vault]\n'
+        printf '  [already in the vault]\n'
       else
-        printf '  [chưa có]\n'
+        printf '  [not yet]\n'
       fi
-      printf '     %d cần vault · %d config · %d placeholder · %d rỗng\n' "$s" "$c" "$pl" "$em"
+      printf '     %d to vault · %d config · %d placeholder · %d empty\n' "$s" "$c" "$pl" "$em"
     done
-    printf '\n  đưa vào vault:  opgate import <file>\n'
+    printf '\n  move into the vault:  opgate import <file>\n'
   fi
 
   (( env_only )) && return 0
 
-  printf '\nsecret nhúng trong file khác:\n'
+  printf '\nsecrets embedded in other files:\n'
   local hits=0 f2 ln label
   # One pass over the whole file list per pattern, rather than every pattern
   # against every file: the old shape re-read each selected file 11 times.
@@ -657,11 +657,11 @@ cmd_scan() {
   done < <(find_config_files "$root" | scan_embedded_list | sort -u)
 
   if (( hits == 0 )); then
-    printf '  không thấy gì\n'
+    printf '  nothing found\n'
   else
-    printf '\n  %d chỗ. Đây là giá trị nằm trong file cấu hình hoặc source, không phải\n' "$hits"
-    printf '  biến môi trường — `opgate import` KHÔNG tự sửa được vì phải đổi code.\n'
-    printf '  Nếu là credential thật thì rotate; opgate chỉ nói chỗ, không in giá trị.\n'
+    printf '\n  %d hits. These are values sitting in config or source files, not\n' "$hits"
+    printf '  environment variables — `opgate import` canNOT fix them, since that needs a code change.\n'
+    printf '  Rotate anything that is a real credential; opgate reports the location, never the value.\n'
   fi
 }
 
@@ -670,18 +670,18 @@ cmd_import() {
   local file="" project="" item="" assume_yes=0 dry=0 want_backup=0 force=0
   while (( $# )); do
     case "$1" in
-      -p|--project) [[ $# -ge 2 ]] || die "--project cần một tên"; project="$2"; shift 2 ;;
-      --item)       [[ $# -ge 2 ]] || die "--item cần một tên"; item="$2"; shift 2 ;;
+      -p|--project) [[ $# -ge 2 ]] || die "--project needs a name"; project="$2"; shift 2 ;;
+      --item)       [[ $# -ge 2 ]] || die "--item needs a name"; item="$2"; shift 2 ;;
       -y|--yes)     assume_yes=1; shift ;;
       --dry-run)    dry=1; shift ;;
       --backup)     want_backup=1; shift ;;
       --force)      force=1; shift ;;
       -h|--help)    usage; exit 0 ;;
-      *) [[ -z "$file" ]] || die "opgate import: chỉ nhận một file"; file="$1"; shift ;;
+      *) [[ -z "$file" ]] || die "opgate import: takes exactly one file"; file="$1"; shift ;;
     esac
   done
-  [[ -n "$file" ]] || die "cú pháp: opgate import <file .env> [--project NAME] [--item NAME] [--yes]"
-  [[ -f "$file" ]] || die "không có file: $file"
+  [[ -n "$file" ]] || die "usage: opgate import <.env file> [--project NAME] [--item NAME] [--yes]"
+  [[ -f "$file" ]] || die "no such file: $file"
   file=$(resolved_path "$file")
 
   local root; root=$(git rev-parse --show-toplevel 2>/dev/null || dirname -- "$file")
@@ -690,12 +690,12 @@ cmd_import() {
   # An item title feeds op:// references and the generated file. A slash makes an
   # invalid reference; a newline could inject a second assignment into .env.op.
   [[ "$item" =~ ^[A-Za-z0-9._-]+$ ]] \
-    || die "tên item không hợp lệ: '$item' — chỉ chấp nhận chữ, số, và . _ -"
+    || die "invalid item name: '$item' — only letters, digits and . _ - are accepted"
   [[ "$project" =~ ^[A-Za-z0-9._-]+$ ]] \
-    || die "tên project không hợp lệ: '$project'"
+    || die "invalid project name: '$project'"
 
   parse_env_file "$file"
-  (( ${#OPG_NAMES[@]} )) || die "$file không có biến nào"
+  (( ${#OPG_NAMES[@]} )) || die "$file has no variables"
 
   # Decide what goes to the vault. Ambiguous entries are settled by you, and the
   # question shows the SHAPE of the value, never the value: deciding does not
@@ -724,11 +724,11 @@ cmd_import() {
     elif (( dry )); then
       : # listed separately below; a dry run must not prompt
     elif [[ -t 0 ]]; then
-      printf '\n%d biến không phân loại được chắc chắn. Giá trị KHÔNG được in ra —\n' "${#ambiguous_idx[@]}" >&2
-      printf 'chỉ mô tả hình dạng, vì in ra là đưa nó vào transcript.\n\n' >&2
+      printf '\n%d variables could not be classified with confidence. The values are NOT printed —\n' "${#ambiguous_idx[@]}" >&2
+      printf 'only their shape, because printing one puts it in the transcript.\n\n' >&2
       for i in ${ambiguous_idx[@]+"${ambiguous_idx[@]}"}; do
         printf '  %s — %s\n' "${OPG_NAMES[$i]}" "$(describe_value "${OPG_VALUES[$i]}")" >&2
-        printf '    đưa vào vault? [Y/n] ' >&2
+        printf '    move into the vault? [Y/n] ' >&2
         # Read from stdin, which the `-t 0` above proved is a terminal. Reading
         # /dev/tty instead looked equivalent and was not: it opens successfully in
         # an agent session with a controlling terminal nobody is watching, returns
@@ -744,8 +744,8 @@ cmd_import() {
       for i in ${ambiguous_idx[@]+"${ambiguous_idx[@]}"}; do
         printf '  %s — %s\n' "${OPG_NAMES[$i]}" "$(describe_value "${OPG_VALUES[$i]}")" >&2
       done
-      die "${#ambiguous_idx[@]} biến ở trên cần bạn quyết, nhưng không có terminal để hỏi.
-       Chạy lại trong terminal, hoặc thêm --yes để đưa tất cả chúng vào vault."
+      die "${#ambiguous_idx[@]} variables above need your decision, and there is no terminal to ask on.
+       Run this in a terminal, or pass --yes to send all of them to the vault."
     fi
   fi
 
@@ -753,27 +753,27 @@ cmd_import() {
   for i in ${vault_idx[@]+"${vault_idx[@]}"}; do vault_names+=("${OPG_NAMES[$i]}"); done
 
   printf '\n%s\n' "$file" >&2
-  printf '  vault  : %s -> op://%s/%s/<VAR>\n' "${#vault_idx[@]} biến" "$OPGATE_VAULT" "$item" >&2
-  printf '  literal: %s giữ nguyên trong file .op\n' "${#literal_idx[@]} biến" >&2
-  (( ${#ambiguous_idx[@]} )) && printf '  chờ hỏi: %s\n' "${#ambiguous_idx[@]} biến" >&2
+  printf '  vault  : %s -> op://%s/%s/<VAR>\n' "${#vault_idx[@]} variables" "$OPGATE_VAULT" "$item" >&2
+  printf '  literal: %s kept as-is in the .op file\n' "${#literal_idx[@]} variables" >&2
+  (( ${#ambiguous_idx[@]} )) && printf '  to ask : %s\n' "${#ambiguous_idx[@]} variables" >&2
 
   if (( dry )); then
-    printf '\n  --dry-run: không ghi gì\n' >&2
+    printf '\n  --dry-run: nothing was written\n' >&2
     for i in ${vault_idx[@]+"${vault_idx[@]}"}; do printf '    vault     %s\n' "${OPG_NAMES[$i]}" >&2; done
     for i in ${ambiguous_idx[@]+"${ambiguous_idx[@]}"}; do
-      printf '    sẽ hỏi   %s — %s\n' "${OPG_NAMES[$i]}" "$(describe_value "${OPG_VALUES[$i]}")" >&2
+      printf '    would ask %s — %s\n' "${OPG_NAMES[$i]}" "$(describe_value "${OPG_VALUES[$i]}")" >&2
     done
     for i in ${literal_idx[@]+"${literal_idx[@]}"}; do printf '    literal   %s\n' "${OPG_NAMES[$i]}" >&2; done
     return 0
   fi
-  (( ${#vault_idx[@]} )) || die "không có biến nào cần đưa vào vault"
+  (( ${#vault_idx[@]} )) || die "no variables need to go to the vault"
 
   # Reserved field names must not be importable as variables: `opgate_source`
   # carries provenance and `notesPlain` is the Secure Note's required field.
   local i
   for (( i = 0; i < ${#OPG_NAMES[@]}; i++ )); do
     case "${OPG_NAMES[$i]}" in
-      notesPlain|opgate_source) die "'${OPG_NAMES[$i]}' là field nội bộ của opgate, không dùng làm tên biến" ;;
+      notesPlain|opgate_source) die "'${OPG_NAMES[$i]}' is an internal opgate field and cannot be used as a variable" ;;
     esac
     require_safe_var_name "${OPG_NAMES[$i]}"
   done
@@ -789,13 +789,16 @@ cmd_import() {
   local opreal; opreal=$(resolved_path "$opfile")
   assert_safe_sink "$opfile" "$opreal"
   if [[ -f "$opreal" ]] && (( ! force )); then
-    local prev; prev=$(sed -n 's/^# nguồn: //p' "$opreal" | head -1)
+    # Both markers on purpose: the header used to be written in Vietnamese, and an
+    # .env.op generated before that changed must still be recognised as ours rather
+    # than reported as "not generated by opgate".
+    local prev; prev=$(sed -n -e 's/^# source: //p' -e 's/^# nguồn: //p' "$opreal" | head -1)
     if [[ "$prev" != "${file#"$root"/}" ]]; then
-      die "$opfile đã tồn tại$( [[ -n "$prev" ]] && printf ' (sinh từ %s)' "$prev" || printf ' và không do opgate sinh') — ghi đè sẽ mất nó. Dùng --force nếu bạn chắc."
+      die "$opfile already exists$( [[ -n "$prev" ]] && printf ' (generated from %s)' "$prev" || printf ' and was not generated by opgate') — overwriting would lose it. Pass --force if you are sure."
     fi
   fi
   local optmp; optmp="${opreal}.tmp.$$"
-  [[ -e "$optmp" || -L "$optmp" ]] && die "$optmp đã tồn tại — xoá nó trước"
+  [[ -e "$optmp" || -L "$optmp" ]] && die "$optmp already exists — remove it first"
 
   # Ownership and collision, from metadata only. `op item list` returns title,
   # category and tags — no field values — so this pre-gate read exposes no
@@ -809,22 +812,22 @@ cmd_import() {
     local owned; owned=$(printf '%s' "$meta" \
       | jq -r 'if (.category == "SECURE_NOTE" and ((.tags // []) | index("opgate"))) then "yes" else "no" end')
     [[ "$owned" == "yes" ]] \
-      || die "item \"$item\" đã tồn tại trong vault $OPGATE_VAULT nhưng không phải do opgate tạo
-       (thiếu tag 'opgate' hoặc không phải Secure Note). Ghi đè sẽ làm mất category,
-       section, URL và passkey của nó. Dùng --item <tên khác>."
+      || die "item \"$item\" already exists in vault $OPGATE_VAULT but was not created by opgate
+       (no 'opgate' tag, or not a Secure Note). Overwriting would drop its category,
+       sections, URLs and passkeys. Use --item <another name>."
 
     local prev_src this_src="${file#"$root"/}"
     prev_src=$(op item get "$item" --vault "$OPGATE_VAULT" --fields label=opgate_source </dev/null 2>/dev/null || true)
     if [[ "$prev_src" != "$this_src" ]] && (( ! force )); then
       if [[ -n "$prev_src" ]]; then
-        die "item \"$item\" đang giữ secret của $prev_src, còn đây là $this_src.
-       Hai file khác nhau cùng suy ra một tên item. Dùng --item <tên khác>, hoặc
-       --force nếu bạn thật sự muốn gộp chúng."
+        die "item \"$item\" already holds the secrets from $prev_src, and this is $this_src.
+       Two different files derive the same item name. Use --item <another name>, or
+       --force if you really do want them merged."
       else
         # No provenance: created before it was recorded. The collision it could
         # hide (a/b vs a-b) is exactly the one we cannot detect, so ask.
-        die "item \"$item\" đã tồn tại nhưng không ghi nguồn (tạo trước khi có tính năng này).
-       Không xác định được nó thuộc file nào. Dùng --force nếu chắc chắn đúng là $this_src."
+        die "item \"$item\" exists but records no source (created before that was tracked).
+       There is no way to tell which file it belongs to. Pass --force if you are sure it is $this_src."
       fi
     fi
   fi
@@ -833,7 +836,7 @@ cmd_import() {
   # Touch ID sheets for a real project, and a control you turn off is worth less
   # than one you keep. The sheet lists every variable being written.
   gate_require "import" "$item: $(IFS=,; printf '%s' "${vault_names[*]}")" \
-    "$(project_name) → nhập ${file#"$root"/} vào item \"$item\": $(summarize_list "${vault_names[@]}")$( (( exists )) && printf ' · gộp vào item có sẵn')"
+    "$(project_name) → import ${file#"$root"/} into item \"$item\": $(summarize_list "${vault_names[@]}")$( (( exists )) && printf ' · merging into an existing item')"
 
   # --- approved: read the full item, merge, write vault, write .op ---
   local item_json
@@ -863,18 +866,18 @@ cmd_import() {
 
   if (( exists )); then
     op item edit "$item" --vault "$OPGATE_VAULT" --template <(printf '%s' "$item_json") </dev/null >/dev/null
-    info "cập nhật item \"$item\" (${#vault_idx[@]} biến)"
+    info "updating item \"$item\" (${#vault_idx[@]} variables)"
   else
     op item create --vault "$OPGATE_VAULT" --template <(printf '%s' "$item_json") </dev/null >/dev/null
-    info "tạo item \"$item\" (${#vault_idx[@]} biến), tag: opgate, project:$project"
+    info "creating item \"$item\" (${#vault_idx[@]} variables), tags: opgate, project:$project"
   fi
 
   # Temporary file then mv, so an interrupted run leaves no half-written file.
   {
-    printf '# sinh bởi `opgate import`\n'
-    printf '# nguồn: %s\n' "${file#"$root"/}"
-    printf '# commit được: chỉ chứa op:// reference và giá trị không bí mật.\n'
-    printf '# chạy: opgate run -f %s -- <lệnh>\n\n' "$(basename -- "$opfile")"
+    printf '# generated by `opgate import`\n'
+    printf '# source: %s\n' "${file#"$root"/}"
+    printf '# safe to commit: op:// references and non-secret values only.\n'
+    printf '# run: opgate run -f %s -- <cmd>\n\n' "$(basename -- "$opfile")"
     local j in_vault
     for (( i = 0; i < ${#OPG_NAMES[@]}; i++ )); do
       in_vault=0
@@ -895,14 +898,14 @@ cmd_import() {
     mkdir -p -- "$backup_dir"; chmod 700 "$backup_dir" 2>/dev/null || true
     local backup="$backup_dir/${item}-$(date +%Y%m%d-%H%M%S)-$$.env"
     ( umask 077; cp -- "$file" "$backup" )
-    warn "sao lưu plaintext: $backup — xoá khi không cần nữa"
+    warn "plaintext backup: $backup — delete it once you no longer need it"
   fi
 
   if ! git check-ignore -q -- "$file" 2>/dev/null; then
-    warn "$(basename -- "$file") CHƯA được git ignore — thêm vào .gitignore trước khi commit"
+    warn "$(basename -- "$file") is NOT git ignored — add it to .gitignore before committing"
   fi
-  info "kiểm tra:  opgate run -f $opfile -- <lệnh>"
-  info "bản gốc còn nguyên; xoá sau khi chắc chắn mọi thứ chạy: rm $file"
+  info "check it:  opgate run -f $opfile -- <cmd>"
+  info "the original is untouched; delete it once you are sure everything works: rm $file"
 }
 
 cmd_items() {
@@ -910,9 +913,9 @@ cmd_items() {
   local project=""
   while (( $# )); do
     case "$1" in
-      -p|--project) [[ $# -ge 2 ]] || die "-p cần một tên"; project="$2"; shift 2 ;;
+      -p|--project) [[ $# -ge 2 ]] || die "-p needs a name"; project="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
-      *) die "opgate items: tham số lạ '$1'" ;;
+      *) die "opgate items: unknown argument '$1'" ;;
     esac
   done
   [[ -n "$project" ]] || project=$(project_name)
@@ -1017,8 +1020,8 @@ case "$sub" in
   audit)  cmd_audit  "$@" ;;
   doctor) cmd_doctor "$@" ;;
   build)  bash "$OPGATE_SCRIPT_DIR/build-gate.sh" ;;
-  read)   die "opgate không có lệnh \`read\` — cố ý. In secret ra stdout sẽ đưa nó vào transcript của model.
-       Dùng \`opgate run -- <cmd>\` (nạp vào env), \`opgate copy <ref>\` (clipboard), hoặc \`opgate inject\` (file gitignored)." ;;
+  read)   die "opgate has no \`read\` command — deliberately. Printing a secret to stdout puts it in the model transcript.
+       Use \`opgate run -- <cmd>\` (into a child env), \`opgate copy <ref>\` (clipboard), or \`opgate inject\` (a gitignored file)." ;;
   help|-h|--help) usage ;;
-  *) printf 'opgate: không rõ lệnh "%s"\n\n' "$sub" >&2; usage; exit 64 ;;
+  *) printf 'opgate: unknown command "%s"\n\n' "$sub" >&2; usage; exit 64 ;;
 esac

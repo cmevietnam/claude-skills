@@ -122,7 +122,7 @@ check "$bash_guard" command 'cut -d= -f2 .env.example'               pass
 check "$bash_guard" command 'python3 -c "print(1)"'                  pass
 check "$bash_guard" command 'base64 logo.png'                        pass
 
-echo "VÒNG 3: lệnh op in ra credential/token"
+echo "round 3 — op subcommands that print a credential or token"
 check "$bash_guard" command 'op signin --raw'                          deny
 check "$bash_guard" command 'op account add --signin --raw'            deny
 check "$bash_guard" command 'op service-account create ci --vault Dev:read_items' deny
@@ -131,7 +131,7 @@ check "$bash_guard" command 'op item share prod-login'                 deny
 check "$bash_guard" command 'op signin'                                pass
 check "$bash_guard" command 'op account list'                          pass
 
-echo "VÒNG 3: false positive từ tách = và , đã bỏ"
+echo "round 3 — the false positives from splitting on = and , are gone"
 check "$bash_guard" command 'echo op=read'                             pass
 check "$bash_guard" command 'printf op,read'                           pass
 check "$bash_guard" command 'cat .env,example'                         pass
@@ -144,21 +144,21 @@ check "$bash_guard" command 'source .env && env'                       ask
 check "$bash_guard" command 'cat .envrc'                               ask
 check "$bash_guard" command 'cat ~/.git-credentials'                   ask
 
-echo "VÒNG 3: 'op read' cách xa nhau không phải lời gọi"
+echo "round 3 — op and read far apart is prose, not an invocation"
 check "$bash_guard" command 'git commit -m "docs: explain why op is safe and what the hooks actually read"' pass
 check "$bash_guard" command 'op --account work --format json read op://a/b/c' deny
 
-echo "VÒNG 3: hook không được timeout trên lệnh lớn"
+echo "round 3 — the hook must not time out on a huge command"
 big=$(python3 -c 'print(" ".join(["option"]*6000))')
 start=$(date +%s)
 decision "$bash_guard" "$(json command "$big")" >/dev/null
 elapsed=$(( $(date +%s) - start ))
 if (( elapsed < 4 )); then pass=$((pass+1)); printf '  ok   6000 token trong %ds\n' "$elapsed"
-else fail=$((fail+1)); printf '  FAIL 6000 token mất %ds (timeout hook là 10s)\n' "$elapsed"; fi
+else fail=$((fail+1)); printf '  FAIL 6000 tokens took %ds (the hook timeout is 10s)\n' "$elapsed"; fi
 big=$(python3 -c 'print(" ".join(["option"]*6000) + " && bash -c \"op read op://a/b/c\"")')
 check "$bash_guard" command "$big" deny
 
-echo "VÒNG 3: guard-grep"
+echo "round 3 — guard-grep"
 grep_guard="$dir/guard-grep.sh"
 gchk() { # <json> <expected> <label>
   local got; got=$(decision "$grep_guard" "$1"); got=${got:-pass}
