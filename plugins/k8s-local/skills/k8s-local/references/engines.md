@@ -9,8 +9,10 @@ a few that do not.
 **How an image reaches the node.** Only Rancher Desktop and Docker Desktop share
 a daemon with the cluster, so a plain `docker build` is enough. kind, k3d and
 minikube run the cluster inside their own container or VM with a separate image
-store, and a build on the host is invisible to it — the pod sits in
-`ErrImageNeverPull` on an image you can see in `docker images`.
+store, and a build on the host is invisible to it — under the shipped
+`IfNotPresent` the kubelet tries the registry and the pod sits in
+`ImagePullBackOff` on an image you can see in `docker images`. (`ErrImageNeverPull`
+is the same situation under `imagePullPolicy: Never`.)
 
 **Which ingress controller is present.** The k3s-based engines — Rancher Desktop
 and k3d — deploy Traefik by default. Docker Desktop, kind and minikube ship none

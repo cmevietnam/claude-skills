@@ -21,11 +21,13 @@
 
   "_secret": [
     "klocal never touches secret values. It runs `hook` from the project root with",
-    "KL_NAMESPACE, KL_SECRET and KL_SECRET_ENV_FILE exported, and the hook is",
-    "responsible for creating the Secret. Piping a vault straight into kubectl keeps",
-    "every value out of both the filesystem and the model transcript, e.g.",
+    "KL_NAMESPACE, KL_SECRET, KL_SECRET_ENV_FILE and KL_KUBECTL exported, and the",
+    "hook is responsible for creating the Secret. Piping a vault straight into",
+    "kubectl keeps every value out of both the filesystem and the model transcript:",
     "  opgate run -f api/.env.op -- ./deploy/scripts/local-secret.sh",
-    "Set hook to \"\" if the project has no secrets yet."
+    "Inside the hook use $KL_KUBECTL, not bare kubectl: it carries the --context",
+    "klocal verified, whereas a bare kubectl follows whatever the kubeconfig says",
+    "at that moment. Set hook to \"\" if the project has no secrets yet."
   ],
   "secret": {
     "name": "PROJECT-api-secrets",

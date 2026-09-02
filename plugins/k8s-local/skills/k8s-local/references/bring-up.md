@@ -73,11 +73,14 @@ in that child process's environment and go straight into `kubectl` on stdin.
 opgate run -f api/.env.op -- ./deploy/scripts/local-secret.sh
 ```
 
-and inside that script:
+and inside that script — note `$KL_KUBECTL`, not bare `kubectl`. klocal exports
+it already pinned to the context it verified; a bare `kubectl` in a hook is a
+separate process and follows the kubeconfig as it stands right then, which after
+a long build may no longer be the cluster that was checked:
 
 ```bash
-kubectl create secret generic "$KL_SECRET" -n "$KL_NAMESPACE" "${args[@]}" \
-  --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+$KL_KUBECTL create secret generic "$KL_SECRET" -n "$KL_NAMESPACE" "${args[@]}" \
+  --dry-run=client -o yaml | $KL_KUBECTL apply -f - >/dev/null
 ```
 
 `create --dry-run=client | apply` is what makes it idempotent — plain
@@ -97,16 +100,32 @@ keys, a test secret. Generating them on every run is the bug:
 So: read what the Secret already holds, and fall back to a generator only when
 it is absent.
 
+The naive version of this is worse than none, because `|| true` turns _every_
+failure into "absent" and then generates: an RBAC denial or a momentary API
+error rotates the very credential you were protecting. Separate the three cases.
+
 ```bash
 keep() { # <key> <generator...>
-  local v
-  v=$(kubectl get secret "$SECRET" -n "$NS" -o "jsonpath={.data.$1}" 2>/dev/null \
-      | base64 -d 2>/dev/null || true)
-  [ -n "$v" ] && { printf '%s' "$v"; return 0; }
-  shift; "$@"
+  local key=$1 exists v; shift
+  # --ignore-not-found is the discriminator: a missing Secret is empty output
+  # with exit 0, while a denied or failed read is a non-zero exit.
+  exists=$($KUBECTL get secret "$SECRET" -n "$NS" -o name --ignore-not-found) \
+    || { echo "cannot read secret/$SECRET — refusing to generate" >&2; exit 1; }
+  [ -n "$exists" ] || { "$@"; return; }          # genuinely absent
+  # Range over the keys: {.data.tls.crt} would look up a nested path and come
+  # back empty, so any key containing a dot reads as absent.
+  $KUBECTL get secret "$SECRET" -n "$NS" \
+      -o "go-template={{range \$k, \$v := .data}}{{\$k}}{{\"\n\"}}{{end}}" \
+    | grep -Fxq -- "$key" || { "$@"; return; }   # key not set
+  v=$($KUBECTL get secret "$SECRET" -n "$NS" -o "go-template={{index .data \"$key\"}}")
+  printf '%s' "$v" | base64 -d                   # present (possibly empty)
 }
 REDIS_PASSWORD=$(keep REDIS_PASSWORD openssl rand -hex 16)
 ```
+
+`$KUBECTL` here is `klocal`'s `$KL_KUBECTL`, which carries `--context`. A hook
+that calls bare `kubectl` is not covered by klocal's pin and will follow whatever
+the kubeconfig says at that moment.
 
 If a value does change anyway, restart the workload that holds the stale copy in
 the same run.
@@ -138,9 +157,19 @@ END $$;
 -- whole cluster, which reads every row RLS was meant to hide.
 ALTER ROLE app_role LOGIN PASSWORD 'app_local_only'
   NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
--- Attribute checks only look at the role itself. Inherited membership in a
--- privileged role bypasses them entirely, so strip memberships too.
-REVOKE ALL ON SCHEMA public FROM app_role;
+-- Attribute checks only look at the role itself, and membership in a privileged
+-- role bypasses them. REVOKE ... ON SCHEMA does NOT remove membership — only
+-- REVOKE <role> FROM does. Drop every inherited grant explicitly:
+DO $$
+DECLARE g record;
+BEGIN
+  FOR g IN SELECT r.rolname FROM pg_auth_members m
+             JOIN pg_roles r ON r.oid = m.roleid
+            WHERE m.member = 'app_role'::regrole
+  LOOP
+    EXECUTE format('REVOKE %I FROM app_role', g.rolname);
+  END LOOP;
+END $$;
 GRANT CONNECT ON DATABASE app_dev TO app_role;
 -- Without USAGE on the schema, the role cannot resolve a single table name —
 -- and an app on a non-public schema fails here with a confusing "relation does
@@ -154,14 +183,15 @@ ALTER DEFAULT PRIVILEGES FOR ROLE owner GRANT USAGE, SELECT, UPDATE ON SEQUENCES
 Then **assert it**, and fail the bring-up if the assertion does not hold:
 
 ```bash
-# Attributes AND memberships: a role that is merely a member of a superuser role
-# has rolsuper = false and every superuser privilege.
+# Attributes AND membership, INCLUDING indirect chains. A direct-membership check
+# misses `GRANT postgres TO bridge; GRANT bridge TO app_role;` — app_role can
+# still SET ROLE postgres through bridge. pg_has_role follows the whole chain.
 [ "$(psql -tAc "SELECT rolsuper OR rolbypassrls OR rolreplication OR NOT rolcanlogin
-                       OR pg_has_role('app_role', 'pg_read_all_data', 'USAGE')
-                       OR EXISTS (SELECT 1 FROM pg_auth_members m
-                                  JOIN pg_roles g ON g.oid = m.roleid
-                                  WHERE m.member = pg_roles.oid
-                                    AND (g.rolsuper OR g.rolbypassrls))
+                       OR EXISTS (SELECT 1 FROM pg_roles g
+                                   WHERE (g.rolsuper OR g.rolbypassrls
+                                          OR g.rolname = 'pg_read_all_data')
+                                     AND g.rolname <> 'app_role'
+                                     AND pg_has_role('app_role', g.oid, 'USAGE'))
                 FROM pg_roles WHERE rolname='app_role'")" = "f" ] \
   || { echo "FAIL: app_role is not a safe login role" >&2; exit 1; }
 ```

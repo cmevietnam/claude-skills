@@ -15,6 +15,10 @@
 # The address is the actual proof: a cluster whose API server is on loopback or
 # a private network is local in the sense that matters here.
 kl_context_name_is_local() { # <context>
+  # Whitespace here would split the kind/k3d loader command built from this name.
+  case "$1" in
+    *[[:space:]]*) return 1 ;;
+  esac
   case "$1" in
     rancher-desktop | docker-desktop | minikube | colima) return 0 ;;
     kind-* | k3d-*) return 0 ;;
@@ -22,42 +26,155 @@ kl_context_name_is_local() { # <context>
   esac
 }
 
+# One field of the CURRENT-ly selected cluster, via --minify.
+#
+# The context name is passed as a FLAG VALUE, never interpolated into the
+# JSONPath. Building "jsonpath={.contexts[?(@.name=='$ctx')]...}" let a context
+# named  kind-x')].context.cluster}{.contexts[0].context.cluster}{.contexts[?(@.name=='x
+# close the expression and append two more: kubectl composes {...}{...}, so the
+# host check could be pointed at a loopback decoy while every real call used the
+# remote context. Verified: composed JSONPath does evaluate all parts.
+kl_cluster_field() { # <context> <jsonpath-after-.cluster>
+  kubectl config view --minify --context "$1" -o \
+    "jsonpath={.clusters[0].cluster.$2}" 2>/dev/null || true
+}
+
 # Host part of a cluster's API server URL. Handles the bracketed IPv6 form.
 kl_context_server_host() { # <context>
-  local ctx=$1 cluster server host
-  cluster=$(kubectl config view -o \
-    "jsonpath={.contexts[?(@.name=='$ctx')].context.cluster}" 2>/dev/null || true)
-  [ -n "$cluster" ] || return 1
-  server=$(kubectl config view -o \
-    "jsonpath={.clusters[?(@.name=='$cluster')].cluster.server}" 2>/dev/null || true)
+  local server host
+  server=$(kl_cluster_field "$1" server)
   [ -n "$server" ] || return 1
   host=${server#*://}
   host=${host%%/*}
   case "$host" in
-    "["*) host=${host#[}; host=${host%%]*} ;; # [::1]:6443
+    "["*)
+      host=${host#[}
+      host=${host%%]*}
+      ;; # [::1]:6443
     *) host=${host%%:*} ;;
   esac
   printf '%s\n' "$host"
 }
 
+# A loopback `server` proves nothing when the connection is tunnelled elsewhere:
+# kubectl sends every request through proxy-url, and tls-server-name changes which
+# certificate is accepted. Neither is anything a local cluster needs, so their
+# presence is a refusal rather than something to interpret.
+kl_context_has_indirection() { # <context> -> 0 if proxy-url/tls-server-name set
+  local p t
+  p=$(kl_cluster_field "$1" proxy-url)
+  t=$(kl_cluster_field "$1" tls-server-name)
+  [ -n "$p" ] || [ -n "$t" ]
+}
+
 # Loopback, link-local, or RFC1918. Deliberately conservative: an address this
 # does not recognise is treated as remote.
+#
+# The private ranges are matched only against a real dotted-decimal literal, never
+# as a text prefix. A glob like 10.* also matches `10.prod.example.com`, and
+# `127.*` matches `127.attacker.net` — a remote cluster would have walked straight
+# through the one check that is supposed to be unfakeable.
 kl_host_is_local() { # <host>
-  case "$1" in
-    localhost | localhost.localdomain | ::1 | 0.0.0.0) return 0 ;;
-    127.*) return 0 ;;
-    10.*) return 0 ;;
-    192.168.*) return 0 ;;
-    172.1[6-9].* | 172.2[0-9].* | 172.3[01].*) return 0 ;;
-    169.254.*) return 0 ;;
-    fe80:* | fd*: | fc*:) return 0 ;;
-    *.local | host.docker.internal | kubernetes.docker.internal | host.lima.internal) return 0 ;;
+  local h=$1 o1 o2
+  case "$h" in
+    localhost | localhost.localdomain | host.docker.internal \
+      | kubernetes.docker.internal | host.lima.internal) return 0 ;;
+    *.local) return 0 ;; # mDNS
+  esac
+
+  # IPv6: loopback, link-local fe80::/10, unique-local fc00::/7.
+  case "$h" in
+    *:*)
+      case "$h" in
+        ::1 | 0:0:0:0:0:0:0:1) return 0 ;;
+        fe8*:* | fe9*:* | fea*:* | feb*:*) return 0 ;;
+        fc*:* | fd*:*) return 0 ;;
+      esac
+      return 1
+      ;;
+  esac
+
+  # Everything else must be exactly four dot-separated decimal octets.
+  case "$h" in
+    *[!0-9.]*) return 1 ;;    # any non-digit, non-dot character
+    *.*.*.*.*) return 1 ;;    # too many parts
+    *.*.*.*) : ;;             # exactly four
     *) return 1 ;;
   esac
+
+  # Every octet must be a real 0-255 value: 10.999.999.999 is not an address, and
+  # a resolver may well treat it as a name and look it up somewhere remote.
+  local rest=$h part
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      *.*)
+        part=${rest%%.*}
+        rest=${rest#*.}
+        ;;
+      *)
+        part=$rest
+        rest=""
+        ;;
+    esac
+    case "$part" in
+      "" | *[!0-9]*) return 1 ;;
+    esac
+    [ "${#part}" -le 3 ] || return 1
+    [ "$part" -le 255 ] 2>/dev/null || return 1
+  done
+
+  o1=${h%%.*}
+  o2=${h#*.}
+  o2=${o2%%.*}
+  [ -n "$o1" ] && [ -n "$o2" ] || return 1
+
+  case "$o1" in
+    0 | 127) return 0 ;; # unspecified, loopback
+    10) return 0 ;;      # RFC1918 /8
+    192) [ "$o2" = "168" ] && return 0 ;;
+    169) [ "$o2" = "254" ] && return 0 ;;
+    172) # RFC1918 172.16.0.0/12
+      case "$o2" in
+        1[6-9] | 2[0-9] | 3[01]) return 0 ;;
+      esac
+      ;;
+  esac
+  return 1
 }
 
 kl_current_context() {
   kubectl config current-context 2>/dev/null || true
+}
+
+# Both checks, without exiting — for callers that report rather than refuse.
+# Read-only commands still must not query a cluster they have not verified, so
+# they use this rather than the name check alone.
+kl_context_is_local() { # <context>
+  local host
+  [ -n "$1" ] || return 1
+  kl_context_name_is_local "$1" || return 1
+  kl_context_has_indirection "$1" && return 1
+  host=$(kl_context_server_host "$1") || return 1
+  kl_host_is_local "$host" || return 1
+  return 0
+}
+
+# A build takes minutes; another terminal can switch the kubeconfig, or remap the
+# same context name onto a different cluster, while it runs. Pinning --context
+# carries the NAME forward, not the cluster it pointed at, so re-verify both
+# before anything is applied.
+kl_assert_context_unchanged() { # <context> <server-host-seen-earlier>
+  local now host
+  now=$(kl_current_context)
+  [ "$now" = "$1" ] || kl_die \
+    "REFUSING: the current context changed from '$1' to '${now:-<none>}' during the build"
+  host=$(kl_context_server_host "$1") ||
+    kl_die "REFUSING: cannot re-read the API server address for '$1'"
+  [ "$host" = "$2" ] || kl_die \
+    "REFUSING: context '$1' now points at $host, not $2, as it did before the build"
+  kl_context_has_indirection "$1" &&
+    kl_die "REFUSING: context '$1' gained proxy-url/tls-server-name during the build"
+  return 0
 }
 
 # Fails closed at every step: no context, an unrecognised name, an unreadable
@@ -72,10 +189,23 @@ kl_require_local_context() {
   ctx=$(kl_current_context)
   [ -n "$ctx" ] || kl_die "no kubectl context — start your local cluster first"
 
+  # kl_image_load_cmd derives a cluster name from the context and the result is
+  # word-split on purpose; whitespace in the name would silently pass the wrong
+  # --name to kind/k3d. Nothing legitimate has it, so refuse it outright.
+  case "$ctx" in
+    *[[:space:]]*) kl_die "REFUSING: context name contains whitespace: '$ctx'" ;;
+  esac
+
   if ! kl_context_name_is_local "$ctx"; then
     printf 'klocal: REFUSING: context '\''%s'\'' does not look local.\n' "$ctx" >&2
     printf '        Local contexts: rancher-desktop, docker-desktop, minikube, colima, kind-*, k3d-*\n' >&2
     printf '        Switch with: kubectl config use-context rancher-desktop\n' >&2
+    exit 1
+  fi
+
+  if kl_context_has_indirection "$ctx"; then
+    printf 'klocal: REFUSING: context '\''%s'\'' sets proxy-url or tls-server-name.\n' "$ctx" >&2
+    printf '        The API server address then says nothing about where requests go.\n' >&2
     exit 1
   fi
 
@@ -151,6 +281,21 @@ kl_image_load_cmd() { # <context> <image> -> prints the load command, or nothing
 kl_build_image() { # <image> <context-dir>
   local image=$1 context=$2 engine load
   engine=$(kl_detect_engine)
+
+  # When the cluster needs an explicit import, the loader looks in its PROVIDER's
+  # store — Docker for a default kind/k3d/minikube cluster. Building into
+  # nerdctl's k8s.io namespace just because that socket answers would leave the
+  # loader unable to find the tag, so prefer docker whenever a loader is involved.
+  if [ -n "$(kl_image_load_cmd "${KL_CONTEXT:-}" "$image")" ] && [ "$engine" = "nerdctl" ]; then
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+      kl_step "context ${KL_CONTEXT} imports from the docker store; using docker, not nerdctl"
+      engine=docker
+    else
+      kl_warn "context ${KL_CONTEXT} needs an image import, but only nerdctl is available."
+      kl_warn "If the cluster was created with the docker provider, the import will not find the image."
+    fi
+  fi
+
   case "$engine" in
     nerdctl)
       # containerd engine: k3s reads the k8s.io namespace directly.
@@ -174,8 +319,21 @@ kl_build_image() { # <image> <context-dir>
     # a stale image, so a missing kind/k3d/minikube binary must be fatal.
     command -v "${load%% *}" >/dev/null 2>&1 ||
       kl_die "${load%% *} not found, but context '$KL_CONTEXT' needs it to see the image"
-    $load
+    kl_run_image_load "${KL_CONTEXT:-}" "$image"
   fi
+}
+
+# Runs the loader with an explicit argument list. Splitting the printed command
+# string instead exposed the cluster name to word-splitting AND pathname
+# expansion: a context named `kind-*` would have globbed against the working
+# directory, and `kind-dev --name other` would have appended a second --name.
+kl_run_image_load() { # <context> <image>
+  case "$1" in
+    kind-*) kind load docker-image "$2" --name "${1#kind-}" ;;
+    k3d-*) k3d image import "$2" -c "${1#k3d-}" ;;
+    minikube) minikube image load "$2" ;;
+    *) : ;;
+  esac
 }
 
 # --- secrets ---------------------------------------------------------------
@@ -187,19 +345,36 @@ kl_build_image() { # <image> <context-dir>
 # a credential a running container still holds — the exact outage kl_keep_or_generate
 # exists to prevent.
 kl_secret_value() { # <namespace> <secret> <key>
-  local raw rc
-  raw=$(kl_kubectl get secret "$2" -n "$1" -o "jsonpath={.data.$3}" 2>/dev/null)
+  local ns=$1 secret=$2 key=$3 exists rc keys raw
+
+  # The key is interpolated into a go-template below. Kubernetes only permits
+  # alphanumerics, '-', '_' and '.' in a Secret key, so anything else is not a
+  # key we could read anyway — refuse rather than build a broken template.
+  case "$key" in
+    "" | *[!a-zA-Z0-9._-]*) return 2 ;;
+  esac
+
+  # --ignore-not-found is what separates "absent" from "cannot read": a missing
+  # Secret gives empty output and exit 0, while RBAC denial or an API failure
+  # gives a non-zero exit. Inferring absence from a failed read instead meant a
+  # forbidden Secret looked absent, and the caller then rotated a live credential.
+  exists=$(kl_kubectl get secret "$secret" -n "$ns" -o name --ignore-not-found 2>/dev/null)
   rc=$?
-  if [ "$rc" -ne 0 ]; then
-    # Absent Secret and failed API call both exit non-zero, so ask again whether
-    # the Secret exists at all; only then is "absent" the right conclusion.
-    if kl_kubectl get secret "$2" -n "$1" >/dev/null 2>&1; then
-      return 2 # the Secret is there, so the read failed for another reason
-    fi
-    kl_kubectl get namespace "$1" >/dev/null 2>&1 || return 2
-    return 1 # namespace reachable, Secret genuinely absent
-  fi
-  [ -n "$raw" ] || return 1 # Secret exists, key not set
+  [ "$rc" -eq 0 ] || return 2
+  [ -n "$exists" ] || return 1 # genuinely not there
+
+  # List the keys rather than probing one: jsonpath {.data.tls.crt} looks up a
+  # nested path that does not exist and returns empty, so any key containing a
+  # dot read as "absent". A range over .data has no such problem.
+  keys=$(kl_kubectl get secret "$secret" -n "$ns" \
+    -o "go-template={{range \$k, \$v := .data}}{{\$k}}{{\"\n\"}}{{end}}" 2>/dev/null) || return 2
+  printf '%s\n' "$keys" | grep -Fxq -- "$key" || return 1 # key not set
+
+  # Present. An empty value is a real value, not an absence, so this returns 0
+  # with empty output rather than inviting the caller to generate a replacement.
+  raw=$(kl_kubectl get secret "$secret" -n "$ns" \
+    -o "go-template={{index .data \"$key\"}}" 2>/dev/null) || return 2
+  [ -n "$raw" ] || return 0
   printf '%s' "$raw" | base64 -d 2>/dev/null || return 2
 }
 
@@ -214,6 +389,8 @@ kl_keep_or_generate() { # <namespace> <secret> <key> <generator...>
   rc=$?
   case "$rc" in
     0)
+      # Present, possibly empty. An empty stored value is still a decision
+      # someone made; replacing it would rotate what a running pod is using.
       printf '%s' "$existing"
       return 0
       ;;
@@ -242,13 +419,46 @@ kl_keep_or_generate() { # <namespace> <secret> <key> <generator...>
 # malformed input, and server-side apply rejects them outright rather than
 # picking a winner. So the point is not to memorise which one wins: it is that
 # the manifest cannot tell you, and only the live object can.
-kl_env_of() { # <namespace> <deployment> <container> <var> -> live value(s)
-  kl_kubectl get deploy "$2" -n "$1" -o "jsonpath={range .spec.template.spec.containers[?(@.name=='$3')].env[?(@.name=='$4')]}{.value}{'\t'}{.valueFrom.secretKeyRef.name}{'\n'}{end}" 2>/dev/null || true
-}
-
-kl_containers_of() { # <namespace> <deployment>
-  kl_kubectl get deploy "$2" -n "$1" \
-    -o "jsonpath={range .spec.template.spec.containers[*]}{.name}{'\n'}{end}" 2>/dev/null || true
+# Live env entries for one variable, in one container, of one workload.
+#
+# Reads JSON and parses it, rather than composing a JSONPath from the container
+# and variable names: those come from a manifest, and interpolating them would
+# reintroduce exactly the injection fixed in kl_cluster_field. It also means a
+# multiline value stays ONE entry — a jsonpath emitting raw values made a single
+# value containing newlines look like several live entries.
+#
+# Prints one line per entry: "value<TAB>source", source being "value",
+# "secret:<name>/<key>", "configmap:<name>/<key>", "fieldRef" or "other".
+kl_env_of() { # <namespace> <workload> <containerKind> <container> <var>
+  local json
+  json=$(kl_kubectl get deploy "$2" -n "$1" -o json 2>/dev/null) || return 0
+  [ -n "$json" ] || return 0
+  KL_C_KIND=$3 KL_C_NAME=$4 KL_VAR=$5 python3 -c '
+import json, os, sys
+d = json.load(sys.stdin)
+spec = d.get("spec", {}).get("template", {}).get("spec", {})
+for c in spec.get(os.environ["KL_C_KIND"], []) or []:
+    if c.get("name") != os.environ["KL_C_NAME"]:
+        continue
+    for e in c.get("env", []) or []:
+        if e.get("name") != os.environ["KL_VAR"]:
+            continue
+        if "value" in e:
+            v, src = e["value"], "value"
+        else:
+            f = e.get("valueFrom", {}) or {}
+            if "secretKeyRef" in f:
+                r = f["secretKeyRef"]; v, src = "", "secret:%s/%s" % (r.get("name"), r.get("key"))
+            elif "configMapKeyRef" in f:
+                r = f["configMapKeyRef"]; v, src = "", "configmap:%s/%s" % (r.get("name"), r.get("key"))
+            elif "fieldRef" in f:
+                v, src = "", "fieldRef"
+            else:
+                v, src = "", "other"
+        print("%s\t%s" % (v.replace("\n", "\\n"), src))
+' <<EOF || true
+$json
+EOF
 }
 
 # Report env names a manifest declares more than once WITHIN one container's env
@@ -259,13 +469,34 @@ kl_duplicate_env_vars() { # <manifest-file>
   [ -f "$1" ] || return 0
   awk '
     function flush() {
-      for (k in seen) if (seen[k] > 1) printf "%s %s %d\n", scope, k, seen[k]
+      for (k in seen)
+        if (seen[k] > 1)
+          printf "DUP %s %s %s %s %d\n", (workload == "" ? "?" : workload), ckind, \
+            (container == "" ? "?" : container), k, seen[k]
       delete seen
     }
     # A new YAML document resets everything.
-    /^---[[:space:]]*$/ { flush(); doc++; container=""; inenv=0; next }
-    # Track indentation of the env: key so we can tell when its list ends.
-    match($0, /^[[:space:]]*(- )?name:[[:space:]]*/) {
+    /^---[[:space:]]*$/ { flush(); doc++; workload=""; container=""; ckind="containers"; inenv=0; next }
+    # The workload this document defines, so a duplicate is looked up against the
+    # right object: previously every finding was queried against the app
+    # Deployment, so a duplicate in the Postgres manifest read as "not set".
+    /^  name:[[:space:]]*/ && workload == "" {
+      w = $0; sub(/^  name:[[:space:]]*/, "", w); gsub(/^["'"'"']|["'"'"']$/, "", w)
+      workload = w; next
+    }
+    /^[[:space:]]*initContainers:[[:space:]]*(#.*)?$/ { flush(); ckind="initContainers"; container=""; inenv=0; next }
+    /^[[:space:]]*containers:[[:space:]]*(#.*)?$/ { flush(); ckind="containers"; container=""; inenv=0; next }
+    # Shapes this line-oriented scanner cannot read. Reporting them is the point:
+    # silently skipping one would be a false all-clear on the very file the user
+    # asked about.
+    /^[[:space:]]*env:[[:space:]]*[\[&*]/ { printf "UNREADABLE %s flow-or-anchor-env\n", FILENAME; next }
+    /^[[:space:]]*<<:[[:space:]]*\*/ { printf "UNREADABLE %s merge-key-alias\n", FILENAME; next }
+    # Only a LIST ENTRY ("- name:") is significant. A bare "name:" is a field of
+    # some other object — the secret in a valueFrom.secretKeyRef, the target of an
+    # envFrom.secretRef — and counting those reported "demo-api-secrets 2" for the
+    # entirely normal case of two variables sourced from the same Secret, and let
+    # an envFrom target be mistaken for the container name.
+    match($0, /^[[:space:]]*- name:[[:space:]]*/) {
       indent = index($0, "name:") - 1
       val = $0; sub(/^[[:space:]]*(- )?name:[[:space:]]*/, "", val)
       gsub(/^["'"'"']|["'"'"']$/, "", val)
@@ -280,7 +511,7 @@ kl_duplicate_env_vars() { # <manifest-file>
       scope = "doc" doc "/" container
       next
     }
-    /^[[:space:]]*env:[[:space:]]*$/ { inenv=1; envindent = index($0, "env:") - 1; next }
+    /^[[:space:]]*env:[[:space:]]*(#.*)?$/ { inenv=1; envindent = index($0, "env:") - 1; next }
     # Any key at or left of the env: indentation ends the env list.
     inenv && /^[[:space:]]*[a-zA-Z_]+:/ {
       here = match($0, /[^[:space:]]/) - 1

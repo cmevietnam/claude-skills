@@ -41,16 +41,33 @@ kl_json_get() { # <file> <dotted.path>  -> value, or empty when absent
     }
   elif command -v python3 >/dev/null 2>&1; then
     KL_PATH="$path" python3 -c '
-import json, os, sys
+import json, math, os, sys
 
 def scalar(v):
     if isinstance(v, bool):
         return "true" if v else "false"      # match jq, not Python
-    if isinstance(v, (int, float, str)):
-        return str(v)
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (int, float)):
+        # jq holds every number as an IEEE double and prints an integral one
+        # without a fractional part. Rendering with Python semantics instead made
+        # 1.0 -> "1.0" (jq: "1") and kept 9007199254740993 exactly (jq: ...992),
+        # so which backend was installed decided whether a config value was
+        # accepted. Go through float to get jq behaviour exactly.
+        f = float(v)
+        if math.isinf(f) or math.isnan(f):
+            raise SystemExit("not a finite number")
+        if f.is_integer():
+            # jq prints negative zero as -0; int() would flatten it to 0.
+            if f == 0 and math.copysign(1.0, f) < 0:
+                return "-0"
+            return str(int(f))
+        return repr(f)
     raise SystemExit("not a scalar")
 
-node = json.load(open(sys.argv[1]))
+# parse_int=float mirrors jq, which has only doubles. Without it Python keeps
+# -0 as the integer 0 (losing the sign jq prints) and 9007199254740993 exactly.
+node = json.load(open(sys.argv[1]), parse_int=float)
 for key in os.environ["KL_PATH"].split("."):
     node = node.get(key) if isinstance(node, dict) else None
     if node is None:
@@ -71,12 +88,35 @@ print(" ".join(scalar(x) for x in node) if isinstance(node, list) else scalar(no
 # dash as a flag: a namespace of "--all" turns `kubectl delete namespace $NS`
 # into `kubectl delete namespace --all`, which deletes every namespace on the
 # cluster. So every such value is validated before it is ever used.
-kl_is_dns_label() { # RFC1123 label: what Kubernetes accepts for a namespace
+# RFC1123 label: what Kubernetes accepts for a namespace.
+#
+# Implemented with `case`, not `grep`: grep -q succeeds when ANY line matches, so
+# a multiline value like $'valid\n--context=prod' passed the anchored pattern and
+# then reached kubectl as an argument. A negated glob set has no such hole — a
+# newline is simply not in [a-z0-9-].
+kl_is_dns_label() {
   case "$1" in
     "" | -* | *-) return 1 ;;
+    *[!a-z0-9-]*) return 1 ;;
   esac
-  [ "${#1}" -le 63 ] || return 1
-  printf '%s' "$1" | LC_ALL=C grep -Eq '^[a-z0-9][-a-z0-9]*[a-z0-9]$|^[a-z0-9]$'
+  [ "${#1}" -le 63 ]
+}
+
+# A bare SQL identifier. Deliberately narrow: psql's -d accepts a full connection
+# URI, so a "database name" of postgresql://postgres@prod-db/production silently
+# redirects the session to production AND overrides -U, which defeats --app.
+kl_is_pg_ident() {
+  case "$1" in
+    "" | [!a-zA-Z_]*) return 1 ;;
+    *[!a-zA-Z0-9_]*) return 1 ;;
+  esac
+  [ "${#1}" -le 63 ]
+}
+
+kl_require_pg_ident() { # <config-key> <value>
+  kl_is_pg_ident "$2" || kl_die \
+    "$KL_CONFIG: \"$1\" must be a bare identifier (letters, digits, _), got: '$2'.
+       A connection URI here would redirect psql to another server and override --app."
 }
 
 kl_require_dns_label() { # <config-key> <value>
@@ -142,8 +182,12 @@ kl_load_config() {
   KL_CACHE=$(kl_json_get "$KL_CONFIG" workloads.cache)
   [ -z "$KL_CACHE" ] || kl_require_dns_label workloads.cache "$KL_CACHE"
 
+  # Unvalidated, this reaches kubectl as a positional argument — and a value of
+  # "--context=prod" is read as a global flag that OVERRIDES the pinned context,
+  # because a later --context wins.
   KL_INGRESS_CLASS=$(kl_json_get "$KL_CONFIG" ingressClass)
   [ -n "$KL_INGRESS_CLASS" ] || KL_INGRESS_CLASS="traefik"
+  kl_require_dns_label ingressClass "$KL_INGRESS_CLASS"
   KL_ROOT_DOMAIN=$(kl_json_get "$KL_CONFIG" rootDomain)
   [ -n "$KL_ROOT_DOMAIN" ] || KL_ROOT_DOMAIN="lvh.me"
 
@@ -153,11 +197,11 @@ kl_load_config() {
   KL_SECRET_HOOK=$(kl_json_get "$KL_CONFIG" secret.hook)
 
   KL_DB_NAME=$(kl_json_get "$KL_CONFIG" database.name)
-  [ -z "$KL_DB_NAME" ] || kl_require_safe_arg database.name "$KL_DB_NAME"
+  [ -z "$KL_DB_NAME" ] || kl_require_pg_ident database.name "$KL_DB_NAME"
   KL_DB_SUPERUSER=$(kl_json_get "$KL_CONFIG" database.superuser)
-  [ -z "$KL_DB_SUPERUSER" ] || kl_require_safe_arg database.superuser "$KL_DB_SUPERUSER"
+  [ -z "$KL_DB_SUPERUSER" ] || kl_require_pg_ident database.superuser "$KL_DB_SUPERUSER"
   KL_DB_APP_ROLE=$(kl_json_get "$KL_CONFIG" database.appRole)
-  [ -z "$KL_DB_APP_ROLE" ] || kl_require_safe_arg database.appRole "$KL_DB_APP_ROLE"
+  [ -z "$KL_DB_APP_ROLE" ] || kl_require_pg_ident database.appRole "$KL_DB_APP_ROLE"
 
   KL_TLS_PORT=$(kl_json_get "$KL_CONFIG" tls.port)
   KL_TLS_CERT_DIR=$(kl_json_get "$KL_CONFIG" tls.certDir)

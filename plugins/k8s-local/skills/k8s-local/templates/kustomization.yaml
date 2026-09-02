@@ -9,10 +9,12 @@
 # reference to the tag klocal builds straight into the cluster's image store.
 #
 # Think about what you deliberately do NOT inherit from a production base, and
-# write down why. Anything that authenticates to a real external system, and any
-# NetworkPolicy whose allow-rules name pods this overlay does not run, belongs on
-# that list — the policy will apply cleanly and then silently drop traffic you
-# need, including kubectl port-forward.
+# write down why. Anything that authenticates to a real external system belongs
+# on that list, as does a NetworkPolicy whose allow-rules name pods this overlay
+# does not run: it applies cleanly and then drops the in-cluster traffic those
+# rules were meant to admit. (Whether it also affects `kubectl port-forward`
+# depends on the CNI — the policy model exempts traffic from the pod's own node,
+# but not every implementation honours that, so test rather than assume.)
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 

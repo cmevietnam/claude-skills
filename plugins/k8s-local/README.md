@@ -37,9 +37,22 @@ both must hold:
 1. **The context name** is `rancher-desktop`, `docker-desktop`, `minikube`,
    `colima`, `kind-*` or `k3d-*` — a whitelist of exact names, not a heuristic,
    because matching "contains local" would accept `localstack-prod`.
-2. **The API server address** is loopback or RFC1918. The name is chosen by
-   whoever created the cluster, so a remote cluster can be called `kind-prod`;
-   the address is the part naming cannot fake.
+2. **The API server address** is loopback or RFC1918, parsed as a real
+   dotted-decimal literal rather than matched as a text prefix (`10.*` as a glob
+   also matches the hostname `10.prod.example.com`). The name is chosen by
+   whoever created the cluster, so a remote cluster can be called `kind-prod`.
+3. **No `proxy-url` or `tls-server-name`** on the cluster entry, since either
+   means the server address says nothing about where requests actually go.
+
+The context name is read via `kubectl config view --minify --context <name>`, so
+it is always a flag _value_. Interpolating it into a JSONPath expression let a
+crafted name close the expression and point the address check at a loopback decoy
+while every real call used a remote cluster.
+
+The check is honest about its limit: RFC1918 establishes address _scope_, not
+that the cluster is on this machine. A production cluster reachable at
+`10.20.30.40` over a VPN satisfies it. If that is your situation, do not rely on
+this guard alone.
 
 No context at all is refused like a remote one. Every subcommand that reaches the
 cluster is guarded — `logs` and `psql` included, since they read and write
@@ -92,8 +105,10 @@ below is optional except `project`.
 ### Secrets
 
 `klocal` never handles secret values. If `secret.hook` is set, it runs from the
-project root with `KL_NAMESPACE`, `KL_SECRET` and `KL_SECRET_ENV_FILE` exported,
-and that command is responsible for creating the Secret. Piping a vault straight
+project root with `KL_NAMESPACE`, `KL_SECRET`, `KL_SECRET_ENV_FILE` and
+`KL_KUBECTL` exported, and that command is responsible for creating the Secret.
+Use `$KL_KUBECTL` inside the hook: it carries the verified `--context`, while a
+bare `kubectl` is a separate process that follows the kubeconfig as it stands. Piping a vault straight
 into `kubectl` keeps values out of both the filesystem and the model transcript:
 
 ```json
@@ -113,18 +128,22 @@ trusting either alone. It reports any env var a manifest declares twice, next to
 the value actually in effect — and the two ways a duplicate reaches the cluster
 resolve in opposite directions:
 
-- In a **kustomize patch**, the strategic merge collapses it and keeps the
+- In a **kustomize strategic-merge patch**, the merge collapses it and keeps the
   **first**. The other value is gone before `kubectl` sees it, so nothing warns.
-- In a **plain manifest**, both entries survive, `kubectl apply` warns, and the
-  kubelet gives the container the **last**.
+- In a **plain manifest** applied client-side, both entries survive, `kubectl
+apply` warns, and the kubelet gives the container the **last**.
+- Under **server-side apply**, the request is rejected outright.
 
-Guessing from the file therefore gets it wrong half the time. A live instance of
-exactly this defect was found this way in a real repo.
+None of that is an API guarantee — a duplicate key in a merge-keyed list is
+malformed input, and JSON6902 patches or resources without a strategic-merge
+schema need not follow the first rule. That is the point: the manifest cannot
+tell you which value is live, so `klocal status` reads the live object. A real
+instance of exactly this defect was found this way in a production repo.
 
 ## Tests
 
 ```bash
-bash plugins/k8s-local/scripts/test-klocal.sh              # 159 assertions
+bash plugins/k8s-local/scripts/test-klocal.sh              # 247 assertions
 bash plugins/k8s-local/scripts/test-klocal.sh --self-check # + prove it can fail
 ```
 
@@ -132,7 +151,8 @@ No cluster, no network, no container engine: `kubectl`, `docker`, `nerdctl`,
 `kind`, `k3d` and `minikube` are all stubbed on `PATH` — created before the first
 test that could reach one, so a regression in the context guard cannot fall
 through to a real engine — and `HOME` is redirected to a temp dir, so live state
-is never touched.
+is never touched. The `kubectl` stub logs every argument on its own line, so
+assertions can see argument boundaries rather than a flattened string.
 
 The assertion discipline, because a suite that cannot fail is not evidence:
 

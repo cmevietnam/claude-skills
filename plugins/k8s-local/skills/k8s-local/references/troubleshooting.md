@@ -68,14 +68,18 @@ An env name declared twice. Which value ends up live depends on how it reached
 the cluster, and the two paths resolve in **opposite** directions — both verified
 on a real cluster, 2026-09-02:
 
-| Declared twice in                 | Live spec                  | Winner                                     | Warning                                                 |
-| --------------------------------- | -------------------------- | ------------------------------------------ | ------------------------------------------------------- |
-| a kustomize patch                 | collapsed to **one** entry | the **first**                              | none, from anything                                     |
-| a plain manifest applied directly | **both** entries survive   | the **last** (kubelet builds env in order) | `kubectl apply` says "hides previous definition of ..." |
+| Declared twice in                    | Live spec                  | Observed winner                            | Warning                                                 |
+| ------------------------------------ | -------------------------- | ------------------------------------------ | ------------------------------------------------------- |
+| a kustomize strategic-merge patch    | collapsed to **one** entry | the **first**                              | none, from anything                                     |
+| a plain manifest applied client-side | **both** entries survive   | the **last** (kubelet builds env in order) | `kubectl apply` says "hides previous definition of ..." |
+| server-side apply                    | rejected                   | —                                          | the request fails                                       |
 
-So a duplicate in a patch is invisible: the losing value is discarded during the
-merge, before `kubectl` ever sees it, and no tool anywhere reports it. Reading
-the file will not tell you which one won.
+None of this is an API guarantee. Duplicate keys in a merge-keyed list are
+malformed input, so a JSON6902 patch, or a resource with no strategic-merge
+schema, need not behave like the first row. The reliable conclusion is narrower
+and more useful: **the manifest cannot tell you which value is live.** A patch
+duplicate is the nastiest case because the losing value is discarded during the
+merge, before `kubectl` sees anything, so no tool reports it at all.
 
 ```bash
 klocal status                            # distinguishes the two cases
@@ -95,8 +99,12 @@ by design in the app:
   drops them and every subsequent request is anonymous.
 
 No amount of ingress work fixes either. Put a TLS front door on `:8443`
-(`bring-up.md` §6). `*.localhost` is the one exception — browsers treat it as a
-secure context over plain http.
+(`bring-up.md` §6).
+
+`*.localhost` helps with the **second** cause only: browsers treat it as a secure
+context over plain http, so `Secure` cookies survive. It does nothing for the
+first — the request still carries `Origin: http://foo.localhost`, and an app that
+rejects non-https origins rejects that too. Only real TLS fixes both.
 
 ## Server-side fetches fail with DEPTH_ZERO_SELF_SIGNED_CERT
 

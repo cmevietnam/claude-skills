@@ -39,8 +39,13 @@ If a legitimate local context is refused, add its exact name to
 ## Do not
 
 - Push a local image to a registry. Build it straight into the cluster's image
-  store, and set `imagePullPolicy: IfNotPresent` with `imagePullSecrets: null`.
-  Miss either and the kubelet ignores the local tag and tries to pull it.
+  store. Keep `imagePullPolicy` at `IfNotPresent` — it is the default for an
+  ordinary tag, but `Always` for `:latest` or no tag, and under `Always` the
+  kubelet ignores the local image and tries to pull it. Clear any inherited
+  `imagePullSecrets` too; that does not affect whether the local image is used,
+  it just removes a reference to a registry credential this cluster has not got.
+  And on kind, k3d or minikube the build must additionally be imported into the
+  node's own store, or the pod keeps running the previous image.
 - Pick the build engine by which binary exists. Rancher Desktop ships `nerdctl`
   even when the engine is moby, where it cannot reach the k3s containerd socket.
   Probe the socket: `nerdctl --namespace k8s.io info`, then `docker info`.
@@ -53,7 +58,8 @@ If a legitimate local context is refused, add its exact name to
   rotated signing key breaks an already-running dev server. Read the existing
   value first, generate only when it is absent.
 - Declare an env var twice. It is malformed input to a merge-keyed list, and
-  what happens next depends on the path: a **kustomize patch** collapses it and
+  what happens next depends on the path: a **kustomize strategic-merge patch**
+  collapses it and
   keeps the **first**, silently, before `kubectl` sees anything; a **plain
   manifest** applied client-side keeps **both**, warns, and the kubelet uses the
   **last**; server-side apply rejects it outright. Do not memorise a winner —
@@ -87,8 +93,9 @@ klocal up
 
 **Get secrets in without writing them to disk.** `klocal` never handles secret
 values. Point `secret.hook` at a command that creates the Secret, and it runs
-from the project root with `KL_NAMESPACE`, `KL_SECRET` and `KL_SECRET_ENV_FILE`
-exported. Piping a vault straight into `kubectl` keeps values out of both the
+from the project root with `KL_NAMESPACE`, `KL_SECRET`, `KL_SECRET_ENV_FILE` and
+`KL_KUBECTL` exported. Use `$KL_KUBECTL` inside the hook — it carries the pinned
+`--context`; a bare `kubectl` there is unpinned and follows the kubeconfig. Piping a vault straight into `kubectl` keeps values out of both the
 filesystem and the transcript — see the `onepassword` skill for `opgate`.
 
 ```json
