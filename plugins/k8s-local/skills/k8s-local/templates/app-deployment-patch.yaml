@@ -1,0 +1,56 @@
+# Local-only differences from the production Deployment.
+#
+# Declare each env var EXACTLY ONCE in this file. A name that appears twice in a
+# patch is collapsed by the strategic merge, which keeps the FIRST and discards
+# the rest before kubectl ever sees them — so nothing warns, and the rollout goes
+# green serving the value you did not mean. (The same duplicate in a plain
+# manifest does the opposite: both survive and the kubelet uses the LAST.)
+# `klocal status` reports duplicates for this reason.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: PROJECT-api
+spec:
+  replicas: 1
+  template:
+    spec:
+      # The image is built straight into the cluster's image store, so there is
+      # no private registry to authenticate against. Both lines matter: without
+      # IfNotPresent the kubelet ignores the local tag and tries to pull it.
+      imagePullSecrets: null
+      containers:
+        - name: api
+          imagePullPolicy: IfNotPresent
+          env:
+            # Dev mode. Check what else this turns on in your app — it commonly
+            # enables test-only login paths that staging and production reject.
+            - name: APP_ENV
+              value: "dev"
+
+            # Drives cookie scope and subdomain resolution.
+            - name: ROOT_DOMAIN
+              value: "lvh.me"
+
+            # Point at the TLS front door, not the Ingress, when the app requires
+            # https. Whatever absolute URLs the app generates come from here.
+            - name: PUBLIC_BASE_URL
+              value: "https://www.lvh.me:8443"
+
+            # Anchor the pattern at both ends. An unanchored regex is usually
+            # matched with a "contains" call, so `^https://…lvh\.me$` without the
+            # anchors would also admit https://lvh.me.evil.com.
+            - name: CORS_ALLOW_ORIGIN_REGEX
+              value: "^https://([a-z0-9][a-z0-9-]*\\.)?lvh\\.me(:[0-9]+)?$"
+
+            # Outbound side effects off. A local cluster must not be able to send
+            # real email, charge a real card, or write to a real bucket. Check how
+            # your app decides a provider is enabled — often a key and a flag
+            # together — and disable it the way the app actually reads.
+            - name: EMAIL_ENABLED
+              value: "false"
+
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: PROJECT-api-secrets
+                  key: DATABASE_URL

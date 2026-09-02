@@ -1,0 +1,6 @@
+# One namespace holds the whole local stack, which makes teardown a single
+# command with nothing left behind: kubectl delete namespace PROJECT-local
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: PROJECT-local

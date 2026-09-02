@@ -19,12 +19,13 @@ claude --plugin-dir ./plugins/onepassword
 
 ## Plugins
 
-| Plugin | Làm gì |
-|---|---|
-| [`onepassword`](plugins/onepassword) | Truy cập secrets từ 1Password với Touch ID gate mỗi lần dùng, và giữ giá trị secret không lọt vào transcript của model. |
-| [`linode`](plugins/linode) | Work with Linode inside the project's tag boundary: resources are created with the project tag, and writes to another project's resources are refused. |
-| [`review`](plugins/review) | Quy trình review đối kháng bằng nhiều model Claude độc lập, và script chẩn đoán sub-agent im lặng hay treo thật. |
-| [`codex`](plugins/codex) | Run OpenAI's Codex CLI as a second opinion, and require every finding to reach the user verbatim before any code is changed. |
+| Plugin                               | Làm gì                                                                                                                                                                             |
+| ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`onepassword`](plugins/onepassword) | Truy cập secrets từ 1Password với Touch ID gate mỗi lần dùng, và giữ giá trị secret không lọt vào transcript của model.                                                            |
+| [`linode`](plugins/linode)           | Work with Linode inside the project's tag boundary: resources are created with the project tag, and writes to another project's resources are refused.                             |
+| [`review`](plugins/review)           | Quy trình review đối kháng bằng nhiều model Claude độc lập, và script chẩn đoán sub-agent im lặng hay treo thật.                                                                   |
+| [`codex`](plugins/codex)             | Run OpenAI's Codex CLI as a second opinion, and require every finding to reach the user verbatim before any code is changed.                                                       |
+| [`k8s-local`](plugins/k8s-local)     | Run a project's whole stack on a local Kubernetes cluster: build straight into the cluster's image store, refuse any context that is not local, and keep the datastores throwaway. |
 
 ## Thêm một skill mới
 

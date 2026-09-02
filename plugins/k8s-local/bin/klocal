@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# klocal - bring a project's stack up on a local Kubernetes cluster, and tear it
+# down again by deleting one namespace.
+#
+# The design rule: this script knows how a local cluster behaves, and nothing
+# about any particular project. Everything project-shaped lives in a committed
+# .k8s-local/project.json, so the same klocal drives every repo.
+#
+#   klocal scaffold      write manifests + config into a new project
+#   klocal up            build, apply, wait, then print what to do next
+#   klocal status        what is actually running, and where it drifts from the manifests
+#   klocal down          delete the namespace
+#
+# Standalone: needs kubectl, a container engine, and jq or python3. Nothing from
+# Claude Code. Symlink it onto PATH and use it like any other tool.
+set -euo pipefail
+
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=../scripts/lib/common.sh
+. "$here/../scripts/lib/common.sh"
+# shellcheck source=../scripts/lib/cluster.sh
+. "$here/../scripts/lib/cluster.sh"
+
+KL_TEMPLATES="$here/../skills/k8s-local/templates"
+
+usage() {
+  cat <<'EOF'
+klocal - run this project's stack on a local Kubernetes cluster
+
+  klocal up [--no-build]     build the image, apply the overlay, wait for rollout
+  klocal down [--yes]        delete the namespace and everything in it
+  klocal status              pods, services, ingress, reachability, manifest drift
+  klocal logs [workload]     follow logs (default: the app workload)
+  klocal rebuild             rebuild the image and restart the app rollout
+  klocal psql [args...]      psql inside the database pod
+  klocal scaffold [dir]      write manifests + .k8s-local/project.json into a project
+  klocal help                this text
+
+Configuration lives in .k8s-local/project.json, found by walking up from $PWD.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# preflight - every guard that must hold before anything is applied
+# ---------------------------------------------------------------------------
+preflight() {
+  kl_info "preflight"
+  command -v kubectl >/dev/null 2>&1 || kl_die "kubectl not found"
+  local ctx
+  ctx=$(kl_require_local_context)
+  kl_step "context: $ctx"
+  kl_step "namespace: $KL_NAMESPACE"
+  kl_check_ingressclass "$KL_INGRESS_CLASS"
+}
+
+# ---------------------------------------------------------------------------
+# up
+# ---------------------------------------------------------------------------
+cmd_up() {
+  local build=1
+  [ "${1:-}" = "--no-build" ] && build=0
+  kl_load_config
+  preflight
+
+  if [ "$build" = 1 ]; then
+    kl_info "build $KL_IMAGE"
+    kl_build_image "$KL_IMAGE" "$KL_ROOT/$KL_IMAGE_CONTEXT"
+  else
+    kl_info "build skipped (--no-build)"
+  fi
+
+  kl_info "namespace"
+  kubectl create namespace "$KL_NAMESPACE" --dry-run=client -o yaml |
+    kubectl apply -f - >/dev/null
+  kl_step "namespace/$KL_NAMESPACE ready"
+
+  # The project owns its secret material; klocal only calls the hook. Keeping
+  # this out-of-process is what lets secrets come from a vault without any
+  # value passing through this script or landing on disk.
+  if [ -n "$KL_SECRET_HOOK" ]; then
+    kl_info "secret"
+    kl_step "running $KL_SECRET_HOOK"
+    (cd "$KL_ROOT" && KL_NAMESPACE="$KL_NAMESPACE" KL_SECRET="$KL_SECRET" \
+      KL_SECRET_ENV_FILE="$KL_SECRET_ENV_FILE" sh -c "$KL_SECRET_HOOK")
+  fi
+
+  kl_info "apply $KL_MANIFESTS"
+  if [ -f "$KL_ROOT/$KL_MANIFESTS/kustomization.yaml" ]; then
+    kubectl apply -k "$KL_ROOT/$KL_MANIFESTS"
+  else
+    kubectl apply -n "$KL_NAMESPACE" -f "$KL_ROOT/$KL_MANIFESTS"
+  fi
+
+  kl_info "waiting for rollout"
+  local w
+  for w in $KL_DB $KL_CACHE $KL_APP; do
+    [ -n "$w" ] || continue
+    kubectl rollout status "deployment/$w" -n "$KL_NAMESPACE" --timeout=180s
+  done
+
+  next_steps
+}
+
+# The closing message is the documentation. Someone who runs `up` and reads the
+# last twenty lines should not need any other file to get to a working stack.
+next_steps() {
+  # Read the hostnames off the live Ingress objects rather than assuming a
+  # convention like api.<domain> — the cluster is the authority on what it serves.
+  local hosts reach
+  hosts=$(kl_ingress_hosts "$KL_NAMESPACE")
+  if [ -n "$hosts" ]; then
+    reach=$(printf '%s' "$hosts" | sed "s|^|http://|" | paste -sd' ' -)
+    [ -n "$KL_TLS_PORT" ] && reach="$reach   (behind TLS on :$KL_TLS_PORT)"
+  else
+    reach="no Ingress in this namespace — use: kubectl port-forward -n $KL_NAMESPACE svc/$KL_APP 8080:80"
+  fi
+
+  cat >&2 <<EOF
+
+Stack is up in namespace $KL_NAMESPACE.
+
+  The datastores have no volume: everything is lost when a pod restarts, and
+  migrations must be re-run after one. That is deliberate — see
+  references/bring-up.md.
+
+  Reach it:   $reach
+              $KL_ROOT_DOMAIN resolves every name to 127.0.0.1, so no /etc/hosts entry.
+  Logs:       klocal logs
+  Drift:      klocal status
+  Teardown:   klocal down
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# status - what is running, and where it disagrees with the manifests
+# ---------------------------------------------------------------------------
+cmd_status() {
+  kl_load_config
+  local ctx
+  ctx=$(kl_current_context)
+  printf 'context:   %s%s\n' "${ctx:-<none>}" \
+    "$(kl_context_is_local "${ctx:-}" || printf '  (NOT a local context)')"
+  printf 'namespace: %s\n\n' "$KL_NAMESPACE"
+
+  if ! kubectl get namespace "$KL_NAMESPACE" >/dev/null 2>&1; then
+    printf 'namespace %s does not exist — run: klocal up\n' "$KL_NAMESPACE"
+    return 0
+  fi
+
+  kubectl get pods,svc,ingress -n "$KL_NAMESPACE"
+
+  printf '\nstorage:\n'
+  local pvc
+  pvc=$(kubectl get pvc -n "$KL_NAMESPACE" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$pvc" = "0" ]; then
+    printf '  no PVC — datastores are ephemeral, a pod restart wipes them\n'
+  else
+    kubectl get pvc -n "$KL_NAMESPACE"
+  fi
+
+  printf '\ndrift (manifest vs live):\n'
+  local found=0 f name count live n effective
+  for f in "$KL_ROOT/$KL_MANIFESTS"/*.yaml; do
+    [ -f "$f" ] || continue
+    while read -r name count; do
+      [ -n "$name" ] || continue
+      found=1
+      live=$(kl_env_of "$KL_NAMESPACE" "$KL_APP" "$name")
+      n=$(printf '%s' "$live" | grep -c . || true)
+      printf '  %s declared %sx in %s\n' "$name" "$count" "$(basename "$f")"
+      if [ "${n:-0}" -gt 1 ]; then
+        # Both survived into the live spec: the kubelet builds env in order, so
+        # the last one is what the container actually sees.
+        effective=$(printf '%s' "$live" | grep . | tail -1)
+        printf '    live spec holds %s copies; the container sees the last: %s\n' "$n" "$effective"
+      elif [ "${n:-0}" -eq 1 ]; then
+        # Collapsed during a strategic merge — the other value never reached the
+        # cluster, and nothing warned.
+        printf '    collapsed to one before apply; live value: %s\n' "$live"
+        printf '    the other value was dropped silently — check which you meant\n'
+      else
+        printf '    not set on the live deployment\n'
+      fi
+    done <<EOF
+$(kl_duplicate_env_vars "$f")
+EOF
+  done
+  [ "$found" = 0 ] && printf '  no duplicate env declarations found\n'
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# the rest
+# ---------------------------------------------------------------------------
+cmd_down() {
+  kl_load_config
+  local ctx
+  ctx=$(kl_require_local_context)
+  if [ "${1:-}" != "--yes" ]; then
+    printf 'Delete namespace %s on context %s, and everything in it? [y/N] ' \
+      "$KL_NAMESPACE" "$ctx" >&2
+    local reply
+    read -r reply
+    case "$reply" in [yY] | [yY][eE][sS]) ;; *) kl_die "aborted" ;; esac
+  fi
+  kubectl delete namespace "$KL_NAMESPACE" --wait=false
+  kl_step "deleting in the background; klocal status will show when it is gone"
+}
+
+cmd_logs() {
+  kl_load_config
+  local workload=${1:-$KL_APP}
+  kubectl logs -n "$KL_NAMESPACE" "deployment/$workload" -f --tail=100
+}
+
+cmd_rebuild() {
+  kl_load_config
+  preflight
+  kl_info "build $KL_IMAGE"
+  kl_build_image "$KL_IMAGE" "$KL_ROOT/$KL_IMAGE_CONTEXT"
+  # The tag has not changed, so the Deployment spec has not changed either and
+  # `apply` would be a no-op. A restart is what makes the kubelet pick up the
+  # new image under the same tag.
+  kl_info "restart"
+  kubectl rollout restart "deployment/$KL_APP" -n "$KL_NAMESPACE"
+  kubectl rollout status "deployment/$KL_APP" -n "$KL_NAMESPACE" --timeout=180s
+}
+
+cmd_psql() {
+  kl_load_config
+  [ -n "$KL_DB" ] || kl_die "no workloads.db in $KL_CONFIG"
+  kubectl exec -it -n "$KL_NAMESPACE" "deploy/$KL_DB" -- \
+    psql -U "${KL_DB_SUPERUSER:-postgres}" -d "${KL_DB_NAME:-postgres}" "$@"
+}
+
+cmd_scaffold() {
+  local dest=${1:-$PWD}
+  [ -d "$dest" ] || kl_die "not a directory: $dest"
+  [ -d "$KL_TEMPLATES" ] || kl_die "templates not found at $KL_TEMPLATES"
+
+  mkdir -p "$dest/.k8s-local" "$dest/deploy/k8s-local" "$dest/deploy/local"
+
+  local wrote=0 f base target
+  for f in "$KL_TEMPLATES"/*; do
+    [ -f "$f" ] || continue
+    base=$(basename "$f")
+    case "$base" in
+      project.json) target="$dest/.k8s-local/$base" ;;
+      https-proxy.mjs) target="$dest/deploy/local/$base" ;;
+      *) target="$dest/deploy/k8s-local/$base" ;;
+    esac
+    if [ -e "$target" ]; then
+      kl_step "skip (exists) ${target#"$dest"/}"
+      continue
+    fi
+    cp "$f" "$target"
+    kl_step "wrote ${target#"$dest"/}"
+    wrote=$((wrote + 1))
+  done
+
+  kl_info "scaffolded $wrote file(s) into $dest"
+  kl_step "next: edit .k8s-local/project.json, then the PROJECT placeholders in deploy/k8s-local/"
+}
+
+# ---------------------------------------------------------------------------
+main() {
+  local cmd=${1:-help}
+  [ $# -gt 0 ] && shift || true
+  case "$cmd" in
+    up) cmd_up "$@" ;;
+    down) cmd_down "$@" ;;
+    status) cmd_status "$@" ;;
+    logs) cmd_logs "$@" ;;
+    rebuild) cmd_rebuild "$@" ;;
+    psql) cmd_psql "$@" ;;
+    scaffold) cmd_scaffold "$@" ;;
+    help | -h | --help) usage ;;
+    *)
+      printf 'klocal: unknown command %s\n\n' "$cmd" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,33 @@
+# Local cluster overlay. Brings the app and its datastores up in one namespace.
+#
+# The `images` block is what makes a registry unnecessary: the base manifests
+# name a registry image, and this rewrites it to the tag klocal builds straight
+# into the cluster's image store.
+#
+# Think about what you deliberately do NOT inherit from the production base, and
+# write down why. Anything that authenticates to a real external system, and any
+# NetworkPolicy whose allow-rules name pods this overlay does not run, belongs on
+# that list — the policy will apply cleanly and then silently drop traffic you
+# need, including kubectl port-forward.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: PROJECT-local
+
+resources:
+  - namespace.yaml
+  - postgres.yaml
+  - redis.yaml
+  - ingress.yaml
+  # - ../k8s   # the production base, once you have one
+
+images:
+  - name: ghcr.io/OWNER/PROJECT-api
+    newName: PROJECT-api
+    newTag: local
+
+patches:
+  - path: app-deployment-patch.yaml
+    target:
+      kind: Deployment
+      name: PROJECT-api

@@ -1,0 +1,32 @@
+# The app's hostname on the local cluster.
+#
+# lvh.me is a public domain whose zone answers every name — including any
+# subdomain — with 127.0.0.1. So multi-tenant subdomain routing works locally
+# with no /etc/hosts entry and no wildcard DNS of your own. Alternatives with the
+# same property: nip.io, sslip.io, and the reserved *.localhost.
+#
+# If the app requires https (it rejects non-https Origins, or it sets __Host-
+# cookies, which are Secure unconditionally), browsers must NOT reach this
+# Ingress directly. Put deploy/local/https-proxy.mjs in front on :8443; it
+# terminates TLS and forwards here with the Host header intact. Without that, a
+# plain-HTTP local stack routes requests and passes CORS but can never complete a
+# login — the routing looks perfect right up to the point it fails.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: PROJECT-api
+spec:
+  # Rancher Desktop ships traefik. kind, minikube and Docker Desktop do not —
+  # see references/engines.md before changing this.
+  ingressClassName: traefik
+  rules:
+    - host: api.lvh.me
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: PROJECT-api
+                port:
+                  number: 80

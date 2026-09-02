@@ -1,0 +1,52 @@
+# Throwaway Redis. No volume, same reasoning as postgres.yaml.
+#
+# The password comes from the same Secret the app reads, and Redis keeps the
+# --requirepass it was started with for the life of the container. So if a re-run
+# of the bring-up ever rotates that value, this pod must be restarted in the same
+# breath or the app crash-loops on WRONGPASS against a password only the Secret
+# knows. The cleaner fix is not to rotate it at all — see references/bring-up.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: PROJECT-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: PROJECT-redis
+  template:
+    metadata:
+      labels:
+        app: PROJECT-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command: ["redis-server"]
+          args: ["--requirepass", "$(REDIS_PASSWORD)"]
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: PROJECT-api-secrets
+                  key: REDIS_PASSWORD
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: PROJECT-redis
+spec:
+  selector:
+    app: PROJECT-redis
+  ports:
+    - port: 6379
+      targetPort: 6379

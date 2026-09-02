@@ -1,0 +1,50 @@
+{
+  "_comment": "klocal configuration. Commit this file. Replace every PROJECT placeholder.",
+
+  "project": "PROJECT",
+  "namespace": "PROJECT-local",
+  "rootDomain": "lvh.me",
+  "ingressClass": "traefik",
+
+  "image": {
+    "name": "PROJECT-api:local",
+    "context": "api"
+  },
+
+  "manifests": "deploy/k8s-local",
+
+  "workloads": {
+    "app": "PROJECT-api",
+    "db": "PROJECT-postgres",
+    "cache": "PROJECT-redis"
+  },
+
+  "_secret": [
+    "klocal never touches secret values. It runs `hook` from the project root with",
+    "KL_NAMESPACE, KL_SECRET and KL_SECRET_ENV_FILE exported, and the hook is",
+    "responsible for creating the Secret. Piping a vault straight into kubectl keeps",
+    "every value out of both the filesystem and the model transcript, e.g.",
+    "  opgate run -f api/.env.op -- ./deploy/scripts/local-secret.sh",
+    "Set hook to \"\" if the project has no secrets yet."
+  ],
+  "secret": {
+    "name": "PROJECT-api-secrets",
+    "envFile": "api/.env.op",
+    "hook": ""
+  },
+
+  "database": {
+    "name": "PROJECT_dev",
+    "superuser": "PROJECT",
+    "appRole": "PROJECT_app"
+  },
+
+  "_tls": [
+    "Only needed when the app refuses non-https origins, or when it sets __Host-",
+    "cookies (which are unconditionally Secure). See references/bring-up.md."
+  ],
+  "tls": {
+    "port": 8443,
+    "certDir": "~/.PROJECT-local-tls"
+  }
+}

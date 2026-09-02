@@ -1,0 +1,71 @@
+# Throwaway Postgres for the local cluster only.
+#
+# There is no volume, so the data is gone when the pod restarts and the
+# migrations have to be re-run. That is the right default for a local stack: a
+# corrupt local database becomes `kubectl rollout restart`, not an afternoon.
+# Say it out loud in your project's docs, though, or it reads as an oversight.
+#
+# Production should not have a Postgres manifest at all — it belongs on a managed
+# instance with a real volume and real backups.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: PROJECT-postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: PROJECT-postgres
+  template:
+    metadata:
+      labels:
+        app: PROJECT-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            # The superuser the image creates. The application must NOT connect
+            # as this role — see app-deployment-patch.yaml for why.
+            - name: POSTGRES_USER
+              value: "PROJECT"
+            - name: POSTGRES_PASSWORD
+              value: "PROJECT_local_only"
+            - name: POSTGRES_DB
+              value: "PROJECT_dev"
+          ports:
+            - containerPort: 5432
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "PROJECT"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+---
+# NodePort so a desktop SQL client can connect without holding a port-forward
+# open. 30432 keeps it clear of a 5432 already taken by a docker-compose stack.
+#
+# Accepted trade-off: some engines' forwarders bind 0.0.0.0, which puts this port
+# and the password above on the local network, not just this machine. Fine on a
+# trusted network; on a shared one delete this Service and use
+# `kubectl port-forward` instead, which binds loopback only.
+#
+# Local clusters only — never mirror this into the production base.
+apiVersion: v1
+kind: Service
+metadata:
+  name: PROJECT-postgres
+spec:
+  type: NodePort
+  selector:
+    app: PROJECT-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+      nodePort: 30432
