@@ -16,16 +16,25 @@ everything reports healthy, and a login that fails only over plain http.
 
 ## The rule that matters most
 
-**Never apply anything without checking the kubecontext first.** One stale
+**Never touch a cluster without checking the kubecontext first.** One stale
 context is the whole difference between a local bring-up and a production
-deploy, and `kubectl` will not ask. `klocal` refuses any context that is not
-`rancher-desktop`, `docker-desktop`, `minikube`, `colima`, `kind-*` or `k3d-*`,
-and refuses when there is no context at all.
+deploy, and `kubectl` will not ask. Two independent checks, because neither is
+enough alone:
 
-The check is a name whitelist, not a heuristic — "contains the word local" would
-happily accept a production cluster called `localstack-prod`. If a legitimate
-local context is refused, add its exact name to `kl_context_is_local`; never
-loosen the pattern.
+1. **The name** must be `rancher-desktop`, `docker-desktop`, `minikube`,
+   `colima`, `kind-*` or `k3d-*`. A whitelist, not a heuristic — "contains the
+   word local" would accept a production cluster called `localstack-prod`.
+2. **The API server address** must be loopback or RFC1918. Names are chosen by
+   whoever created the cluster, so a remote cluster can be called `kind-prod`;
+   the address is the part that naming cannot fake.
+
+No context at all is refused the same way a remote one is. Every command that
+reaches the cluster is guarded — including `logs` and `psql`, which read and
+write through a pod — and the verified context is pinned with `--context` on
+every call, so switching the kubeconfig mid-build cannot redirect the rest.
+
+If a legitimate local context is refused, add its exact name to
+`kl_context_name_is_local` and a case to the test suite; never loosen the pattern.
 
 ## Do not
 
@@ -43,12 +52,13 @@ loosen the pattern.
   `--requirepass` it booted with, so the app crash-loops on `WRONGPASS`; a
   rotated signing key breaks an already-running dev server. Read the existing
   value first, generate only when it is absent.
-- Declare an env var twice. The two ways it reaches the cluster fail in opposite
-  directions: in a **kustomize patch** the strategic merge collapses it and keeps
-  the **first**, silently, before `kubectl` ever sees it; in a **plain manifest**
-  both survive, `kubectl apply` warns, and the kubelet gives the container the
-  **last**. Guessing which value is live gets it wrong half the time — read the
-  live object, or run `klocal status`, which reports both cases distinctly.
+- Declare an env var twice. It is malformed input to a merge-keyed list, and
+  what happens next depends on the path: a **kustomize patch** collapses it and
+  keeps the **first**, silently, before `kubectl` sees anything; a **plain
+  manifest** applied client-side keeps **both**, warns, and the kubelet uses the
+  **last**; server-side apply rejects it outright. Do not memorise a winner —
+  the point is that the manifest cannot tell you and only the live object can.
+  `klocal status` reports the duplicate next to the value actually in effect.
 - Give the local datastores a volume. They are meant to be throwaway; say so in
   the project's docs rather than making local state precious.
 
@@ -61,7 +71,7 @@ loosen the pattern.
 | `klocal status`          | Something is wrong, or before trusting any claim about what is running |
 | `klocal rebuild`         | Code changed and the image tag did not                                 |
 | `klocal logs [workload]` | The app is crash-looping or answering wrong                            |
-| `klocal psql`            | Running migrations or inspecting local data                            |
+| `klocal psql [--app]`    | Migrations as the owner, or `--app` to check that RLS actually bites   |
 | `klocal down`            | Finished, or the local database needs a clean slate                    |
 
 ## Common workflows

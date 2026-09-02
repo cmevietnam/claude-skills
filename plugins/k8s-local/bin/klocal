@@ -31,26 +31,47 @@ klocal - run this project's stack on a local Kubernetes cluster
   klocal down [--yes]        delete the namespace and everything in it
   klocal status              pods, services, ingress, reachability, manifest drift
   klocal logs [workload]     follow logs (default: the app workload)
-  klocal rebuild             rebuild the image and restart the app rollout
-  klocal psql [args...]      psql inside the database pod
+  klocal rebuild             rebuild the image and restart the rollout
+  klocal psql [--app] [args] psql in the database pod (--app: as the app role)
   klocal scaffold [dir]      write manifests + .k8s-local/project.json into a project
   klocal help                this text
 
 Configuration lives in .k8s-local/project.json, found by walking up from $PWD.
+Every command that touches the cluster refuses a context that is not local.
 EOF
 }
 
 # ---------------------------------------------------------------------------
-# preflight - every guard that must hold before anything is applied
+# preflight - every guard that must hold before anything touches the cluster.
+# Sets KL_CONTEXT, which pins every later kubectl call (kl_kubectl).
 # ---------------------------------------------------------------------------
+require_cluster() {
+  command -v kubectl >/dev/null 2>&1 || kl_die "kubectl not found"
+  KL_CONTEXT=$(kl_require_local_context)
+}
+
 preflight() {
   kl_info "preflight"
-  command -v kubectl >/dev/null 2>&1 || kl_die "kubectl not found"
-  local ctx
-  ctx=$(kl_require_local_context)
-  kl_step "context: $ctx"
+  require_cluster
+  kl_step "context: $KL_CONTEXT"
   kl_step "namespace: $KL_NAMESPACE"
   kl_check_ingressclass "$KL_INGRESS_CLASS"
+  check_namespace_agreement
+}
+
+# kustomize carries its own `namespace:`, and it is the one that decides where
+# resources land. If it disagrees with project.json, klocal would wait on a
+# rollout in one namespace while the objects went to another, and `down` would
+# later delete the wrong one.
+check_namespace_agreement() {
+  local kf="$KL_ROOT/$KL_MANIFESTS/kustomization.yaml" declared
+  [ -f "$kf" ] || return 0
+  declared=$(sed -n 's/^namespace:[[:space:]]*//p' "$kf" | head -1 | tr -d '"'\''[:space:]')
+  [ -n "$declared" ] || return 0
+  [ "$declared" = "$KL_NAMESPACE" ] || kl_die \
+    "namespace mismatch: project.json says '$KL_NAMESPACE' but
+       ${kf#"$KL_ROOT"/} says '$declared'. Resources would be applied to one and
+       waited on (and later deleted) in the other. Make them agree."
 }
 
 # ---------------------------------------------------------------------------
@@ -70,8 +91,8 @@ cmd_up() {
   fi
 
   kl_info "namespace"
-  kubectl create namespace "$KL_NAMESPACE" --dry-run=client -o yaml |
-    kubectl apply -f - >/dev/null
+  kl_kubectl create namespace "$KL_NAMESPACE" --dry-run=client -o yaml |
+    kl_kubectl apply -f - >/dev/null
   kl_step "namespace/$KL_NAMESPACE ready"
 
   # The project owns its secret material; klocal only calls the hook. Keeping
@@ -81,21 +102,22 @@ cmd_up() {
     kl_info "secret"
     kl_step "running $KL_SECRET_HOOK"
     (cd "$KL_ROOT" && KL_NAMESPACE="$KL_NAMESPACE" KL_SECRET="$KL_SECRET" \
-      KL_SECRET_ENV_FILE="$KL_SECRET_ENV_FILE" sh -c "$KL_SECRET_HOOK")
+      KL_CONTEXT="$KL_CONTEXT" KL_SECRET_ENV_FILE="$KL_SECRET_ENV_FILE" \
+      sh -c "$KL_SECRET_HOOK")
   fi
 
   kl_info "apply $KL_MANIFESTS"
   if [ -f "$KL_ROOT/$KL_MANIFESTS/kustomization.yaml" ]; then
-    kubectl apply -k "$KL_ROOT/$KL_MANIFESTS"
+    kl_kubectl apply -k "$KL_ROOT/$KL_MANIFESTS"
   else
-    kubectl apply -n "$KL_NAMESPACE" -f "$KL_ROOT/$KL_MANIFESTS"
+    kl_kubectl apply -n "$KL_NAMESPACE" -f "$KL_ROOT/$KL_MANIFESTS"
   fi
 
   kl_info "waiting for rollout"
   local w
   for w in $KL_DB $KL_CACHE $KL_APP; do
     [ -n "$w" ] || continue
-    kubectl rollout status "deployment/$w" -n "$KL_NAMESPACE" --timeout=180s
+    kl_kubectl rollout status "deployment/$w" -n "$KL_NAMESPACE" --timeout=180s
   done
 
   next_steps
@@ -139,52 +161,64 @@ cmd_status() {
   local ctx
   ctx=$(kl_current_context)
   printf 'context:   %s%s\n' "${ctx:-<none>}" \
-    "$(kl_context_is_local "${ctx:-}" || printf '  (NOT a local context)')"
+    "$(kl_context_name_is_local "${ctx:-}" || printf '  (NOT a local context)')"
   printf 'namespace: %s\n\n' "$KL_NAMESPACE"
 
-  if ! kubectl get namespace "$KL_NAMESPACE" >/dev/null 2>&1; then
+  # status is read-only, so it reports on a remote context rather than refusing —
+  # but it must not pretend it verified one.
+  if ! kl_context_name_is_local "${ctx:-}"; then
+    printf 'refusing to query a non-local context; switch context to inspect the local stack\n'
+    return 0
+  fi
+  KL_CONTEXT="$ctx"
+
+  if ! kl_kubectl get namespace "$KL_NAMESPACE" >/dev/null 2>&1; then
     printf 'namespace %s does not exist — run: klocal up\n' "$KL_NAMESPACE"
     return 0
   fi
 
-  kubectl get pods,svc,ingress -n "$KL_NAMESPACE"
+  kl_kubectl get pods,svc,ingress -n "$KL_NAMESPACE"
 
   printf '\nstorage:\n'
   local pvc
-  pvc=$(kubectl get pvc -n "$KL_NAMESPACE" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  pvc=$(kl_kubectl get pvc -n "$KL_NAMESPACE" --no-headers 2>/dev/null | wc -l | tr -d ' ')
   if [ "$pvc" = "0" ]; then
     printf '  no PVC — datastores are ephemeral, a pod restart wipes them\n'
   else
-    kubectl get pvc -n "$KL_NAMESPACE"
+    kl_kubectl get pvc -n "$KL_NAMESPACE"
   fi
 
   printf '\ndrift (manifest vs live):\n'
-  local found=0 f name count live n effective
-  for f in "$KL_ROOT/$KL_MANIFESTS"/*.yaml; do
-    [ -f "$f" ] || continue
-    while read -r name count; do
+  local found=0 f scope name count live n effective container
+  while read -r f; do
+    [ -n "$f" ] || continue
+    while read -r scope name count; do
       [ -n "$name" ] || continue
       found=1
-      live=$(kl_env_of "$KL_NAMESPACE" "$KL_APP" "$name")
+      container=${scope#*/}
+      printf '  %s declared %sx in %s (container %s)\n' \
+        "$name" "$count" "${f##*/}" "$container"
+      live=$(kl_env_of "$KL_NAMESPACE" "$KL_APP" "$container" "$name" | grep . || true)
       n=$(printf '%s' "$live" | grep -c . || true)
-      printf '  %s declared %sx in %s\n' "$name" "$count" "$(basename "$f")"
       if [ "${n:-0}" -gt 1 ]; then
         # Both survived into the live spec: the kubelet builds env in order, so
         # the last one is what the container actually sees.
-        effective=$(printf '%s' "$live" | grep . | tail -1)
+        effective=$(printf '%s' "$live" | tail -1 | cut -f1)
         printf '    live spec holds %s copies; the container sees the last: %s\n' "$n" "$effective"
       elif [ "${n:-0}" -eq 1 ]; then
         # Collapsed during a strategic merge — the other value never reached the
         # cluster, and nothing warned.
-        printf '    collapsed to one before apply; live value: %s\n' "$live"
+        printf '    collapsed to one before apply; live value: %s\n' "$(printf '%s' "$live" | cut -f1)"
         printf '    the other value was dropped silently — check which you meant\n'
       else
-        printf '    not set on the live deployment\n'
+        printf '    not set on the live deployment (or it uses valueFrom)\n'
       fi
     done <<EOF
 $(kl_duplicate_env_vars "$f")
 EOF
-  done
+  done <<EOF
+$(kl_manifest_files "$KL_ROOT/$KL_MANIFESTS")
+EOF
   [ "$found" = 0 ] && printf '  no duplicate env declarations found\n'
   return 0
 }
@@ -194,23 +228,29 @@ EOF
 # ---------------------------------------------------------------------------
 cmd_down() {
   kl_load_config
-  local ctx
-  ctx=$(kl_require_local_context)
+  require_cluster
   if [ "${1:-}" != "--yes" ]; then
     printf 'Delete namespace %s on context %s, and everything in it? [y/N] ' \
-      "$KL_NAMESPACE" "$ctx" >&2
+      "$KL_NAMESPACE" "$KL_CONTEXT" >&2
     local reply
     read -r reply
     case "$reply" in [yY] | [yY][eE][sS]) ;; *) kl_die "aborted" ;; esac
   fi
-  kubectl delete namespace "$KL_NAMESPACE" --wait=false
+  # `--` stops kubectl reading a namespace that begins with a dash as a flag.
+  # kl_require_dns_label already rejects those, so this is the second lock.
+  kl_kubectl delete namespace --wait=false -- "$KL_NAMESPACE"
   kl_step "deleting in the background; klocal status will show when it is gone"
 }
 
+# logs and psql reach into a running pod, so they need the same guard as the
+# write commands: without it, `klocal psql -c 'DROP ...'` runs against whatever
+# context happens to be current, production included.
 cmd_logs() {
   kl_load_config
+  require_cluster
   local workload=${1:-$KL_APP}
-  kubectl logs -n "$KL_NAMESPACE" "deployment/$workload" -f --tail=100
+  kl_require_dns_label "workload argument" "$workload"
+  kl_kubectl logs -n "$KL_NAMESPACE" "deployment/$workload" -f --tail=100
 }
 
 cmd_rebuild() {
@@ -222,15 +262,31 @@ cmd_rebuild() {
   # `apply` would be a no-op. A restart is what makes the kubelet pick up the
   # new image under the same tag.
   kl_info "restart"
-  kubectl rollout restart "deployment/$KL_APP" -n "$KL_NAMESPACE"
-  kubectl rollout status "deployment/$KL_APP" -n "$KL_NAMESPACE" --timeout=180s
+  kl_kubectl rollout restart "deployment/$KL_APP" -n "$KL_NAMESPACE"
+  kl_kubectl rollout status "deployment/$KL_APP" -n "$KL_NAMESPACE" --timeout=180s
 }
 
 cmd_psql() {
   kl_load_config
+  require_cluster
   [ -n "$KL_DB" ] || kl_die "no workloads.db in $KL_CONFIG"
-  kubectl exec -it -n "$KL_NAMESPACE" "deploy/$KL_DB" -- \
-    psql -U "${KL_DB_SUPERUSER:-postgres}" -d "${KL_DB_NAME:-postgres}" "$@"
+  # Default to the owning role, because migrations and inspection need it. --app
+  # connects as the least-privilege application role instead, which is how you
+  # check that row-level security actually bites.
+  local user=${KL_DB_SUPERUSER:-postgres}
+  if [ "${1:-}" = "--app" ]; then
+    shift
+    [ -n "$KL_DB_APP_ROLE" ] ||
+      kl_die "--app needs \"database\": { \"appRole\": ... } in $KL_CONFIG"
+    user=$KL_DB_APP_ROLE
+  fi
+  # -t only when stdin really is a terminal: kubectl warns and degrades when it
+  # is not, which turns every scripted `klocal psql -c ...` into noise.
+  local tty=""
+  [ -t 0 ] && tty="-t"
+  # shellcheck disable=SC2086 # $tty is a single deliberate flag or empty
+  kl_kubectl exec -i $tty -n "$KL_NAMESPACE" "deploy/$KL_DB" -- \
+    psql -U "$user" -d "${KL_DB_NAME:-postgres}" "$@"
 }
 
 cmd_scaffold() {
@@ -259,7 +315,8 @@ cmd_scaffold() {
   done
 
   kl_info "scaffolded $wrote file(s) into $dest"
-  kl_step "next: edit .k8s-local/project.json, then the PROJECT placeholders in deploy/k8s-local/"
+  kl_step "next: edit .k8s-local/project.json, then the PROJECT placeholders in deploy/"
+  kl_step "the namespace in deploy/k8s-local/kustomization.yaml must match project.json"
 }
 
 # ---------------------------------------------------------------------------

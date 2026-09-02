@@ -30,49 +30,64 @@ Claude Code — symlink `bin/klocal` onto `PATH` and use it as an ordinary tool.
 
 ## The guard
 
-`klocal` refuses any kubecontext that is not `rancher-desktop`,
-`docker-desktop`, `minikube`, `colima`, `kind-*` or `k3d-*`, and refuses when
-there is no context at all. One stale context is the whole difference between a
-local bring-up and a production deploy, and `kubectl` will not ask.
+One stale context is the whole difference between a local bring-up and a
+production deploy, and `kubectl` will not ask. `klocal` checks two things, and
+both must hold:
 
-It is a whitelist of exact names, not a heuristic: matching "contains local"
-would accept a production cluster called `localstack-prod`. To add a legitimate
-local context, put its exact name in `kl_context_is_local`
-(`scripts/lib/cluster.sh`) and add a test case.
+1. **The context name** is `rancher-desktop`, `docker-desktop`, `minikube`,
+   `colima`, `kind-*` or `k3d-*` — a whitelist of exact names, not a heuristic,
+   because matching "contains local" would accept `localstack-prod`.
+2. **The API server address** is loopback or RFC1918. The name is chosen by
+   whoever created the cluster, so a remote cluster can be called `kind-prod`;
+   the address is the part naming cannot fake.
+
+No context at all is refused like a remote one. Every subcommand that reaches the
+cluster is guarded — `logs` and `psql` included, since they read and write
+through a pod — and the verified context is pinned with `--context` on every
+call, so a kubeconfig switch during a long build cannot redirect what follows.
+
+Values from `project.json` that become kubectl arguments are validated, not just
+quoted: quoting stops word-splitting but not option interpretation, and a
+namespace of `--all` would otherwise turn `klocal down --yes` into
+`kubectl delete namespace --all`.
+
+To add a legitimate local context, put its exact name in
+`kl_context_name_is_local` (`scripts/lib/cluster.sh`) and add a test case.
 
 This stops the ordinary mistake. It is not a sandbox — it guards `klocal`, not
 the `kubectl` you type yourself.
 
 ## Commands
 
-| Command                  | Does                                                               |
-| ------------------------ | ------------------------------------------------------------------ |
-| `klocal up [--no-build]` | Build, apply the overlay, wait for rollout, print next steps       |
-| `klocal down [--yes]`    | Delete the namespace and everything in it                          |
-| `klocal status`          | Pods, services, ingress, ephemeral storage, manifest-vs-live drift |
-| `klocal logs [workload]` | Follow logs (default: the app workload)                            |
-| `klocal rebuild`         | Rebuild the image and restart the rollout                          |
-| `klocal psql [args]`     | `psql` inside the database pod                                     |
-| `klocal scaffold [dir]`  | Write manifests + config into a project                            |
+| Command                      | Does                                                                     |
+| ---------------------------- | ------------------------------------------------------------------------ |
+| `klocal up [--no-build]`     | Build, apply the overlay, wait for rollout, print next steps             |
+| `klocal down [--yes]`        | Delete the namespace and everything in it                                |
+| `klocal status`              | Pods, services, ingress, ephemeral storage, manifest-vs-live drift       |
+| `klocal logs [workload]`     | Follow logs (default: the app workload)                                  |
+| `klocal rebuild`             | Rebuild the image and restart the rollout                                |
+| `klocal psql [--app] [args]` | `psql` in the database pod; `--app` connects as the least-privilege role |
+| `klocal scaffold [dir]`      | Write manifests + config into a project                                  |
 
 ## Configuration
 
 `.k8s-local/project.json`, committed, found by walking up from `$PWD`. Every key
 below is optional except `project`.
 
-| Key                                         | Default                 | Meaning                                              |
-| ------------------------------------------- | ----------------------- | ---------------------------------------------------- |
-| `project`                                   | —                       | Required. Names the stack                            |
-| `namespace`                                 | `<project>-local`       | Everything lives here; deleting it is the uninstall  |
-| `rootDomain`                                | `lvh.me`                | Wildcard-DNS domain for hostnames                    |
-| `ingressClass`                              | `traefik`               | Warned about, not enforced, when absent              |
-| `image.name`                                | `<project>-api:local`   | Tag built into the cluster's store                   |
-| `image.context`                             | `.`                     | Build context, relative to the project root          |
-| `manifests`                                 | `deploy/k8s-local`      | Applied with `-k` if it holds a `kustomization.yaml` |
-| `workloads.app` / `.db` / `.cache`          | `<project>-api` / — / — | Rollout order is db, cache, app                      |
-| `secret.name` / `.envFile` / `.hook`        | —                       | See below                                            |
-| `database.name` / `.superuser` / `.appRole` | —                       | Used by `klocal psql`                                |
-| `tls.port` / `.certDir`                     | —                       | Reported in the closing message                      |
+| Key                                  | Default                 | Meaning                                                  |
+| ------------------------------------ | ----------------------- | -------------------------------------------------------- |
+| `project`                            | —                       | Required. Names the stack                                |
+| `namespace`                          | `<project>-local`       | Everything lives here; deleting it is the uninstall      |
+| `rootDomain`                         | `lvh.me`                | Wildcard-DNS domain for hostnames                        |
+| `ingressClass`                       | `traefik`               | Warned about, not enforced, when absent                  |
+| `image.name`                         | `<project>-api:local`   | Tag built into the cluster's store                       |
+| `image.context`                      | `.`                     | Build context, relative to the project root              |
+| `manifests`                          | `deploy/k8s-local`      | Applied with `-k` if it holds a `kustomization.yaml`     |
+| `workloads.app` / `.db` / `.cache`   | `<project>-api` / — / — | Rollout order is db, cache, app                          |
+| `secret.name` / `.envFile` / `.hook` | —                       | See below                                                |
+| `database.name` / `.superuser`       | —                       | Database and owning role `klocal psql` connects to       |
+| `database.appRole`                   | —                       | The least-privilege role `klocal psql --app` connects as |
+| `tls.port` / `.certDir`              | —                       | Reported in the closing message                          |
 
 ### Secrets
 
@@ -109,21 +124,28 @@ exactly this defect was found this way in a real repo.
 ## Tests
 
 ```bash
-bash plugins/k8s-local/scripts/test-klocal.sh              # 55 assertions
+bash plugins/k8s-local/scripts/test-klocal.sh              # 159 assertions
 bash plugins/k8s-local/scripts/test-klocal.sh --self-check # + prove it can fail
 ```
 
-No cluster, no network, no container engine: `kubectl`, `docker` and `nerdctl`
-are stubbed on `PATH` and `HOME` is redirected to a temp dir, so live state is
-never touched.
+No cluster, no network, no container engine: `kubectl`, `docker`, `nerdctl`,
+`kind`, `k3d` and `minikube` are all stubbed on `PATH` — created before the first
+test that could reach one, so a regression in the context guard cannot fall
+through to a real engine — and `HOME` is redirected to a temp dir, so live state
+is never touched.
 
-Every assertion demands a specific string that only appears when the code under
-test actually ran, and empty output is a hard failure — an assertion phrased as
-an absence cannot tell a passing run from a run that never happened. The two
-absence checks additionally require an execution marker. `--self-check`
-deliberately breaks three assertions and requires all three to go red; if fewer
-fail, the suite exits non-zero instead of reporting green, because a harness that
-cannot fail is not evidence.
+The assertion discipline, because a suite that cannot fail is not evidence:
+
+- `want` demands a specific string. An **empty expectation is itself a failure**,
+  since every string contains the empty string and such a check can never go red.
+- Empty output is always a hard failure, never agreement.
+- `want_absent` also requires a marker proving execution reached the code under
+  test; otherwise silence from an unrelated crash scores as a pass.
+- `want_empty` requires a **positive control** — the same function producing
+  output on a known input — so "no output" cannot pass when the function is
+  missing or broken.
+- `--self-check` breaks four assertions on purpose and exits non-zero unless all
+  four go red.
 
 ## Read
 

@@ -12,9 +12,10 @@ minikube run the cluster inside their own container or VM with a separate image
 store, and a build on the host is invisible to it — the pod sits in
 `ErrImageNeverPull` on an image you can see in `docker images`.
 
-**Which ingress controller is present.** Only Rancher Desktop ships one. On the
-others an `Ingress` naming a class that does not exist applies cleanly, the
-rollout goes green, and every hostname routes nowhere.
+**Which ingress controller is present.** The k3s-based engines — Rancher Desktop
+and k3d — deploy Traefik by default. Docker Desktop, kind and minikube ship none
+until you install one, and there an `Ingress` naming a class that does not exist
+applies cleanly, the rollout goes green, and every hostname routes nowhere.
 
 |                     | Image into the cluster                                                                 | Ingress out of the box                              | Context name      |
 | ------------------- | -------------------------------------------------------------------------------------- | --------------------------------------------------- | ----------------- |

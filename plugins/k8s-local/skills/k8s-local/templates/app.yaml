@@ -1,0 +1,50 @@
+# The application itself. Replace this with `../k8s` in kustomization.yaml once
+# the project has a production base worth inheriting; until then this stands on
+# its own so a fresh scaffold renders and runs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: PROJECT-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: PROJECT-api
+  template:
+    metadata:
+      labels:
+        app: PROJECT-api
+    spec:
+      containers:
+        - name: api
+          # Built into the cluster's image store by `klocal up`; there is no
+          # registry. `:local` already defaults to IfNotPresent (Always applies
+          # only to `:latest` or an untagged image), but it is written out so the
+          # manifest does not silently depend on the tag never becoming `latest`.
+          image: PROJECT-api:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          # Declare each env name at most ONCE per container — see the header of
+          # app-deployment-patch.yaml for what a duplicate does.
+          env:
+            - name: PORT
+              value: "8080"
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "512Mi"
+              cpu: "1000m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: PROJECT-api
+spec:
+  selector:
+    app: PROJECT-api
+  ports:
+    - port: 80
+      targetPort: 8080

@@ -22,14 +22,20 @@ spec:
       containers:
         - name: redis
           image: redis:7-alpine
-          command: ["redis-server"]
-          args: ["--requirepass", "$(REDIS_PASSWORD)"]
+          # The fallback keeps a fresh scaffold runnable before any secret hook
+          # exists; once the Secret carries REDIS_PASSWORD it is used instead.
+          command: ["sh", "-c"]
+          args:
+            [
+              'exec redis-server --requirepass "${REDIS_PASSWORD:-local_dev_only}"',
+            ]
           env:
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: PROJECT-api-secrets
                   key: REDIS_PASSWORD
+                  optional: true
           ports:
             - containerPort: 6379
           resources:

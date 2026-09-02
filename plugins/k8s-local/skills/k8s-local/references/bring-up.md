@@ -25,10 +25,15 @@ cheaper to catch now than to diagnose from a symptom later.
 There is no registry and no push. The kubelet finds the tag locally, provided
 two things are true:
 
-- The overlay sets `imagePullPolicy: IfNotPresent` and `imagePullSecrets: null`.
-  With the default `Always`, the kubelet ignores the local image and tries to
-  pull `PROJECT-api:local` from Docker Hub, which fails with `ImagePullBackOff`
-  on an image that is sitting right there.
+- `imagePullPolicy` resolves to `IfNotPresent`. Kubernetes defaults it by tag:
+  `IfNotPresent` for an ordinary tag like `:local`, but **`Always` when the tag
+  is `:latest` or omitted**. So a local image tagged `:latest` is ignored in
+  favour of a registry pull that fails with `ImagePullBackOff` on an image
+  sitting right there. Tag your local builds with something other than `latest`,
+  and set the policy explicitly anyway so the manifest does not depend on that
+  rule. Set `imagePullSecrets: null` too — not because it forces a pull, but
+  because inheriting a production base's registry credential reference in a
+  cluster that has no such Secret is one more thing to go wrong.
 - The build went to the store the cluster actually reads.
 
 **Probe the socket, not the binary.** Rancher Desktop ships `nerdctl` even when
@@ -44,8 +49,15 @@ fi
 ```
 
 The `k8s.io` namespace is not optional on containerd. An image built into the
-default namespace is invisible to the kubelet, with the same
-`ErrImageNeverPull` symptom as not having built it at all.
+default namespace is invisible to the kubelet, exactly as if it had never been
+built — `ImagePullBackOff` under `IfNotPresent`, or `ErrImageNeverPull` if the
+policy is `Never`.
+
+**kind, k3d and minikube need one more step.** Their node runs in its own
+container or VM with a separate image store, so a host build never reaches it.
+`klocal` runs the right import for the current context; by hand it is
+`kind load docker-image`, `k3d image import`, or `minikube image load`. Skip it
+and the pod keeps running the _previous_ image with nothing reported anywhere.
 
 ## 2. Namespace, then secret, then manifests
 
@@ -122,9 +134,18 @@ DO $$ BEGIN
 END $$;
 -- Unconditional. A role left from an earlier run may carry a different
 -- password, NOLOGIN, or worse SUPERUSER — exactly what this role exists to avoid.
+-- NOREPLICATION matters as much as the rest: a replication role can stream the
+-- whole cluster, which reads every row RLS was meant to hide.
 ALTER ROLE app_role LOGIN PASSWORD 'app_local_only'
-  NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+  NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+-- Attribute checks only look at the role itself. Inherited membership in a
+-- privileged role bypasses them entirely, so strip memberships too.
+REVOKE ALL ON SCHEMA public FROM app_role;
 GRANT CONNECT ON DATABASE app_dev TO app_role;
+-- Without USAGE on the schema, the role cannot resolve a single table name —
+-- and an app on a non-public schema fails here with a confusing "relation does
+-- not exist" rather than a permission error.
+GRANT USAGE ON SCHEMA public TO app_role;
 -- Covers everything the migrations create from here on.
 ALTER DEFAULT PRIVILEGES FOR ROLE owner GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_role;
 ALTER DEFAULT PRIVILEGES FOR ROLE owner GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO app_role;
@@ -133,10 +154,21 @@ ALTER DEFAULT PRIVILEGES FOR ROLE owner GRANT USAGE, SELECT, UPDATE ON SEQUENCES
 Then **assert it**, and fail the bring-up if the assertion does not hold:
 
 ```bash
-[ "$(psql -tAc "SELECT rolsuper OR rolbypassrls OR NOT rolcanlogin
+# Attributes AND memberships: a role that is merely a member of a superuser role
+# has rolsuper = false and every superuser privilege.
+[ "$(psql -tAc "SELECT rolsuper OR rolbypassrls OR rolreplication OR NOT rolcanlogin
+                       OR pg_has_role('app_role', 'pg_read_all_data', 'USAGE')
+                       OR EXISTS (SELECT 1 FROM pg_auth_members m
+                                  JOIN pg_roles g ON g.oid = m.roleid
+                                  WHERE m.member = pg_roles.oid
+                                    AND (g.rolsuper OR g.rolbypassrls))
                 FROM pg_roles WHERE rolname='app_role'")" = "f" ] \
   || { echo "FAIL: app_role is not a safe login role" >&2; exit 1; }
 ```
+
+Prove the assertion bites before you trust it: grant the role `BYPASSRLS`, watch
+the bring-up fail, then take it away again. An assertion nobody has seen go red
+is a comment.
 
 `ALTER DEFAULT PRIVILEGES` only covers objects created _after_ it runs. On any
 re-run against an already-migrated database, the existing tables and sequences
@@ -162,8 +194,12 @@ mean it does not, and both fail in ways that look like routing bugs:
   browser drops them silently, so every request after login is anonymous.
 
 The fix is a TLS front door in front of the cluster — not TLS on the Ingress —
-so one certificate covers both the API and the frontend dev server, and browsers
-reach a single origin. `templates/https-proxy.mjs` is ~90 lines of Node
+so one wildcard certificate and one port cover both the API and the frontend dev
+server. They remain **separate origins**: `https://www.lvh.me:8443` and
+`https://api.lvh.me:8443` differ in host, so CORS still applies and host-only
+cookies still do not cross between them. What the proxy buys is that both are
+_https_, which is what the two failures above actually require.
+`templates/https-proxy.mjs` is ~90 lines of Node
 built-ins: it terminates TLS on `:8443` and routes by `Host`, forwarding
 WebSocket upgrades so hot reload keeps working.
 

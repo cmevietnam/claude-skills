@@ -34,9 +34,12 @@ curl -s http://api.lvh.me/some-path
 
 The image exists on your machine and the cluster cannot see it.
 
-- `imagePullPolicy` is not `IfNotPresent`. The default `Always` makes the kubelet
-  try to pull `app:local` from Docker Hub. Also set `imagePullSecrets: null` in
-  the local overlay, or it looks for a registry credential that is not there.
+- `imagePullPolicy` resolved to `Always`. Kubernetes defaults it by tag:
+  `IfNotPresent` for an ordinary tag, `Always` for `:latest` or no tag at all. So
+  a local image tagged `:latest` gets pulled from Docker Hub instead of used.
+  Tag local builds something other than `latest` and set the policy explicitly.
+  (`ErrImageNeverPull` rather than `ImagePullBackOff` means the policy is
+  `Never` — then the image really is absent from the node's store.)
 - The build went to the wrong store. On containerd the `k8s.io` namespace is
   mandatory. On kind, k3d or minikube a host build never reaches the cluster
   without an explicit load step.

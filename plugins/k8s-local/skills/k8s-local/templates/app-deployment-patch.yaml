@@ -15,8 +15,8 @@ spec:
   template:
     spec:
       # The image is built straight into the cluster's image store, so there is
-      # no private registry to authenticate against. Both lines matter: without
-      # IfNotPresent the kubelet ignores the local tag and tries to pull it.
+      # no private registry to authenticate against — drop any pull secret the
+      # production base referenced, since no such Secret exists here.
       imagePullSecrets: null
       containers:
         - name: api
@@ -49,8 +49,12 @@ spec:
             - name: EMAIL_ENABLED
               value: "false"
 
+            # optional: true so a scaffold with no secret hook configured still
+            # starts. Drop the flag once secret.hook is set in project.json, so a
+            # missing Secret becomes a loud failure rather than a silent unset.
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: PROJECT-api-secrets
                   key: DATABASE_URL
+                  optional: true
