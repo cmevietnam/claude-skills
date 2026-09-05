@@ -363,10 +363,33 @@ expect_fail "NUL byte in prompt"   2 "NUL byte" \
 expect_fail "--out is an existing file" 2 "cannot use output directory" \
   --agy "$STUB" --out "$TMP/prompt.txt" "$TMP/prompt.txt"
 
+# A pre-existing report must be refused AND left byte-for-byte alone, and the run must
+# not have happened at all. An empty fixture could not prove either.
 mkdir -p "$TMP/run-collide"
-: > "$TMP/run-collide/out.json"
-expect_fail "--out already holds a report" 2 "already exists" \
+printf 'SENTINEL-OUT-DO-NOT-TOUCH\n' > "$TMP/run-collide/out.json"
+expect_fail "--out already holds out.json" 2 "already exists" \
   --agy "$STUB" --out "$TMP/run-collide" "$TMP/prompt.txt"
+if [ "$(cat "$TMP/run-collide/out.json")" = "SENTINEL-OUT-DO-NOT-TOUCH" ]; then
+  note_pass "existing out.json left untouched"
+else
+  note_fail "existing out.json was modified: $(cat "$TMP/run-collide/out.json")"
+fi
+if [ ! -e "$STUB_ARGV" ]; then
+  note_pass "collision refused before agy ran"
+else
+  note_fail "agy was invoked despite the collision"
+fi
+
+# err.txt collides too, not just out.json
+mkdir -p "$TMP/run-collide2"
+printf 'SENTINEL-ERR\n' > "$TMP/run-collide2/err.txt"
+expect_fail "--out already holds err.txt" 2 "already exists" \
+  --agy "$STUB" --out "$TMP/run-collide2" "$TMP/prompt.txt"
+if [ "$(cat "$TMP/run-collide2/err.txt")" = "SENTINEL-ERR" ]; then
+  note_pass "existing err.txt left untouched"
+else
+  note_fail "existing err.txt was modified"
+fi
 
 expect_pass "run path prints review" "$GOOD_STDOUT" \
   --agy "$STUB" --out "$TMP/run1" "$TMP/prompt.txt"
@@ -445,6 +468,32 @@ STUB_RC=4 STUB_STDOUT="$TMP/deep.json" \
 # An empty option value is a mistake, never a request for the default — otherwise
 # `--check "$UNSET_VAR"` silently becomes a real, billed review.
 expect_fail "--check with an empty value"  2 "empty value" --check "" "$TMP/prompt.txt"
+
+# NaN parses under json's defaults but is not JSON, and agy never emits it.
+cat > "$TMP/nan.json" <<'EOF'
+{"conversation_id":"x","status":"SUCCESS","response":"ok","usage":{"total_tokens":NaN}}
+EOF
+expect_fail "NaN is not JSON" 1 "non-JSON constant" --check "$TMP/nan.json"
+
+# A CRLF prompt must reach agy with its CRLFs intact — universal-newline translation
+# would silently review different bytes than the file holds.
+printf 'line one\r\nline two\r\n' > "$TMP/crlf-prompt.txt"
+CRLF_ARG="$(cat "$TMP/crlf-prompt.txt"; printf x)"; CRLF_ARG="${CRLF_ARG%x}"
+expect_pass "CRLF prompt survives" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-crlf" "$TMP/crlf-prompt.txt"
+argv_equals "CRLF prompt reaches agy byte-for-byte" \
+  "-p" "$CRLF_ARG" "--model" "gemini-3.8-flash" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
+  "--effort" "high"
+
+# A closed reader (`| head -1`) is not our error: exit conventionally, no traceback.
+python3 "$BIN" --check "$TMP/good.json" 2>"$TMP/.pipe-err" | head -1 >/dev/null
+if grep -q 'Traceback' "$TMP/.pipe-err" 2>/dev/null; then
+  note_fail "closed pipe produced a traceback"
+else
+  note_pass "closed pipe produces no traceback"
+fi
+
 expect_fail "--model with an empty value"  2 "empty value" \
   --agy "$STUB" --model "" --out "$TMP/run-empty1" "$TMP/prompt.txt"
 expect_fail "--out with an empty value"    2 "empty value" \

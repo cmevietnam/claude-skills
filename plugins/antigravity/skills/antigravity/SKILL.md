@@ -69,7 +69,7 @@ a non-`SUCCESS` status, any `denied_actions`, or an empty/whitespace response �
 tells you where the raw `out.json` and `err.txt` are. Confirmed against the live CLI: a
 prompt that triggers an auto-deny gives `agy` exit 0 / SUCCESS and `agy-review` exit 1.
 
-`scripts/test-agy-review.sh` has 62 cases, nine of them meta-tests that deliberately make
+`scripts/test-agy-review.sh` has 74 cases, nine of them meta-tests that deliberately make
 each assertion helper fail — because a test that cannot go red proves nothing.
 
 Do not substitute `jq -r '.response // "failed"'`: on a zero-byte file `jq` prints
@@ -100,6 +100,11 @@ So before reviewing anything you did not write: **read** that settings file. If 
 tell the user what is in it** — that file is theirs, it may hold configuration unrelated to
 this plugin, and removing rules is their call, not mine. If they authorise a temporary
 change, keep a copy and restore it afterwards.
+
+**The whole prompt travels in `agy`'s argv**, since `agy -p` does not read stdin — on a
+shared machine anyone who can list processes can read it, diff included. Check the bundle
+for an accidentally committed credential before sending it, and do not use this path for
+material that must not leak locally.
 
 ```bash
 set -euo pipefail                      # an empty diff.txt must not become a clean review

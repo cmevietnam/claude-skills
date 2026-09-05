@@ -49,11 +49,13 @@ EFFORT_SUFFIXES = ("-high", "-medium", "-low")
 
 # The review is UTF-8 whatever the locale says: agy emits UTF-8, and printing it through
 # an ASCII stdout would raise UnicodeEncodeError on a perfectly good review.
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8")
-    except (AttributeError, ValueError):  # pragma: no cover - very old Python
-        pass
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    # A diagnosis must always be printable, even when it quotes an undecodable path or a
+    # lone surrogate — backslashreplace degrades instead of raising.
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+except (AttributeError, ValueError):  # pragma: no cover - very old Python
+    pass
 
 
 def die(msg, code=1):
@@ -68,9 +70,25 @@ def write_response(text):
     single exception is a trailing newline added when the response lacks one, so the
     shell prompt starts on its own line; no other byte is touched.
     """
-    sys.stdout.write(text)
-    if not text.endswith("\n"):
-        sys.stdout.write("\n")
+    try:
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+    except UnicodeEncodeError as e:
+        # Surrogates cannot be encoded. Refusing beats emitting a mangled review from a
+        # tool whose contract is that the reviewer's words arrive intact.
+        die(f"FAILED: the response cannot be encoded for output ({e})")
+    except BrokenPipeError:
+        # Conventional handling: the reader went away (`| head`), which is not an error
+        # of ours. Silence Python's shutdown warning and exit as a killed-by-SIGPIPE
+        # process would.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:
+            pass
+        raise SystemExit(141)
 
 
 def takes_effort(model):
@@ -85,9 +103,19 @@ def takes_effort(model):
 
 
 def read_text(path):
-    """Read a text file as UTF-8 regardless of locale — agy emits raw UTF-8 JSON."""
-    with open(path, encoding="utf-8") as f:
+    """Read a text file as UTF-8 regardless of locale — agy emits raw UTF-8 JSON.
+
+    newline="" disables universal-newline translation: a CRLF prompt must reach `agy`
+    with its CRLFs intact, or a review OF line-ending behaviour examines different bytes
+    than the ones on disk.
+    """
+    with open(path, encoding="utf-8", newline="") as f:
         return f.read()
+
+
+def reject_json_constant(name):
+    """json.loads accepts NaN/Infinity by default; they are not JSON and not from agy."""
+    die(f"FAILED: output contains the non-JSON constant {name}")
 
 
 def parse_json(raw, what, hint=""):
@@ -97,7 +125,7 @@ def parse_json(raw, what, hint=""):
     lacked the RecursionError guard the --check path had.
     """
     try:
-        return json.loads(raw)
+        return json.loads(raw, parse_constant=reject_json_constant)
     except json.JSONDecodeError as e:
         die(f"FAILED: {what} is not JSON ({e}){hint}\nfirst 200 bytes: {raw[:200]!r}")
     except RecursionError:
@@ -107,15 +135,9 @@ def parse_json(raw, what, hint=""):
         die(f"FAILED: {what} could not be parsed ({e}){hint}")
 
 
-def read_envelope(path, err_path=None):
-    hint = f" — see {err_path}" if err_path else ""
-    try:
-        raw = read_text(path).strip()
-    except OSError as e:
-        die(f"FAILED: cannot read {path}: {e}")
-    except UnicodeDecodeError as e:
-        die(f"FAILED: {path} is not valid UTF-8 ({e}){hint}")
-
+def envelope_from_text(raw, hint=""):
+    """Validate an already-read envelope body."""
+    raw = raw.strip()
     if not raw:
         die(f"FAILED: empty output file, the run produced nothing{hint}")
 
@@ -125,9 +147,26 @@ def read_envelope(path, err_path=None):
     return env
 
 
-def validate(path, err_path=None):
-    """Return (response, envelope), or exit non-zero explaining why the run is unusable."""
-    env = read_envelope(path, err_path)
+def read_envelope(path, err_path=None):
+    hint = f" — see {err_path}" if err_path else ""
+    try:
+        raw = read_text(path)
+    except OSError as e:
+        die(f"FAILED: cannot read {path}: {e}")
+    except UnicodeDecodeError as e:
+        die(f"FAILED: {path} is not valid UTF-8 ({e}){hint}")
+    return envelope_from_text(raw, hint)
+
+
+def validate(path, err_path=None, env=None):
+    """Return (response, envelope), or exit non-zero explaining why the run is unusable.
+
+    `env` lets the caller supply an envelope it already read from its own file
+    descriptor, so a writable output directory cannot have the file swapped underneath
+    between the run and the check.
+    """
+    if env is None:
+        env = read_envelope(path, err_path)
     hint = f" — see {err_path}" if err_path else ""
 
     if env.get("error"):
@@ -322,21 +361,29 @@ def main():
         is never more permissive than 0600, but under a umask like 0200 it would come
         out 0400. fchmod pins it.
         """
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             os.fchmod(fd, 0o600)
         except OSError:  # some filesystems do not support it; 0600-or-tighter still holds
             pass
-        return os.fdopen(fd, "wb")
+        return os.fdopen(fd, "w+b")
 
     # Announce the paths BEFORE running: a pre-exec failure (a bad shebang in the target,
     # say) would otherwise leave an implicitly created temp directory nobody can find.
     print(f"raw output: {out_path}", file=sys.stderr)
     print(f"stderr:     {err_path}", file=sys.stderr)
 
+    envelope_bytes = None
     try:
         with private_create(out_path) as out_f, private_create(err_path) as err_f:
             rc = subprocess.call(cmd, stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f)
+            # Read the envelope back through the SAME descriptor we handed the child.
+            # Re-opening by pathname would let anyone who can write the output directory
+            # unlink out.json and drop a forged SUCCESS envelope in its place between the
+            # run and the check.
+            out_f.flush()
+            out_f.seek(0)
+            envelope_bytes = out_f.read()
     except OSError as e:
         die(f"FAILED: could not run {binary}: {e}", 2)
     except ValueError as e:
@@ -359,7 +406,12 @@ def main():
             pass
         die(f"FAILED: agy exited {rc}{detail} — see {err_path}")
 
-    response, env = validate(out_path, err_path)
+    try:
+        envelope_text = envelope_bytes.decode("utf-8")
+    except UnicodeDecodeError as e:
+        die(f"FAILED: {out_path} is not valid UTF-8 ({e}) — see {err_path}")
+    env = envelope_from_text(envelope_text, f" — see {err_path}")
+    response, env = validate(out_path, err_path, env=env)
 
     usage = env.get("usage") or {}
     print(
