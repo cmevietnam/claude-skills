@@ -1,7 +1,8 @@
 # Codex CLI reference
 
-Verified against **codex-cli 0.149.1** on 2026-08-31 by reading `codex --help`,
-`codex exec --help`, `codex exec review --help`, and `~/.codex/models_cache.json`.
+Verified against **codex-cli 0.153.4** on 2026-09-05 by reading `codex --help`,
+`codex exec --help`, `codex exec resume --help`, `codex exec review --help`,
+`codex features list`, and `~/.codex/models_cache.json`.
 Re-verify after every upgrade — flags move between releases.
 
 ## Subcommands worth knowing
@@ -34,6 +35,8 @@ Re-verify after every upgrade — flags move between releases.
 | `--json` | Emit events as JSONL on stdout |
 | `--output-schema <FILE>` | JSON Schema constraining the final response shape |
 | `-i, --image <FILE>...` | Attach images to the prompt |
+| `--oss` + `--local-provider <P>` | Run a local model through lmstudio or ollama |
+| `--thread-source <SOURCE>` | Source classification for new or forked threads |
 | `-p, --profile <NAME>` | Layer `$CODEX_HOME/<name>.config.toml` over the base config |
 | `--ephemeral` | Don't persist the session — this disables `resume --last` |
 | `--enable` / `--disable <FEATURE>` | Shorthand for `-c features.<name>=true|false` |
@@ -61,7 +64,9 @@ prompt for custom review instructions (`-` reads it from stdin).
 - Default to `2>/dev/null`; on a non-zero exit, rerun once with `2>&1` to capture the
   error. Suppressing stderr hides failures, so never leave it suppressed while debugging.
 - If stdin is piped *and* a prompt argument is given, stdin is appended as an extra
-  `<stdin>` block — hence `</dev/null` on every argument-form invocation.
+  `<stdin>` block — hence `</dev/null` on every argument-form invocation. 0.153.4 still
+  prints `Reading additional input from stdin...` to stderr even with `</dev/null`; that
+  line is noise, not a sign the redirect failed.
 
 ## Auth and failure modes
 
@@ -72,8 +77,12 @@ prompt for custom review instructions (`-` reads it from stdin).
   signing certificate was revoked (seen on cask 0.107.0). Fix:
   `brew upgrade --cask codex`, then
   `xattr -d com.apple.quarantine "$(readlink -f /opt/homebrew/bin/codex)"`.
-- **400 "requires a newer version of Codex"** → 5.6-class models are rejected by CLI
-  builds older than 0.144. Upgrade.
+- **400 "requires a newer version of Codex"** → the build is too old for the model.
+  5.6-class models are rejected below 0.144; `gpt-6-astra` was absent from 0.149.1 and
+  present in 0.153.4. Fix with `codex update` (or `brew upgrade --cask codex`).
+- **A model the release notes announced is missing from the list** → the cache is stale.
+  It refreshes on a real `codex exec` run, not from `codex doctor`, so run something
+  trivial first and re-read the file.
 - Any non-zero exit: stop, report it, rerun once with `2>&1`, then ask for direction
   rather than retrying blind.
 - Warnings or partial results get summarised to the user with an `AskUserQuestion` about
@@ -95,6 +104,8 @@ for m in d['models']:
 "
 ```
 
-Note that a model's own `default_reasoning_level` (Sol ships `low`) is overridden by
-`model_reasoning_effort` in `~/.codex/config.toml` — check both before claiming what the
-effective default is.
+Note that a model's own `default_reasoning_level` (Astra and Sol ship `low`) is
+overridden by `model_reasoning_effort` in `~/.codex/config.toml` — check both before
+claiming what the effective default is. The same file's `model =` line decides which
+model an omitted `-m` selects — it is `gpt-6-astra` as of 2026-09-05, and it does not
+follow new releases on its own.

@@ -30,7 +30,8 @@ is the intended shape — each reviewer's blind spot tends to be another's headl
 ## Requires
 
 Codex CLI on `PATH` (`brew install --cask codex`), authenticated via `codex login`.
-Verified against **0.149.1**; the skill says which flags were checked and when.
+Verified against **0.153.4** on `gpt-6-astra`; the skill says which flags were checked and
+when. `gpt-6-astra` needs a recent CLI: 0.149.1 does not list it, 0.153.4 does.
 
 ```bash
 codex --version
