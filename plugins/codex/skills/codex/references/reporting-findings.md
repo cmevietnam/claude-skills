@@ -51,7 +51,7 @@ reach the user intact, and must reach them *before* the diff does.
 ## Shape of a good report
 
 ```
-## Codex findings (gpt-5.6-sol, effort=high, sandbox=read-only)
+## Codex findings (gpt-6-astra, effort=high, sandbox=read-only)
 
 Raw output: /tmp/codex-review.md
 
