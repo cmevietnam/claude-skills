@@ -12,14 +12,22 @@ agy changelog
 ## Install
 
 ```bash
-curl -fsSL https://antigravity.google/cli/install.sh -o /tmp/agy-install.sh
-less /tmp/agy-install.sh      # read it — it is ~240 lines and does what it says
-bash /tmp/agy-install.sh
+d="$(mktemp -d)"
+curl -fsSL --proto '=https' https://antigravity.google/cli/install.sh -o "$d/install.sh"
+less "$d/install.sh"          # read it — ~240 lines, and it does what it says
+bash "$d/install.sh"
 ```
 
-Download, read, then run **that exact file**. Piping straight into `bash` executes network
-content you have not seen, and a failed `curl` becomes an empty script that `bash` accepts
-happily — so the documented one-liner
+Download into a **fresh private directory**, read it, then run that exact file. Three
+things this avoids:
+
+- piping into `bash` executes network content nobody has seen;
+- a failed `curl` leaves an empty script that `bash` accepts happily, so the install
+  silently does nothing;
+- a fixed name like `/tmp/agy-install.sh` can be pre-created by another local user as a
+  symlink, or swapped between the read and the run.
+
+So the documented one-liner
 (`curl -fsSL https://antigravity.google/cli/install.sh | bash`) is not what to use.
 
 The installer fetches a per-platform manifest, verifies a **SHA512** against it, writes the

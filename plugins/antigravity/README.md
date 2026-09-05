@@ -59,15 +59,19 @@ that claim was false. Hence the rule that every finding is reproduced before it 
 ## Requires
 
 ```bash
-curl -fsSL https://antigravity.google/cli/install.sh -o /tmp/agy-install.sh
-less /tmp/agy-install.sh      # read it first; it is short
-bash /tmp/agy-install.sh
+d="$(mktemp -d)"                                                   # private, unguessable
+curl -fsSL --proto '=https' https://antigravity.google/cli/install.sh -o "$d/install.sh"
+less "$d/install.sh"          # read it first; it is short
+bash "$d/install.sh"
 agy --version
 ```
 
 Google documents this as `curl … | bash`. Don't: that runs network content before anyone
 can look at it, and a failed download becomes an empty script `bash` accepts without
-complaint. Note the installer appends a PATH line to **six** shell profiles.
+complaint. Use `mktemp -d` rather than a fixed `/tmp/install.sh` — a predictable name lets
+another local user pre-create it, or swap it between the read and the run.
+
+Note the installer appends a PATH line to **six** shell profiles.
 
 Then sign in **from a real terminal** — `agy` opens a TUI and there is no headless
 sign-in (`bubbletea: could not open TTY`), so Claude Code's `!` prefix cannot do it.

@@ -66,7 +66,7 @@ a non-`SUCCESS` status, any `denied_actions`, or an empty/whitespace response â€
 tells you where the raw `out.json` and `err.txt` are. Confirmed against the live CLI: a
 prompt that triggers an auto-deny gives `agy` exit 0 / SUCCESS and `agy-review` exit 1.
 
-`scripts/test-agy-review.sh` has 49 cases, six of them meta-tests that deliberately make
+`scripts/test-agy-review.sh` has 62 cases, nine of them meta-tests that deliberately make
 each assertion helper fail â€” because a test that cannot go red proves nothing.
 
 Do not substitute `jq -r '.response // "failed"'`: on a zero-byte file `jq` prints
@@ -85,6 +85,14 @@ resolved somewhere under `~/.gemini/antigravity-cli`. Use absolute paths, or `--
 
 Put the material _in the prompt_. No tools means no permissions to configure, nothing to
 be silently denied, and a deterministic run.
+
+**The "do not call any tools" preamble is behavioural guidance, not a security boundary.**
+Nothing in it enforces anything: if a persistent allow-rule such as `command(cat)` already
+sits in `~/.gemini/antigravity-cli/settings.json`, the model can still run tools, no
+`denied_actions` appears, and the run is accepted as clean. An instruction planted in the
+material being reviewed could use that to read credentials. Before reviewing anything you
+did not write, read that settings file and remove standing allow-rules; the empty-file
+default denies every tool, which is what you want.
 
 ```bash
 set -euo pipefail                      # an empty diff.txt must not become a clean review

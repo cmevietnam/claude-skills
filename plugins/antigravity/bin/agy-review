@@ -38,16 +38,32 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 
 EFFORT_SUFFIXES = ("-high", "-medium", "-low")
 
+# The review is UTF-8 whatever the locale says: agy emits UTF-8, and printing it through
+# an ASCII stdout would raise UnicodeEncodeError on a perfectly good review.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):  # pragma: no cover - very old Python
+        pass
+
 
 def die(msg, code=1):
     print(msg, file=sys.stderr)
     raise SystemExit(code)
+
+
+def write_response(text):
+    """Emit the review byte-for-byte — no added or removed newline."""
+    sys.stdout.write(text)
+    if not text.endswith("\n"):
+        sys.stdout.write("\n")
 
 
 def takes_effort(model):
@@ -83,6 +99,10 @@ def read_envelope(path, err_path=None):
         env = json.loads(raw)
     except json.JSONDecodeError as e:
         die(f"FAILED: output is not JSON ({e}){hint}\nfirst 200 bytes: {raw[:200]!r}")
+    except RecursionError:
+        # Pathologically nested JSON blows the parser's stack; that is a bad envelope,
+        # not a reason to print a traceback.
+        die(f"FAILED: output JSON is nested too deeply to parse{hint}")
 
     if not isinstance(env, dict):
         die(f"FAILED: output is not a JSON object, got {type(env).__name__}{hint}")
@@ -111,15 +131,23 @@ def validate(path, err_path=None):
         die(
             f"FAILED: `response` is {type(raw_response).__name__}, not a string{hint}"
         )
-    response = (raw_response or "").strip()
-    if not response:
+    # Strip ONLY to decide emptiness. The response itself is returned untouched — this
+    # tool's whole premise is that the reviewer's words reach the user verbatim, and
+    # leading whitespace can be the indentation of a markdown code block.
+    if not (raw_response or "").strip():
         die(f"FAILED: empty response, nothing was reviewed{hint}")
+    response = raw_response
 
-    # `usage` is only ever reported, never trusted — but a wrong type must not crash
-    # the run after a perfectly good review has been produced.
+    # `usage` is cosmetic: it is reported, never trusted. A wrong type must not crash the
+    # run — and must not discard a review that is otherwise complete either. Warn, drop it.
     usage = env.get("usage")
     if usage is not None and not isinstance(usage, dict):
-        die(f"FAILED: `usage` is {type(usage).__name__}, not an object{hint}")
+        print(
+            f"warning: `usage` is {type(usage).__name__}, not an object; "
+            "token counts unavailable",
+            file=sys.stderr,
+        )
+        env = dict(env, usage={})
     return response, env
 
 
@@ -129,13 +157,16 @@ def usable_binary(path):
 
 def find_agy(explicit):
     if explicit:
-        # A bare name like `agy` is resolved through PATH; a path is used as given.
+        # A bare name is resolved through PATH and ONLY through PATH — falling back to a
+        # relative path would run ./<name> from the working directory.
         if os.sep not in explicit:
             found = shutil.which(explicit)
             if found:
                 return found
-        if usable_binary(explicit):
-            return explicit
+            die(f"FAILED: agy binary `{explicit}` not found on PATH", 2)
+        expanded = os.path.expanduser(explicit)
+        if usable_binary(expanded):
+            return expanded
         die(f"FAILED: agy binary not found or not executable at {explicit}", 2)
     found = shutil.which("agy")
     if found:
@@ -150,10 +181,12 @@ def main():
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("target", nargs="?")
     ap.add_argument("--check", metavar="ENVELOPE_JSON")
-    ap.add_argument("--model", default="gemini-3.8-flash")
+    # Defaults stay None so "not given" is distinguishable from "given the default",
+    # which is what lets --check reject run options instead of ignoring them.
+    ap.add_argument("--model", default=None)
     ap.add_argument("--effort", default=None)
     ap.add_argument("--out")
-    ap.add_argument("--timeout", default="9m")
+    ap.add_argument("--timeout", default=None)
     ap.add_argument("--agy")
     ap.add_argument("-h", "--help", action="store_true")
     args = ap.parse_args()
@@ -172,6 +205,8 @@ def main():
                 ("--out", args.out),
                 ("--agy", args.agy),
                 ("--effort", args.effort),
+                ("--model", args.model),
+                ("--timeout", args.timeout),
             )
             if value is not None
         ]
@@ -180,8 +215,11 @@ def main():
                 f"usage: --check takes no run options, got: {', '.join(conflicting)}", 2
             )
         response, _ = validate(args.check)
-        print(response)
+        write_response(response)
         return 0
+
+    model = args.model or "gemini-3.8-flash"
+    timeout = args.timeout or "9m"
 
     if not args.target:
         die("usage: agy-review [options] PROMPT_FILE | --check ENVELOPE_JSON", 2)
@@ -210,6 +248,16 @@ def main():
         if args.out:
             os.makedirs(args.out, mode=0o700, exist_ok=True)
             out_dir = args.out
+            # makedirs' mode applies only when it creates the directory. An existing
+            # 0755 --out would leave the report world-readable, so say so rather than
+            # silently changing permissions on a directory the caller owns.
+            mode = stat.S_IMODE(os.stat(out_dir).st_mode)
+            if mode & (stat.S_IRWXG | stat.S_IRWXO):
+                print(
+                    f"warning: {out_dir} is mode {mode:04o}; other local users can list "
+                    "it. The report files themselves are created 0600.",
+                    file=sys.stderr,
+                )
         else:
             out_dir = tempfile.mkdtemp(prefix="agy-review-")
     except OSError as e:
@@ -231,19 +279,23 @@ def main():
     cmd = [
         binary,
         "-p", prompt,
-        "--model", args.model,
+        "--model", model,
         "--disable-slash-commands",
         "--output-format", "json",
-        "--print-timeout", args.timeout,
+        "--print-timeout", timeout,
     ]
     if args.effort is not None:
         cmd += ["--effort", args.effort]
-    elif takes_effort(args.model):
+    elif takes_effort(model):
         cmd += ["--effort", "high"]
 
+    def private_create(path):
+        """O_CREAT|O_EXCL (never follows a symlink) at mode 0600, umask notwithstanding."""
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        return os.fdopen(fd, "wb")
+
     try:
-        # "xb" is O_CREAT|O_EXCL: it will not follow a symlink into an existing file.
-        with open(out_path, "xb") as out_f, open(err_path, "xb") as err_f:
+        with private_create(out_path) as out_f, private_create(err_path) as err_f:
             rc = subprocess.call(cmd, stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f)
     except OSError as e:
         die(f"FAILED: could not run {binary}: {e}", 2)
@@ -271,11 +323,11 @@ def main():
 
     usage = env.get("usage") or {}
     print(
-        f"model={args.model} conversation={env.get('conversation_id')} "
+        f"model={model} conversation={env.get('conversation_id')} "
         f"tokens={usage.get('total_tokens')} turns={env.get('num_turns')}",
         file=sys.stderr,
     )
-    print(response)
+    write_response(response)
     return 0
 
 

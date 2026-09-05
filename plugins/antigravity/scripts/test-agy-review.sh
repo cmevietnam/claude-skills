@@ -22,6 +22,12 @@ if [ -z "$TMP" ] || [ ! -d "$TMP" ]; then
 fi
 trap 'rm -rf "$TMP"' EXIT
 
+# STUB_ARGV is fixed to a path inside TMP before any test runs, and is never taken from
+# the caller's environment — run_bin deletes this file, and an inherited value would
+# make the suite delete something of the caller's on its very first case.
+STUB_ARGV="$TMP/argv.bin"
+export STUB_ARGV
+
 pass=0
 fail=0
 
@@ -32,7 +38,10 @@ note_fail() { echo "FAIL  $1"; fail=$((fail + 1)); }
 # that printed the review to stderr must not be able to satisfy a stdout assertion.
 run_bin() {
   # Drop any previous argv capture so a stale one cannot satisfy this run's assertions.
-  rm -f "${STUB_ARGV:-/dev/null}" 2>/dev/null || true
+  case "$STUB_ARGV" in
+    "$TMP"/*) rm -f "$STUB_ARGV" ;;
+    *) echo "FATAL: refusing to delete $STUB_ARGV, outside $TMP"; exit 1 ;;
+  esac
   python3 "$BIN" "$@" >"$TMP/.stdout" 2>"$TMP/.stderr"
   RC=$?
   STDOUT="$(cat "$TMP/.stdout")"
@@ -45,21 +54,31 @@ run_bin() {
 expect_fail() {
   local name="$1" want_rc="$2" want="$3"; shift 3
   run_bin "$@"
-  if [ -z "$OUT" ]; then
-    note_fail "$name: no output at all — the check did not run"
+  if [ -z "$STDERR" ]; then
+    note_fail "$name: stderr empty — the check produced no diagnosis"
+  elif [ -n "$STDOUT" ]; then
+    # A failure must print nothing on stdout: partial review text there would be
+    # indistinguishable from a real review to anything consuming this tool.
+    note_fail "$name: stdout was not empty on failure — ${STDOUT:0:120}"
+  elif printf '%s' "$STDERR" | grep -q 'Traceback (most recent call last)'; then
+    note_fail "$name: died with a traceback instead of a clean diagnosis"
   elif [ "$RC" -eq 0 ]; then
     note_fail "$name: exited 0, should have failed"
   elif [ "$RC" -ne "$want_rc" ]; then
-    note_fail "$name: exit $RC, expected $want_rc — got: ${OUT:0:120}"
-  elif ! printf '%s' "$OUT" | grep -q -- "$want"; then
-    note_fail "$name: exit $RC but message lacked '$want' — got: ${OUT:0:160}"
+    note_fail "$name: exit $RC, expected $want_rc — got: ${STDERR:0:120}"
+  elif ! printf '%s' "$STDERR" | grep -q -- "$want"; then
+    note_fail "$name: exit $RC but message lacked '$want' — got: ${STDERR:0:160}"
   else
     note_pass "$name"
   fi
 }
 
+# The stub records argv NUL-delimited, so an argument containing newlines (every real
+# review prompt) keeps its boundaries. Line-based matching cannot do that, and cannot
+# check ordering or the absence of an extra flag either.
+#
 # An argv assertion is only meaningful if the capture exists. Without this guard, a
-# missing capture makes every grep fail, which argv_lacks would read as "absent" — the
+# missing capture makes every match fail, which argv_lacks would read as "absent" — the
 # same silence-passes bug this suite exists to prevent.
 argv_capture_ok() {
   local name="$1"
@@ -70,13 +89,43 @@ argv_capture_ok() {
   return 0
 }
 
+# argv_equals NAME EXPECTED... -- the COMPLETE argument vector, in order.
+# This is the strong assertion: it catches a missing prompt, a scrambled flag/value
+# pair, a stripped trailing newline, and an extra flag such as
+# --dangerously-skip-permissions, none of which membership checks can see.
+argv_equals() {
+  local name="$1"; shift
+  argv_capture_ok "$name" || return
+  if ARGV_FILE="$STUB_ARGV" python3 - "$@" <<'PY'
+import os, sys
+want = sys.argv[1:]
+got = open(os.environ["ARGV_FILE"], "rb").read().split(b"\0")
+if got and got[-1] == b"":
+    got.pop()
+got = [a.decode("utf-8", "surrogateescape") for a in got]
+if got == want:
+    raise SystemExit(0)
+print(f"  argv mismatch\n    want ({len(want)}): {want!r}\n    got  ({len(got)}): {got!r}",
+      file=sys.stderr)
+raise SystemExit(1)
+PY
+  then
+    note_pass "$name"
+  else
+    note_fail "$name: argv did not match exactly"
+  fi
+}
+
 # argv_has NAME EXPECTED... -- every string must appear as its own argv entry
 argv_has() {
   local name="$1"; shift
   argv_capture_ok "$name" || return
   local missing=""
   for want in "$@"; do
-    grep -qxF -- "$want" "$STUB_ARGV" || missing="$missing $want"
+    ARGV_FILE="$STUB_ARGV" python3 -c '
+import os, sys
+got = open(os.environ["ARGV_FILE"], "rb").read().split(b"\0")
+sys.exit(0 if sys.argv[1].encode() in got else 1)' "$want" || missing="$missing $want"
   done
   if [ -n "$missing" ]; then
     note_fail "$name: argv missing:$missing"
@@ -91,7 +140,10 @@ argv_lacks() {
   argv_capture_ok "$name" || return
   local present=""
   for bad in "$@"; do
-    grep -qxF -- "$bad" "$STUB_ARGV" && present="$present $bad"
+    ARGV_FILE="$STUB_ARGV" python3 -c '
+import os, sys
+got = open(os.environ["ARGV_FILE"], "rb").read().split(b"\0")
+sys.exit(0 if sys.argv[1].encode() in got else 1)' "$bad" && present="$present $bad"
   done
   if [ -n "$present" ]; then
     note_fail "$name: argv unexpectedly contained:$present"
@@ -187,6 +239,26 @@ cat > "$TMP/utf8.json" <<'EOF'
  "duration_seconds":1.0,"num_turns":1,"usage":{"total_tokens":10}}
 EOF
 
+# Both shapes a real successful run produces for denied_actions.
+cat > "$TMP/denied-null.json" <<'EOF'
+{"conversation_id":"x","status":"SUCCESS","response":"NO FINDINGS\n","denied_actions":null}
+EOF
+cat > "$TMP/denied-empty.json" <<'EOF'
+{"conversation_id":"x","status":"SUCCESS","response":"NO FINDINGS\n","denied_actions":[]}
+EOF
+
+# Leading whitespace is content — a markdown code block starts with it. The wrapper must
+# not "tidy" the reviewer's words; that is the rule the whole plugin exists to enforce.
+cat > "$TMP/indented.json" <<'EOF'
+{"conversation_id":"x","status":"SUCCESS","response":"    indented finding\n"}
+EOF
+
+# Pathologically nested JSON must produce a diagnosis, not a RecursionError traceback.
+python3 -c '
+import sys
+n = 20000
+open(sys.argv[1], "w").write("[" * n + "]" * n)' "$TMP/deep.json"
+
 # --- --check cases -------------------------------------------------------------------
 
 expect_fail "zero-byte output file"    1 "empty output file"       --check "$TMP/zero-byte.json"
@@ -201,7 +273,14 @@ expect_fail "null response"            1 "empty response"          --check "$TMP
 expect_fail "status=ERROR"             1 "invalid model selection" --check "$TMP/error-status.json"
 expect_fail "output token limit"       1 "output token limit"      --check "$TMP/token-limit.json"
 expect_fail "missing file"             1 "cannot read"             --check "$TMP/nope.json"
-expect_fail "usage is not an object"   1 "not an object"           --check "$TMP/usage-string.json"
+# `usage` is cosmetic: a wrong type must neither crash nor discard a complete review.
+expect_pass "mistyped usage still yields the review" "NO FINDINGS" \
+  --check "$TMP/usage-string.json"
+if printf '%s' "$STDERR" | grep -q "usage. is str, not an object"; then
+  note_pass "mistyped usage warns on stderr"
+else
+  note_fail "mistyped usage did not warn — got: ${STDERR:0:120}"
+fi
 
 # --check is about an existing envelope; run options alongside it mean a mistyped command
 expect_fail "--check with a prompt file"  2 "takes no run options" \
@@ -209,28 +288,42 @@ expect_fail "--check with a prompt file"  2 "takes no run options" \
 expect_fail "--check with --out"          2 "takes no run options" \
   --check "$TMP/good.json" --out "$TMP/somewhere"
 
+expect_fail "deeply nested JSON"       1 "nested too deeply"       --check "$TMP/deep.json"
+
 expect_pass "real review"              "$GOOD_STDOUT"            --check "$TMP/good.json"
 expect_pass "NO FINDINGS is a result"  "NO FINDINGS"             --check "$TMP/good-no-findings.json"
 expect_pass "non-ASCII response"       "Finding 1 — cấu hình → hỏng" --check "$TMP/utf8.json"
+expect_pass "denied_actions null is a success shape"  "NO FINDINGS" --check "$TMP/denied-null.json"
+expect_pass "denied_actions [] is a success shape"    "NO FINDINGS" --check "$TMP/denied-empty.json"
+expect_pass "leading whitespace is preserved verbatim" "    indented finding" \
+  --check "$TMP/indented.json"
+
+# The response must survive an ASCII locale — agy's output is UTF-8 either way.
+LC_ALL=C PYTHONUTF8=0 expect_pass "non-ASCII response under LC_ALL=C" \
+  "Finding 1 — cấu hình → hỏng" --check "$TMP/utf8.json"
 
 # --- run-path cases, driven by a stub agy --------------------------------------------
 
 STUB="$TMP/stub-agy"
 cat > "$STUB" <<'EOF'
 #!/bin/bash
-# Records its argv, then emits whatever the fixture files dictate.
-printf '%s\n' "$@" > "$STUB_ARGV"
+# Records its argv NUL-delimited so arguments containing newlines keep their boundaries,
+# then emits whatever the fixture files dictate.
+printf '%s\0' "$@" > "$STUB_ARGV"
 cat "$STUB_STDOUT"
 [ -n "${STUB_STDERR:-}" ] && cat "$STUB_STDERR" >&2
 exit "${STUB_RC:-0}"
 EOF
 chmod +x "$STUB"
 
-export STUB_ARGV="$TMP/argv.txt"
 export STUB_STDOUT="$TMP/good.json"
 export STUB_RC=0
 
-printf 'review this please\n' > "$TMP/prompt.txt"
+# A realistic prompt: several lines, a blank line, and a trailing newline. The
+# single-line prompt that used to be here made the -p assertions pass for the wrong
+# reason — line-based matching cannot survive an embedded newline.
+printf 'Review the diff below.\n\n--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-old\n+new\n' \
+  > "$TMP/prompt.txt"
 : > "$TMP/empty-prompt.txt"
 
 printf 'review\0this' > "$TMP/nul-prompt.txt"
@@ -257,24 +350,18 @@ expect_fail "--out already holds a report" 2 "already exists" \
 expect_pass "run path prints review" "$GOOD_STDOUT" \
   --agy "$STUB" --out "$TMP/run1" "$TMP/prompt.txt"
 
-# The invocation contract, not just the flags: `agy -p` does not read stdin, so the
-# prompt MUST arrive as the argument after -p. Without this a wrapper that dropped the
-# prompt entirely would leave the suite green.
-argv_has "prompt is passed via -p, with its exact contents" \
-  "-p" "$(cat "$TMP/prompt.txt")"
-argv_has "gemini id gets --model and default --effort high" \
-  "--model" "gemini-3.8-flash" "--effort" "high" \
-  "--disable-slash-commands" "--output-format" "json" \
-  "--print-timeout" "9m"
-
-# -p and the prompt must be adjacent, in that order. The stub records "$@", so the
-# first flag is line 1 and its value line 2.
-if [ "$(grep -n -xF -- "-p" "$STUB_ARGV" | cut -d: -f1)" = "1" ] &&
-   [ "$(sed -n '2p' "$STUB_ARGV")" = "$(cat "$TMP/prompt.txt")" ]; then
-  note_pass "prompt immediately follows -p in argv"
-else
-  note_fail "prompt does not immediately follow -p in argv (line1=$(sed -n '1p' "$STUB_ARGV"))"
-fi
+# The whole invocation contract, in order and with nothing extra. `agy -p` does not read
+# stdin, so the prompt must arrive as the argument right after -p, with its trailing
+# newline intact — and no surprise flag such as --dangerously-skip-permissions may appear.
+# `$(cat)` would strip the trailing newline, so read the file in a way that keeps it.
+PROMPT_ARG="$(cat "$TMP/prompt.txt"; printf x)"; PROMPT_ARG="${PROMPT_ARG%x}"
+argv_equals "full argv: -p, the exact prompt, and nothing unexpected" \
+  "-p" "$PROMPT_ARG" \
+  "--model" "gemini-3.8-flash" \
+  "--disable-slash-commands" \
+  "--output-format" "json" \
+  "--print-timeout" "9m" \
+  "--effort" "high"
 
 # a suffixed id must NOT get --effort (agy: "conflicts with --effort=high"),
 # but the model itself must still be forwarded
@@ -323,6 +410,49 @@ STUB_RC=0 STUB_STDOUT="$TMP/denied.json" \
   expect_fail "denied tools fail even on exit 0" 1 "auto-denied" \
   --agy "$STUB" --out "$TMP/run7" "$TMP/prompt.txt"
 
+# --- the default output location, which no --out run can exercise --------------------
+# Replacing the private mkdtemp with a predictable shared path must not stay green.
+expect_pass "run with no --out" "$GOOD_STDOUT" --agy "$STUB" "$TMP/prompt.txt"
+DEFAULT_OUT="$(printf '%s' "$STDERR" | sed -n 's/^raw output: \(.*\)\/out\.json$/\1/p')"
+if [ -z "$DEFAULT_OUT" ] || [ ! -d "$DEFAULT_OUT" ]; then
+  note_fail "default --out: could not find the reported directory in stderr"
+else
+  dmode="$(stat -f '%Lp' "$DEFAULT_OUT" 2>/dev/null || stat -c '%a' "$DEFAULT_OUT")"
+  fmode="$(stat -f '%Lp' "$DEFAULT_OUT/out.json" 2>/dev/null || stat -c '%a' "$DEFAULT_OUT/out.json")"
+  if [ "$dmode" = "700" ]; then
+    note_pass "default output directory is 0700"
+  else
+    note_fail "default output directory is $dmode, expected 700"
+  fi
+  if [ "$fmode" = "600" ]; then
+    note_pass "report files are 0600"
+  else
+    note_fail "report files are $fmode, expected 600"
+  fi
+  case "$DEFAULT_OUT" in
+    */agy-review-*) note_pass "default output directory is a fresh mkdtemp" ;;
+    *) note_fail "default output directory is not a mkdtemp path: $DEFAULT_OUT" ;;
+  esac
+  rm -rf "$DEFAULT_OUT"
+fi
+
+# a world-readable --out must still produce 0600 files, and must say so
+mkdir -p "$TMP/public-out"
+chmod 0755 "$TMP/public-out"
+expect_pass "public --out still writes 0600 files" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/public-out" "$TMP/prompt.txt"
+pfmode="$(stat -f '%Lp' "$TMP/public-out/out.json" 2>/dev/null || stat -c '%a' "$TMP/public-out/out.json")"
+if [ "$pfmode" = "600" ]; then
+  note_pass "report file in a public directory is still 0600"
+else
+  note_fail "report file in a public directory is $pfmode, expected 600"
+fi
+if printf '%s' "$STDERR" | grep -q "other local users can list it"; then
+  note_pass "public --out is warned about"
+else
+  note_fail "public --out produced no warning"
+fi
+
 # --- meta-tests: prove each helper can actually go red -------------------------------
 # Without these, a crashing binary or a mis-wired assertion would make cases pass by
 # accident — which is exactly the defect this suite exists to catch in agy itself.
@@ -330,16 +460,24 @@ STUB_RC=0 STUB_STDOUT="$TMP/denied.json" \
 # meta_expect_red DESCRIPTION -- <a deliberately wrong assertion>
 meta_expect_red() {
   local what="$1"; shift
-  local before=$fail
+  local before_fail=$fail before_pass=$pass
   "$@" >/dev/null 2>&1
-  if [ "$fail" -eq $((before + 1)) ]; then
-    fail=$before               # the deliberate failure is the expected result
-    pass=$((pass - 1)) 2>/dev/null || true
-    pass=$((pass + 1))
+  if [ "$fail" -eq $((before_fail + 1)) ]; then
+    fail=$before_fail          # the deliberate failure is the expected result
     note_pass "meta: $what"
   else
+    # The inner assertion wrongly passed, so it incremented $pass; undo that or the
+    # summary counts a broken test as a good one.
+    pass=$before_pass
     note_fail "meta: $what — the harness did NOT detect it; every result is suspect"
   fi
+}
+
+# Seed a known argv capture so the content meta-tests exercise the MATCHING logic.
+# Without this they run against a capture that run_bin has just deleted, and fail at
+# argv_capture_ok instead — proving the guard works, but never the matching.
+seed_argv() {
+  printf '%s\0' "--model" "gemini-3.8-flash" "-p" "hello" > "$STUB_ARGV"
 }
 
 meta_expect_red "expect_pass rejects a denied envelope" \
@@ -351,13 +489,23 @@ meta_expect_red "expect_fail rejects the wrong exit code" \
 meta_expect_red "expect_fail rejects the wrong message" \
   expect_fail "META" 1 "this string never appears" --check "$TMP/zero-byte.json"
 
+seed_argv
 meta_expect_red "argv_has notices a missing argument" \
   argv_has "META" "--this-flag-was-never-passed"
 
+seed_argv
 meta_expect_red "argv_lacks notices an argument that is present" \
   argv_lacks "META" "--model"
 
-# The subtle one: with no capture at all, every grep fails, which a naive argv_lacks
+seed_argv
+meta_expect_red "argv_equals notices a wrong argument vector" \
+  argv_equals "META" "--model" "gemini-3.8-flash"
+
+seed_argv
+meta_expect_red "argv_equals notices a reordered vector" \
+  argv_equals "META" "gemini-3.8-flash" "--model" "-p" "hello"
+
+# The subtle one: with no capture at all, every match fails, which a naive argv_lacks
 # would read as "the argument is absent" and pass. It must fail instead.
 STUB_ARGV="$TMP/no-such-argv.txt" meta_expect_red \
   "argv_lacks fails when the capture is missing" \

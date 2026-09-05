@@ -80,6 +80,13 @@ Without that instruction, a model handed 47 KB of self-contained material _still
 for a shell command, was denied, and returned an empty response. With it, the same prompt
 produced an 11 KB review and `denied_actions: null`. The instruction is not optional.
 
+**But it is guidance, not a fence.** Nothing enforces it. The safety comes entirely from
+the deny-by-default policy above — so if a standing allow-rule exists in
+`settings.json`, the model can act on an instruction planted in the material under review,
+succeed, and be reported as a clean run because `denied_actions` stays empty. Reviewing
+code you did not write is exactly when that matters: audit the settings file first, and
+prefer no allow-rules at all.
+
 ## Allow-rules, if the run really must touch the repo
 
 `~/.gemini/antigravity-cli/settings.json`, pattern `action(target)`:
