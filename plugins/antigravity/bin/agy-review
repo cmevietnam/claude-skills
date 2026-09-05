@@ -1,0 +1,427 @@
+#!/usr/bin/env python3
+"""Run one headless `agy` review and refuse to call it a success unless it really was.
+
+`agy` exits 0 with status=SUCCESS and an empty response when every tool it wanted was
+auto-denied, which is the default headless. This wrapper treats that — and an empty
+output file, non-JSON output, a populated `error`, and any `denied_actions` — as hard
+failures.
+
+Usage:
+  agy-review [options] PROMPT_FILE     run the prompt, validate, print the response
+  agy-review --check ENVELOPE_JSON     validate an envelope that already exists
+
+Options:
+  --model M      model id (default: gemini-3.8-flash)
+  --effort E     low|medium|high. Given explicitly it is ALWAYS forwarded, even to a
+                 model that rejects it, so agy's own error surfaces. See below for when
+                 the default is applied.
+  --out DIR      where to keep out.json and err.txt. Default: a private mkdtemp
+                 directory. An existing out.json/err.txt is never overwritten, so two
+                 models get two directories and no raw report is lost.
+  --timeout T    --print-timeout value (default: 9m)
+  --agy PATH     agy binary: a bare name is resolved on PATH, a path is used as given
+                 (default: agy, then ~/.local/bin/agy)
+
+The prompt is passed to `agy` as a command-line argument, because `agy -p` does not read
+stdin. On a shared machine that makes its full text visible to anyone who can list
+processes — do not put secrets in a review bundle.
+
+Effort handling: `agy` rejects --effort for models that bake the level into the id
+(gemini-3.8-flash-high) and for models that do not support it at all (claude-sonnet-4-6,
+claude-opus-4-6-thinking). Given no explicit --effort, this wrapper applies the default
+only to an unsuffixed `gemini-*` id and omits it everywhere else. An explicit --effort is
+always passed through, so `agy`'s own error surfaces rather than being silently dropped.
+
+Exit codes: 0 review produced, 1 run failed or was incomplete, 2 usage error.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+EFFORT_SUFFIXES = ("-high", "-medium", "-low")
+
+# The review is UTF-8 whatever the locale says: agy emits UTF-8, and printing it through
+# an ASCII stdout would raise UnicodeEncodeError on a perfectly good review.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    # A diagnosis must always be printable, even when it quotes an undecodable path or a
+    # lone surrogate — backslashreplace degrades instead of raising.
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+except (AttributeError, ValueError):  # pragma: no cover - very old Python
+    pass
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def write_response(text):
+    """Emit the review unmodified.
+
+    Nothing is stripped, rewrapped or re-indented — leading whitespace is content. The
+    single exception is a trailing newline added when the response lacks one, so the
+    shell prompt starts on its own line; no other byte is touched.
+    """
+    try:
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+    except UnicodeEncodeError as e:
+        # Surrogates cannot be encoded. Refusing beats emitting a mangled review from a
+        # tool whose contract is that the reviewer's words arrive intact.
+        die(f"FAILED: the response cannot be encoded for output ({e})")
+    except BrokenPipeError:
+        # Conventional handling: the reader went away (`| head`), which is not an error
+        # of ours. Silence Python's shutdown warning and exit as a killed-by-SIGPIPE
+        # process would.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:
+            pass
+        raise SystemExit(141)
+
+
+def takes_effort(model):
+    """True when `model` is an id that accepts a separate --effort flag.
+
+    Verified against agy 1.1.27: a suffixed id conflicts ("conflicts with --effort=high")
+    and the Claude ids are refused outright ("--effort is not supported for model ...").
+    """
+    if model.endswith(EFFORT_SUFFIXES):
+        return False
+    return bool(re.match(r"^gemini-", model))
+
+
+def read_text(path):
+    """Read a text file as UTF-8 regardless of locale — agy emits raw UTF-8 JSON.
+
+    newline="" disables universal-newline translation: a CRLF prompt must reach `agy`
+    with its CRLFs intact, or a review OF line-ending behaviour examines different bytes
+    than the ones on disk.
+    """
+    with open(path, encoding="utf-8", newline="") as f:
+        return f.read()
+
+
+def reject_json_constant(name):
+    """json.loads accepts NaN/Infinity by default; they are not JSON and not from agy."""
+    die(f"FAILED: output contains the non-JSON constant {name}")
+
+
+def parse_json(raw, what, hint=""):
+    """Parse JSON, turning every parser explosion into a diagnosis instead of a traceback.
+
+    One helper for both call sites: the run path used to have its own inline parse that
+    lacked the RecursionError guard the --check path had.
+    """
+    try:
+        return json.loads(raw, parse_constant=reject_json_constant)
+    except json.JSONDecodeError as e:
+        die(f"FAILED: {what} is not JSON ({e}){hint}\nfirst 200 bytes: {raw[:200]!r}")
+    except RecursionError:
+        die(f"FAILED: {what} is nested too deeply to parse{hint}")
+    except ValueError as e:
+        # e.g. an integer literal beyond sys.set_int_max_str_digits
+        die(f"FAILED: {what} could not be parsed ({e}){hint}")
+
+
+def envelope_from_text(raw, hint=""):
+    """Validate an already-read envelope body."""
+    raw = raw.strip()
+    if not raw:
+        die(f"FAILED: empty output file, the run produced nothing{hint}")
+
+    env = parse_json(raw, "output", hint)
+    if not isinstance(env, dict):
+        die(f"FAILED: output is not a JSON object, got {type(env).__name__}{hint}")
+    return env
+
+
+def read_envelope(path, err_path=None):
+    hint = f" — see {err_path}" if err_path else ""
+    try:
+        raw = read_text(path)
+    except OSError as e:
+        die(f"FAILED: cannot read {path}: {e}")
+    except UnicodeDecodeError as e:
+        die(f"FAILED: {path} is not valid UTF-8 ({e}){hint}")
+    return envelope_from_text(raw, hint)
+
+
+def validate(path, err_path=None, env=None):
+    """Return (response, envelope), or exit non-zero explaining why the run is unusable.
+
+    `env` lets the caller supply an envelope it already read from its own file
+    descriptor, so a writable output directory cannot have the file swapped underneath
+    between the run and the check.
+    """
+    if env is None:
+        env = read_envelope(path, err_path)
+    hint = f" — see {err_path}" if err_path else ""
+
+    if env.get("error"):
+        die(f"FAILED: status={env.get('status')} error={env['error']}")
+    if env.get("status") != "SUCCESS":
+        die(f"FAILED: status={env.get('status')}{hint}")
+    if env.get("denied_actions"):
+        die(
+            "FAILED: the run was incomplete — these tools were auto-denied: "
+            f"{env['denied_actions']}\n"
+            "Either put the material in the prompt and forbid tool use, or add "
+            "allow-rules to ~/.gemini/antigravity-cli/settings.json."
+        )
+
+    raw_response = env.get("response")
+    if raw_response is not None and not isinstance(raw_response, str):
+        die(
+            f"FAILED: `response` is {type(raw_response).__name__}, not a string{hint}"
+        )
+    # Strip ONLY to decide emptiness. The response itself is returned untouched — this
+    # tool's whole premise is that the reviewer's words reach the user verbatim, and
+    # leading whitespace can be the indentation of a markdown code block.
+    if not (raw_response or "").strip():
+        die(f"FAILED: empty response, nothing was reviewed{hint}")
+    response = raw_response
+
+    # `usage` is cosmetic: it is reported, never trusted. A wrong type must not crash the
+    # run — and must not discard a review that is otherwise complete either. Warn, drop it.
+    usage = env.get("usage")
+    if usage is not None and not isinstance(usage, dict):
+        print(
+            f"warning: `usage` is {type(usage).__name__}, not an object; "
+            "token counts unavailable",
+            file=sys.stderr,
+        )
+        env = dict(env, usage={})
+    return response, env
+
+
+def usable_binary(path):
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def find_agy(explicit):
+    if explicit:
+        # A bare name is resolved through PATH and ONLY through PATH — falling back to a
+        # relative path would run ./<name> from the working directory.
+        if os.sep not in explicit:
+            found = shutil.which(explicit)
+            if found:
+                return found
+            die(f"FAILED: agy binary `{explicit}` not found on PATH", 2)
+        expanded = os.path.expanduser(explicit)
+        if usable_binary(expanded):
+            return expanded
+        die(f"FAILED: agy binary not found or not executable at {explicit}", 2)
+    found = shutil.which("agy")
+    if found:
+        return found
+    fallback = os.path.expanduser("~/.local/bin/agy")
+    if usable_binary(fallback):
+        return fallback
+    die("FAILED: `agy` not found on PATH or at ~/.local/bin/agy", 2)
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("target", nargs="?")
+    ap.add_argument("--check", metavar="ENVELOPE_JSON")
+    # Defaults stay None so "not given" is distinguishable from "given the default",
+    # which is what lets --check reject run options instead of ignoring them.
+    ap.add_argument("--model", default=None)
+    ap.add_argument("--effort", default=None)
+    ap.add_argument("--out")
+    ap.add_argument("--timeout", default=None)
+    ap.add_argument("--agy")
+    ap.add_argument("-h", "--help", action="store_true")
+    args = ap.parse_args()
+
+    if args.help:
+        print(__doc__)
+        return 0
+
+    # An empty value is a mistake, never a request for the default — otherwise
+    # `--check "$MAYBE_UNSET"` quietly turns a validation into a real, billed review.
+    for flag, value in (
+        ("--check", args.check), ("--model", args.model), ("--effort", args.effort),
+        ("--out", args.out), ("--timeout", args.timeout), ("--agy", args.agy),
+    ):
+        if value is not None and not value.strip():
+            die(f"usage: {flag} was given an empty value", 2)
+
+    if args.check is not None:
+        # --check validates an existing envelope; nothing about a run applies to it.
+        # Silently ignoring run options would hide a mistyped command.
+        conflicting = [
+            name
+            for name, value in (
+                ("PROMPT_FILE", args.target),
+                ("--out", args.out),
+                ("--agy", args.agy),
+                ("--effort", args.effort),
+                ("--model", args.model),
+                ("--timeout", args.timeout),
+            )
+            if value is not None
+        ]
+        if conflicting:
+            die(
+                f"usage: --check takes no run options, got: {', '.join(conflicting)}", 2
+            )
+        response, _ = validate(args.check)
+        write_response(response)
+        return 0
+
+    model = args.model if args.model is not None else "gemini-3.8-flash"
+    timeout = args.timeout if args.timeout is not None else "9m"
+
+    if not args.target:
+        die("usage: agy-review [options] PROMPT_FILE | --check ENVELOPE_JSON", 2)
+    if not os.path.isfile(args.target):
+        die(f"FAILED: prompt file not found: {args.target}", 2)
+
+    try:
+        prompt = read_text(args.target)
+    except OSError as e:
+        die(f"FAILED: cannot read prompt file {args.target}: {e}", 2)
+    except UnicodeDecodeError as e:
+        die(f"FAILED: prompt file {args.target} is not valid UTF-8 ({e})", 2)
+    if not prompt.strip():
+        die("FAILED: prompt file is empty", 2)
+    if "\0" in prompt:
+        # exec() cannot carry a NUL; without this the failure is a ValueError traceback
+        # from deep inside subprocess.
+        die(f"FAILED: prompt file {args.target} contains a NUL byte", 2)
+
+    binary = find_agy(args.agy)
+
+    # Default to a private 0700 directory. A predictable shared path under /tmp would
+    # expose the review — prompt and response both — to any local user, and invites
+    # pre-created-file and symlink attacks.
+    try:
+        if args.out:
+            os.makedirs(args.out, mode=0o700, exist_ok=True)
+            out_dir = args.out
+            # makedirs' mode applies only when it creates the directory. An existing
+            # 0755 --out would leave the report world-readable, so say so rather than
+            # silently changing permissions on a directory the caller owns.
+            mode = stat.S_IMODE(os.stat(out_dir).st_mode)
+            if mode & (stat.S_IRWXG | stat.S_IRWXO):
+                print(
+                    f"warning: {out_dir} is mode {mode:04o}; other local users can list "
+                    "it. The report files themselves are created 0600.",
+                    file=sys.stderr,
+                )
+        else:
+            out_dir = tempfile.mkdtemp(prefix="agy-review-")
+    except OSError as e:
+        die(f"FAILED: cannot use output directory {args.out or '(temp)'}: {e}", 2)
+
+    out_path = os.path.join(out_dir, "out.json")
+    err_path = os.path.join(out_dir, "err.txt")
+
+    # Refuse to clobber a previous run's raw report: two models written to one --out
+    # would destroy the first, and an attacker-planted symlink would be followed.
+    for path in (out_path, err_path):
+        if os.path.lexists(path):
+            die(
+                f"FAILED: {path} already exists — pick a different --out so an earlier "
+                "run's raw report is not overwritten",
+                2,
+            )
+
+    cmd = [
+        binary,
+        "-p", prompt,
+        "--model", model,
+        "--disable-slash-commands",
+        "--output-format", "json",
+        "--print-timeout", timeout,
+    ]
+    if args.effort is not None:
+        cmd += ["--effort", args.effort]
+    elif takes_effort(model):
+        cmd += ["--effort", "high"]
+
+    def private_create(path):
+        """Create at exactly 0600, never following a symlink.
+
+        O_CREAT|O_EXCL refuses an existing path, symlink included. The mode passed to
+        os.open is still masked by the umask — which can only remove bits, so the file
+        is never more permissive than 0600, but under a umask like 0200 it would come
+        out 0400. fchmod pins it.
+        """
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:  # some filesystems do not support it; 0600-or-tighter still holds
+            pass
+        return os.fdopen(fd, "w+b")
+
+    # Announce the paths BEFORE running: a pre-exec failure (a bad shebang in the target,
+    # say) would otherwise leave an implicitly created temp directory nobody can find.
+    print(f"raw output: {out_path}", file=sys.stderr)
+    print(f"stderr:     {err_path}", file=sys.stderr)
+
+    envelope_bytes = None
+    try:
+        with private_create(out_path) as out_f, private_create(err_path) as err_f:
+            rc = subprocess.call(cmd, stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f)
+            # Read the envelope back through the SAME descriptor we handed the child.
+            # Re-opening by pathname would let anyone who can write the output directory
+            # unlink out.json and drop a forged SUCCESS envelope in its place between the
+            # run and the check.
+            out_f.flush()
+            out_f.seek(0)
+            envelope_bytes = out_f.read()
+    except OSError as e:
+        die(f"FAILED: could not run {binary}: {e}", 2)
+    except ValueError as e:
+        die(f"FAILED: could not run {binary}: {e}", 2)
+
+    # A non-zero exit is reported with its code before any envelope complaint, so the
+    # real failure is never masked by "empty output file".
+    if rc != 0:
+        # Best-effort extra detail. The exit code is the finding here, so any problem
+        # reading or parsing the envelope is swallowed rather than replacing it — but it
+        # must not become a traceback either, hence the same guards as the --check path.
+        detail = ""
+        try:
+            raw = read_text(out_path).strip()
+            if raw:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict) and parsed.get("error"):
+                    detail = f": {parsed['error']}"
+        except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+            pass
+        die(f"FAILED: agy exited {rc}{detail} — see {err_path}")
+
+    try:
+        envelope_text = envelope_bytes.decode("utf-8")
+    except UnicodeDecodeError as e:
+        die(f"FAILED: {out_path} is not valid UTF-8 ({e}) — see {err_path}")
+    env = envelope_from_text(envelope_text, f" — see {err_path}")
+    response, env = validate(out_path, err_path, env=env)
+
+    usage = env.get("usage") or {}
+    print(
+        f"model={model} conversation={env.get('conversation_id')} "
+        f"tokens={usage.get('total_tokens')} turns={env.get('num_turns')}",
+        file=sys.stderr,
+    )
+    write_response(response)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
