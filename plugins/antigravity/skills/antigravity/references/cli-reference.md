@@ -12,10 +12,11 @@ agy changelog
 ## Install
 
 ```bash
+set -euo pipefail
 d="$(mktemp -d)"
-curl -fsSL --proto '=https' https://antigravity.google/cli/install.sh -o "$d/install.sh"
-less "$d/install.sh"          # read it — ~240 lines, and it does what it says
-bash "$d/install.sh"
+curl -fsSL --proto '=https' https://antigravity.google/cli/install.sh -o "$d/install.sh" \
+  && less "$d/install.sh" \
+  && bash "$d/install.sh"
 ```
 
 Download into a **fresh private directory**, read it, then run that exact file. Three
@@ -96,7 +97,7 @@ comfortably as an argument.
 | -------------------------------- | ---------------------------------------------------------------------------------- |
 | `-p`, `--print`, `--prompt`      | Headless run                                                                       |
 | `--model`                        | Model id; `agy models` lists them                                                  |
-| `--effort`                       | `low`, `medium`, `high` — only with an unsuffixed model id                         |
+| `--effort`                       | `low`, `medium`, `high` — only unsuffixed `gemini-*` ids accept it                 |
 | `--agent`                        | Select a named agent (`agy agents`)                                                |
 | `--output-format`                | `text` (default), `json`, `stream-json`                                            |
 | `--input-format`                 | `text` (default), `stream-json`; the latter requires `--output-format stream-json` |
@@ -203,8 +204,13 @@ $ agy -p "..." --model claude-sonnet-4-6 --effort high
  --effort \"high\"): --effort is not supported for model \"claude-sonnet-4-6\""}
 ```
 
-So the rule is: suffixed ids and Claude ids take no `--effort`; unsuffixed `gemini-*` ids
-do. `agy-review` encodes exactly that.
+So the rule is narrower than "unsuffixed ids take `--effort`": only **unsuffixed
+`gemini-*`** ids do. A suffixed id conflicts, and every Claude id refuses outright —
+`claude-sonnet-4-6` carries no suffix and still rejects it.
+
+`agy-review` applies its **default** effort under exactly that rule, and forwards an
+**explicit** `--effort` unconditionally, including to models that will reject it, so
+`agy`'s own error reaches you instead of being silently dropped.
 
 A long prompt that invites a long answer can also fail after the model has run:
 

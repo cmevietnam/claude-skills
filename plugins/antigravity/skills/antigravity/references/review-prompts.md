@@ -15,9 +15,16 @@ output at all. Write the review directly.
 token limit"` — an entirely wasted run. Add a cap to every review prompt:
 
 ```
-Report AT MOST 8 findings, most serious first, each under 12 lines. Quote only the
-specific line you object to, never long blocks of the material back to me.
+HARD LIMIT: report AT MOST 6 findings, most serious first, each one AT MOST 6 lines.
+Quote only the single line you object to, never a block. No preamble, no closing summary.
+If you cannot fit a finding in 6 lines, drop it and report a more serious one instead.
 ```
+
+**And drop the effort as the bundle grows.** Thinking tokens are charged against the same
+output budget and dominate it — a successful 92 KB review used 55,850 output tokens of
+which 54,977 were thinking. On that bundle `--effort high` hit the limit twice while
+`--effort medium` succeeded on the identical prompt. Reach for `high` on a small diff, not
+on a whole subsystem.
 
 Two more things separate a useful review from a list of platitudes:
 

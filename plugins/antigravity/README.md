@@ -50,19 +50,24 @@ The [`review`](../review) plugin runs adversarial review with multiple **Claude*
 and needs no external CLI. [`codex`](../codex) is one external reviewer; this is another.
 Running both on security-sensitive code and diffing their findings is the intended shape.
 
-Measured over two rounds while building this: **round 1, 9 findings — 4 correct, 2 partly,
-3 fabricated; round 2 on this plugin itself, 8 findings — 7 correct, 1 fabricated.** Round
-2 earned its keep: it found a real bug in the wrapper and a test that could never go red.
-It also repeated round 1's invention word for word, in a document that explicitly told it
-that claim was false. Hence the rule that every finding is reproduced before it is believed.
+Measured over five review rounds while building this — `agy` and Codex over the same
+material: **52 findings, 46 correct, 2 partly, 4 fabricated.** Every fabrication came from
+`agy`; Codex produced none in four rounds. They also barely overlap — in round 4 they
+agreed on 2 findings out of 21, and `agy` caught four test-harness defects Codex missed
+while Codex caught every security issue `agy` missed.
+
+One `agy` invention recurred in three separate rounds, twice in documents that named it as
+fabricated and asked for the correction to be deleted. Hence the rule that every finding is
+reproduced before it is believed.
 
 ## Requires
 
 ```bash
+set -euo pipefail
 d="$(mktemp -d)"                                                   # private, unguessable
-curl -fsSL --proto '=https' https://antigravity.google/cli/install.sh -o "$d/install.sh"
-less "$d/install.sh"          # read it first; it is short
-bash "$d/install.sh"
+curl -fsSL --proto '=https' https://antigravity.google/cli/install.sh -o "$d/install.sh" \
+  && less "$d/install.sh" \
+  && bash "$d/install.sh"                # each step gated on the one before
 agy --version
 ```
 

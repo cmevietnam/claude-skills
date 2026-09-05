@@ -44,8 +44,11 @@ run_bin() {
   esac
   python3 "$BIN" "$@" >"$TMP/.stdout" 2>"$TMP/.stderr"
   RC=$?
-  STDOUT="$(cat "$TMP/.stdout")"
-  STDERR="$(cat "$TMP/.stderr")"
+  # `$(cat f)` strips ALL trailing newlines, which would hide exactly the kind of
+  # trailing-newline corruption these tests exist to catch. The `printf x` trick keeps
+  # the bytes intact.
+  STDOUT="$(cat "$TMP/.stdout"; printf x)"; STDOUT="${STDOUT%x}"
+  STDERR="$(cat "$TMP/.stderr"; printf x)"; STDERR="${STDERR%x}"
   OUT="$STDOUT$STDERR"
 }
 
@@ -214,8 +217,12 @@ cat > "$TMP/good.json" <<'EOF'
  "usage":{"input_tokens":13282,"output_tokens":2,"thinking_tokens":0,
           "cache_read_tokens":0,"total_tokens":13284}}
 EOF
-GOOD_STDOUT='### Finding 1
-Something is wrong at foo.py:12'
+# Byte-exact expected stdout, trailing newline included — the wrapper must not add,
+# drop, or normalise one.
+GOOD_STDOUT="$(printf '### Finding 1\nSomething is wrong at foo.py:12\n'; printf x)"
+GOOD_STDOUT="${GOOD_STDOUT%x}"
+# NOT $(printf '\n') — command substitution strips the very newline we need.
+NL=$'\n'
 
 cat > "$TMP/good-no-findings.json" <<'EOF'
 {"conversation_id":"8849d232-d82b-454f-b31e-fe23d47b3d6b","status":"SUCCESS",
@@ -274,7 +281,7 @@ expect_fail "status=ERROR"             1 "invalid model selection" --check "$TMP
 expect_fail "output token limit"       1 "output token limit"      --check "$TMP/token-limit.json"
 expect_fail "missing file"             1 "cannot read"             --check "$TMP/nope.json"
 # `usage` is cosmetic: a wrong type must neither crash nor discard a complete review.
-expect_pass "mistyped usage still yields the review" "NO FINDINGS" \
+expect_pass "mistyped usage still yields the review" "NO FINDINGS$NL" \
   --check "$TMP/usage-string.json"
 if printf '%s' "$STDERR" | grep -q "usage. is str, not an object"; then
   note_pass "mistyped usage warns on stderr"
@@ -291,16 +298,30 @@ expect_fail "--check with --out"          2 "takes no run options" \
 expect_fail "deeply nested JSON"       1 "nested too deeply"       --check "$TMP/deep.json"
 
 expect_pass "real review"              "$GOOD_STDOUT"            --check "$TMP/good.json"
-expect_pass "NO FINDINGS is a result"  "NO FINDINGS"             --check "$TMP/good-no-findings.json"
-expect_pass "non-ASCII response"       "Finding 1 — cấu hình → hỏng" --check "$TMP/utf8.json"
-expect_pass "denied_actions null is a success shape"  "NO FINDINGS" --check "$TMP/denied-null.json"
-expect_pass "denied_actions [] is a success shape"    "NO FINDINGS" --check "$TMP/denied-empty.json"
-expect_pass "leading whitespace is preserved verbatim" "    indented finding" \
+expect_pass "NO FINDINGS is a result"  "NO FINDINGS$NL"          --check "$TMP/good-no-findings.json"
+expect_pass "non-ASCII response"       "Finding 1 — cấu hình → hỏng$NL" --check "$TMP/utf8.json"
+expect_pass "denied_actions null is a success shape"  "NO FINDINGS$NL" --check "$TMP/denied-null.json"
+expect_pass "denied_actions [] is a success shape"    "NO FINDINGS$NL" --check "$TMP/denied-empty.json"
+expect_pass "leading whitespace is preserved verbatim" "    indented finding$NL" \
   --check "$TMP/indented.json"
+
+# The documented newline contract, both directions: an existing trailing newline is not
+# doubled, and a missing one gets exactly one added.
+cat > "$TMP/no-trailing-nl.json" <<'EOF'
+{"conversation_id":"x","status":"SUCCESS","response":"NO FINDINGS"}
+EOF
+expect_pass "missing trailing newline gets exactly one" "NO FINDINGS$NL" \
+  --check "$TMP/no-trailing-nl.json"
+
+cat > "$TMP/double-nl.json" <<'EOF'
+{"conversation_id":"x","status":"SUCCESS","response":"line one\n\n"}
+EOF
+expect_pass "interior and trailing blank lines survive" "line one$NL$NL" \
+  --check "$TMP/double-nl.json"
 
 # The response must survive an ASCII locale — agy's output is UTF-8 either way.
 LC_ALL=C PYTHONUTF8=0 expect_pass "non-ASCII response under LC_ALL=C" \
-  "Finding 1 — cấu hình → hỏng" --check "$TMP/utf8.json"
+  "Finding 1 — cấu hình → hỏng$NL" --check "$TMP/utf8.json"
 
 # --- run-path cases, driven by a stub agy --------------------------------------------
 
@@ -367,20 +388,25 @@ argv_equals "full argv: -p, the exact prompt, and nothing unexpected" \
 # but the model itself must still be forwarded
 expect_pass "suffixed model runs" "$GOOD_STDOUT" \
   --agy "$STUB" --model gemini-3.8-flash-high --out "$TMP/run2" "$TMP/prompt.txt"
-argv_has   "suffixed id still forwards --model" "--model" "gemini-3.8-flash-high"
-argv_lacks "--effort suppressed for gemini-3.8-flash-high" "--effort"
+argv_equals "suffixed id: full argv, no --effort anywhere" \
+  "-p" "$PROMPT_ARG" "--model" "gemini-3.8-flash-high" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m"
 
 # a Claude id must NOT get --effort (agy: "--effort is not supported for model ...")
 expect_pass "claude model runs" "$GOOD_STDOUT" \
   --agy "$STUB" --model claude-opus-4-6-thinking --out "$TMP/run3" "$TMP/prompt.txt"
-argv_has   "claude id still forwards --model" "--model" "claude-opus-4-6-thinking"
-argv_lacks "--effort suppressed for claude-opus-4-6-thinking" "--effort"
+argv_equals "claude id: full argv, no --effort anywhere" \
+  "-p" "$PROMPT_ARG" "--model" "claude-opus-4-6-thinking" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m"
 
 # an explicit --effort is passed through even for a model that will reject it,
 # so agy's own error surfaces instead of being silently dropped
 expect_pass "explicit --effort passed through" "$GOOD_STDOUT" \
   --agy "$STUB" --model claude-sonnet-4-6 --effort low --out "$TMP/run4" "$TMP/prompt.txt"
-argv_has "explicit --effort low reaches agy" "--model" "claude-sonnet-4-6" "--effort" "low"
+argv_equals "explicit --effort is forwarded even to a model that rejects it" \
+  "-p" "$PROMPT_ARG" "--model" "claude-sonnet-4-6" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
+  "--effort" "low"
 
 # ...and when agy rejects that combination, the error reaches the user rather than
 # being swallowed. This is the behaviour the pass-through exists for.
@@ -410,29 +436,52 @@ STUB_RC=0 STUB_STDOUT="$TMP/denied.json" \
   expect_fail "denied tools fail even on exit 0" 1 "auto-denied" \
   --agy "$STUB" --out "$TMP/run7" "$TMP/prompt.txt"
 
+# The nonzero-exit branch has its own JSON read. It must survive the same pathological
+# input the --check parser handles, rather than dying with a RecursionError traceback.
+STUB_RC=4 STUB_STDOUT="$TMP/deep.json" \
+  expect_fail "nested JSON on the nonzero-exit path" 1 "agy exited 4" \
+  --agy "$STUB" --out "$TMP/run-deep" "$TMP/prompt.txt"
+
+# An empty option value is a mistake, never a request for the default — otherwise
+# `--check "$UNSET_VAR"` silently becomes a real, billed review.
+expect_fail "--check with an empty value"  2 "empty value" --check "" "$TMP/prompt.txt"
+expect_fail "--model with an empty value"  2 "empty value" \
+  --agy "$STUB" --model "" --out "$TMP/run-empty1" "$TMP/prompt.txt"
+expect_fail "--out with an empty value"    2 "empty value" \
+  --agy "$STUB" --out "" "$TMP/prompt.txt"
+
 # --- the default output location, which no --out run can exercise --------------------
 # Replacing the private mkdtemp with a predictable shared path must not stay green.
-expect_pass "run with no --out" "$GOOD_STDOUT" --agy "$STUB" "$TMP/prompt.txt"
+# TMPDIR is pinned so mkdtemp lands inside the suite's own directory: the path below is
+# parsed out of the OUTPUT OF THE CODE UNDER TEST, and a broken wrapper printing
+# "raw output: /Users/alice/out.json" must never become `rm -rf /Users/alice`.
+TMPDIR="$TMP" expect_pass "run with no --out" "$GOOD_STDOUT" --agy "$STUB" "$TMP/prompt.txt"
 DEFAULT_OUT="$(printf '%s' "$STDERR" | sed -n 's/^raw output: \(.*\)\/out\.json$/\1/p')"
+DEFAULT_OUT_REAL="$(cd "$DEFAULT_OUT" 2>/dev/null && pwd -P || true)"
+TMP_REAL="$(cd "$TMP" && pwd -P)"
 if [ -z "$DEFAULT_OUT" ] || [ ! -d "$DEFAULT_OUT" ]; then
   note_fail "default --out: could not find the reported directory in stderr"
+elif [ -z "$DEFAULT_OUT_REAL" ] || [ "${DEFAULT_OUT_REAL#"$TMP_REAL"/}" = "$DEFAULT_OUT_REAL" ]; then
+  note_fail "default --out escaped the test directory: $DEFAULT_OUT (refusing to touch it)"
 else
   dmode="$(stat -f '%Lp' "$DEFAULT_OUT" 2>/dev/null || stat -c '%a' "$DEFAULT_OUT")"
   fmode="$(stat -f '%Lp' "$DEFAULT_OUT/out.json" 2>/dev/null || stat -c '%a' "$DEFAULT_OUT/out.json")"
+  emode="$(stat -f '%Lp' "$DEFAULT_OUT/err.txt" 2>/dev/null || stat -c '%a' "$DEFAULT_OUT/err.txt")"
   if [ "$dmode" = "700" ]; then
     note_pass "default output directory is 0700"
   else
     note_fail "default output directory is $dmode, expected 700"
   fi
-  if [ "$fmode" = "600" ]; then
-    note_pass "report files are 0600"
+  if [ "$fmode" = "600" ] && [ "$emode" = "600" ]; then
+    note_pass "both report files are 0600"
   else
-    note_fail "report files are $fmode, expected 600"
+    note_fail "report files are out.json=$fmode err.txt=$emode, expected 600/600"
   fi
   case "$DEFAULT_OUT" in
     */agy-review-*) note_pass "default output directory is a fresh mkdtemp" ;;
     *) note_fail "default output directory is not a mkdtemp path: $DEFAULT_OUT" ;;
   esac
+  # Safe: proven to be a real path beneath $TMP, which the EXIT trap removes anyway.
   rm -rf "$DEFAULT_OUT"
 fi
 

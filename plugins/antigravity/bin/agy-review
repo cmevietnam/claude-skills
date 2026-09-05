@@ -12,7 +12,9 @@ Usage:
 
 Options:
   --model M      model id (default: gemini-3.8-flash)
-  --effort E     low|medium|high. Passed only when the model accepts it; see below.
+  --effort E     low|medium|high. Given explicitly it is ALWAYS forwarded, even to a
+                 model that rejects it, so agy's own error surfaces. See below for when
+                 the default is applied.
   --out DIR      where to keep out.json and err.txt. Default: a private mkdtemp
                  directory. An existing out.json/err.txt is never overwritten, so two
                  models get two directories and no raw report is lost.
@@ -60,7 +62,12 @@ def die(msg, code=1):
 
 
 def write_response(text):
-    """Emit the review byte-for-byte — no added or removed newline."""
+    """Emit the review unmodified.
+
+    Nothing is stripped, rewrapped or re-indented — leading whitespace is content. The
+    single exception is a trailing newline added when the response lacks one, so the
+    shell prompt starts on its own line; no other byte is touched.
+    """
     sys.stdout.write(text)
     if not text.endswith("\n"):
         sys.stdout.write("\n")
@@ -83,6 +90,23 @@ def read_text(path):
         return f.read()
 
 
+def parse_json(raw, what, hint=""):
+    """Parse JSON, turning every parser explosion into a diagnosis instead of a traceback.
+
+    One helper for both call sites: the run path used to have its own inline parse that
+    lacked the RecursionError guard the --check path had.
+    """
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        die(f"FAILED: {what} is not JSON ({e}){hint}\nfirst 200 bytes: {raw[:200]!r}")
+    except RecursionError:
+        die(f"FAILED: {what} is nested too deeply to parse{hint}")
+    except ValueError as e:
+        # e.g. an integer literal beyond sys.set_int_max_str_digits
+        die(f"FAILED: {what} could not be parsed ({e}){hint}")
+
+
 def read_envelope(path, err_path=None):
     hint = f" — see {err_path}" if err_path else ""
     try:
@@ -95,15 +119,7 @@ def read_envelope(path, err_path=None):
     if not raw:
         die(f"FAILED: empty output file, the run produced nothing{hint}")
 
-    try:
-        env = json.loads(raw)
-    except json.JSONDecodeError as e:
-        die(f"FAILED: output is not JSON ({e}){hint}\nfirst 200 bytes: {raw[:200]!r}")
-    except RecursionError:
-        # Pathologically nested JSON blows the parser's stack; that is a bad envelope,
-        # not a reason to print a traceback.
-        die(f"FAILED: output JSON is nested too deeply to parse{hint}")
-
+    env = parse_json(raw, "output", hint)
     if not isinstance(env, dict):
         die(f"FAILED: output is not a JSON object, got {type(env).__name__}{hint}")
     return env
@@ -195,7 +211,16 @@ def main():
         print(__doc__)
         return 0
 
-    if args.check:
+    # An empty value is a mistake, never a request for the default — otherwise
+    # `--check "$MAYBE_UNSET"` quietly turns a validation into a real, billed review.
+    for flag, value in (
+        ("--check", args.check), ("--model", args.model), ("--effort", args.effort),
+        ("--out", args.out), ("--timeout", args.timeout), ("--agy", args.agy),
+    ):
+        if value is not None and not value.strip():
+            die(f"usage: {flag} was given an empty value", 2)
+
+    if args.check is not None:
         # --check validates an existing envelope; nothing about a run applies to it.
         # Silently ignoring run options would hide a mistyped command.
         conflicting = [
@@ -218,8 +243,8 @@ def main():
         write_response(response)
         return 0
 
-    model = args.model or "gemini-3.8-flash"
-    timeout = args.timeout or "9m"
+    model = args.model if args.model is not None else "gemini-3.8-flash"
+    timeout = args.timeout if args.timeout is not None else "9m"
 
     if not args.target:
         die("usage: agy-review [options] PROMPT_FILE | --check ENVELOPE_JSON", 2)
@@ -290,9 +315,24 @@ def main():
         cmd += ["--effort", "high"]
 
     def private_create(path):
-        """O_CREAT|O_EXCL (never follows a symlink) at mode 0600, umask notwithstanding."""
+        """Create at exactly 0600, never following a symlink.
+
+        O_CREAT|O_EXCL refuses an existing path, symlink included. The mode passed to
+        os.open is still masked by the umask — which can only remove bits, so the file
+        is never more permissive than 0600, but under a umask like 0200 it would come
+        out 0400. fchmod pins it.
+        """
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:  # some filesystems do not support it; 0600-or-tighter still holds
+            pass
         return os.fdopen(fd, "wb")
+
+    # Announce the paths BEFORE running: a pre-exec failure (a bad shebang in the target,
+    # say) would otherwise leave an implicitly created temp directory nobody can find.
+    print(f"raw output: {out_path}", file=sys.stderr)
+    print(f"stderr:     {err_path}", file=sys.stderr)
 
     try:
         with private_create(out_path) as out_f, private_create(err_path) as err_f:
@@ -302,12 +342,12 @@ def main():
     except ValueError as e:
         die(f"FAILED: could not run {binary}: {e}", 2)
 
-    print(f"raw output: {out_path}", file=sys.stderr)
-    print(f"stderr:     {err_path}", file=sys.stderr)
-
     # A non-zero exit is reported with its code before any envelope complaint, so the
     # real failure is never masked by "empty output file".
     if rc != 0:
+        # Best-effort extra detail. The exit code is the finding here, so any problem
+        # reading or parsing the envelope is swallowed rather than replacing it — but it
+        # must not become a traceback either, hence the same guards as the --check path.
         detail = ""
         try:
             raw = read_text(out_path).strip()
@@ -315,7 +355,7 @@ def main():
                 parsed = json.loads(raw)
                 if isinstance(parsed, dict) and parsed.get("error"):
                     detail = f": {parsed['error']}"
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, ValueError, RecursionError):
             pass
         die(f"FAILED: agy exited {rc}{detail} — see {err_path}")
 

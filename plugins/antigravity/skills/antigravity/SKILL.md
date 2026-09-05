@@ -30,9 +30,12 @@ after an upgrade — `agy` self-updates in the background, so the version can mo
    This holds even under a prior "review it and then fix it": the user authorised fixing
    the problems they knew about, not the ones the reviewer just found.
 4. **Verify every finding before presenting it as fact.** Reproduce each claim against the
-   code — without editing anything — and mark which ones reproduced. In the run that built
-   this plugin, **3 of 9 findings were fabricated**, including a confident claim that a
-   tool I use in every session does not exist. Present the unreproducible ones too, labelled.
+   code — without editing anything — and mark which ones reproduced. Across the five
+   review rounds that built this plugin, **4 of 52 findings were fabricated** — three in
+   the first round, against the predecessor plugin, and one repeated invention that
+   recurred in three separate rounds: a confident claim that a tool used in every session
+   does not exist. Present the unreproducible ones too, labelled. Counts and detail:
+   `references/reporting-findings.md`.
 5. **A crashed or empty run is a reportable outcome**, not a gap to fill with my own
    analysis.
 
@@ -90,9 +93,13 @@ be silently denied, and a deterministic run.
 Nothing in it enforces anything: if a persistent allow-rule such as `command(cat)` already
 sits in `~/.gemini/antigravity-cli/settings.json`, the model can still run tools, no
 `denied_actions` appears, and the run is accepted as clean. An instruction planted in the
-material being reviewed could use that to read credentials. Before reviewing anything you
-did not write, read that settings file and remove standing allow-rules; the empty-file
-default denies every tool, which is what you want.
+material being reviewed could use that to read credentials.
+
+So before reviewing anything you did not write: **read** that settings file. If it has no
+`permissions.allow`, the default denies every tool and you are fine. If it does, **stop and
+tell the user what is in it** — that file is theirs, it may hold configuration unrelated to
+this plugin, and removing rules is their call, not mine. If they authorise a temporary
+change, keep a copy and restore it afterwards.
 
 ```bash
 set -euo pipefail                      # an empty diff.txt must not become a clean review
@@ -116,7 +123,7 @@ git diff main...HEAD > "$S/diff.txt"   # or: git diff (unstaged) / --cached / <S
   cat "$S/diff.txt"
 } > "$S/prompt.txt"
 
-agy-review --model gemini-3.8-flash --effort high --out "$S" "$S/prompt.txt"
+agy-review --model gemini-3.8-flash --out "$S/flash" "$S/prompt.txt"
 ```
 
 `agy-review` adds `--disable-slash-commands`, `--output-format json` and
@@ -196,10 +203,23 @@ Rule-by-rule evidence: `references/headless-permissions.md`.
 
 ## Sessions
 
+`agy-review` has no session flag yet, so a follow-up is the one place `agy` is called
+directly — and the false-success trap applies in full, so **validate the envelope**:
+
 ```bash
-agy -p "follow-up" --continue --output-format json </dev/null       # most recent
-agy -p "follow-up" --conversation <ID> --output-format json </dev/null
+S="$(mktemp -d)"
+agy -p "follow-up" --continue --output-format json </dev/null \
+  >"$S/out.json" 2>"$S/err.txt"
+echo "exit=$?"
+agy-review --check "$S/out.json"      # never read .response directly
+
+agy -p "follow-up" --conversation <ID> --output-format json </dev/null \
+  >"$S/out2.json" 2>"$S/err2.txt"
+agy-review --check "$S/out2.json"
 ```
+
+A follow-up that reaches for a tool exits 0 with `SUCCESS` and an empty response exactly
+like any other denied run; `--check` is what catches it.
 
 `conversation_id` comes back in every JSON envelope. Note that `num_turns`,
 `duration_seconds` and `usage` are **cumulative over the session**, not per-turn.
@@ -214,10 +234,18 @@ agy -p "follow-up" --conversation <ID> --output-format json </dev/null
 
 - **`Please sign in`** — headless cannot authenticate. The user runs `agy` in a **real
   terminal** (not `!` in Claude Code, which has no TTY: `bubbletea: could not open TTY`).
-- **`exceeded the output token limit`** — `status: ERROR` with an empty response, seen on
-  a 57 KB review prompt that invited an unbounded answer. Bound the output in the prompt
-  ("at most 8 findings, each under 12 lines, quote only the line you object to") and rerun.
-  This one is invisible to anything that reads `.response` without checking `.error`.
+- **`exceeded the output token limit`** — `status: ERROR` with an empty response.
+  **Thinking tokens count against that budget**, and they dominate: a successful 92 KB
+  review reported `output_tokens: 55850` of which `thinking_tokens: 54977`. Two levers,
+  in this order:
+  1. **Lower the effort.** On a 92 KB bundle, `--effort high` failed twice and
+     `--effort medium` succeeded on the same prompt. Big input wants less effort, not more.
+  2. Bound the answer in the prompt: "at most 6 findings, each at most 6 lines, quote only
+     the line you object to".
+
+  Invisible to anything that reads `.response` without checking `.error`; `agy-review`
+  catches it.
+
 - **stderr carries the diagnosis**, including the auto-deny warning. Never discard it —
   capture it to a file. Mixing it into stdout corrupts `stream-json` output with non-JSON
   lines.

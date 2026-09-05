@@ -6,7 +6,9 @@ append this block to the prompt.
 ```
 Also check for PRODUCTION BREAKING CHANGES:
 1. Does any change REJECT inputs previously ACCEPTED? (stricter validation, new required fields)
-   → New validation must apply to CREATION paths only, NOT read/login/existing-data paths
+   → New validation must apply only to paths that CREATE or CHANGE the value (registration,
+     password change), NEVER to paths that read or verify an existing value (login, fetch),
+     unless the existing data is migrated first
 2. Does any change INVALIDATE existing sessions/data? (token format, cache keys, Redis schema)
    → Flag if Redis restart wipes data, coordinated deploy needed
 3. Does any change REMOVE or RENAME external-facing contracts? (API fields, endpoints, env vars)
@@ -19,8 +21,9 @@ For each finding, state: WHAT breaks, WHO is affected, HOW to mitigate.
 
 ## The principle
 
-Tightening validation on a READ or LOGIN path breaks existing users. Tighten on
-WRITE/CREATE paths only, unless the existing data is migrated first.
+Tightening validation on a READ or LOGIN path breaks existing users. Tighten only where
+the value is created or changed — registration **and** password change — never where an
+existing value is merely read or verified, unless the existing data is migrated first.
 
 ## The incident behind it
 
