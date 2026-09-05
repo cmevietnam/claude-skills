@@ -99,12 +99,24 @@ causes. Do not restate the plan back to me.
 ## Assembling and running
 
 ```bash
-S=/tmp/agy-review; mkdir -p "$S"
-git diff main...HEAD > "$S/diff.txt"
+set -euo pipefail            # a failed producer must not yield a half-built prompt
+S="$(mktemp -d)"             # private 0700; never a predictable /tmp path
+
+git diff main...HEAD > "$S/diff.txt"     # committed only — omits uncommitted work
+[ -s "$S/diff.txt" ] || { echo "nothing to review"; exit 1; }
+
 cat "$S/preamble.txt" "$S/instructions.txt" "$S/diff.txt" > "$S/prompt.txt"
 
-agy-review --model gemini-3.8-flash --effort high --out "$S" "$S/prompt.txt"
+agy-review --model gemini-3.8-flash --effort high --out "$S/flash" "$S/prompt.txt"
 ```
+
+Without `set -e` and the emptiness check, a missing base branch leaves `diff.txt` empty,
+the model reviews the instructions alone, and a confident `NO FINDINGS` comes back on a
+diff nobody looked at.
+
+Give each model its own `--out` subdirectory: `agy-review` refuses to overwrite an
+existing `out.json`, so a second model pointed at the same directory fails rather than
+destroying the first raw report.
 
 ## Reading the result
 

@@ -101,6 +101,18 @@ Verified behaviour, one step at a time:
 | `command(cat)`                       | model falls back to `read_file` → `denied_actions: [read_file / ViewFile]` |
 | `command(cat)` + `read_file(<repo>)` | `denied_actions: null`, correct file contents returned                     |
 
+### `command(cat)` is not a read-only rule
+
+It appears in the table because that is how the behaviour was measured, not as a
+recommendation. `command(<binary>)` scopes to the **binary**, never to a path: `command(cat)`
+authorises `cat` against every file the user can read — `~/.ssh/id_ed25519`,
+`~/.aws/credentials`, another project's `.env`. It lives in the user's global settings and
+stays in force for every later session and every project.
+
+`read_file(<path prefix>)` is the scoped rule. Prefer it alone. If a shell genuinely is
+needed, name that explicitly to the user, keep it for the one task, and delete the rule
+afterwards.
+
 So every tool the model might reach for needs its own rule. Tool names observed:
 
 | Tool           | Display name | Rule                       |

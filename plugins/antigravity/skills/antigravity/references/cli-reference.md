@@ -12,12 +12,19 @@ agy changelog
 ## Install
 
 ```bash
-curl -fsSL https://antigravity.google/cli/install.sh | bash
+curl -fsSL https://antigravity.google/cli/install.sh -o /tmp/agy-install.sh
+less /tmp/agy-install.sh      # read it — it is ~240 lines and does what it says
+bash /tmp/agy-install.sh
 ```
+
+Download, read, then run **that exact file**. Piping straight into `bash` executes network
+content you have not seen, and a failed `curl` becomes an empty script that `bash` accepts
+happily — so the documented one-liner
+(`curl -fsSL https://antigravity.google/cli/install.sh | bash`) is not what to use.
 
 The installer fetches a per-platform manifest, verifies a **SHA512** against it, writes the
 binary to `~/.local/bin/agy`, clears the macOS quarantine attribute, and runs `agy install`
-to configure the shell. Read it before running it — it is short and does what it says.
+to configure the shell.
 
 Be aware that `agy install` appends a PATH line to **every** shell profile it finds:
 `.zshrc`, `.zprofile`, `.bashrc`, `.bash_profile`, `.profile`, and

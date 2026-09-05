@@ -13,9 +13,16 @@ Usage:
 Options:
   --model M      model id (default: gemini-3.8-flash)
   --effort E     low|medium|high. Passed only when the model accepts it; see below.
-  --out DIR      where to keep out.json and err.txt (default: a mkdtemp directory)
+  --out DIR      where to keep out.json and err.txt. Default: a private mkdtemp
+                 directory. An existing out.json/err.txt is never overwritten, so two
+                 models get two directories and no raw report is lost.
   --timeout T    --print-timeout value (default: 9m)
-  --agy PATH     path to the agy binary (default: agy, then ~/.local/bin/agy)
+  --agy PATH     agy binary: a bare name is resolved on PATH, a path is used as given
+                 (default: agy, then ~/.local/bin/agy)
+
+The prompt is passed to `agy` as a command-line argument, because `agy -p` does not read
+stdin. On a shared machine that makes its full text visible to anyone who can list
+processes — do not put secrets in a review bundle.
 
 Effort handling: `agy` rejects --effort for models that bake the level into the id
 (gemini-3.8-flash-high) and for models that do not support it at all (claude-sonnet-4-6,
@@ -107,6 +114,12 @@ def validate(path, err_path=None):
     response = (raw_response or "").strip()
     if not response:
         die(f"FAILED: empty response, nothing was reviewed{hint}")
+
+    # `usage` is only ever reported, never trusted — but a wrong type must not crash
+    # the run after a perfectly good review has been produced.
+    usage = env.get("usage")
+    if usage is not None and not isinstance(usage, dict):
+        die(f"FAILED: `usage` is {type(usage).__name__}, not an object{hint}")
     return response, env
 
 
@@ -150,6 +163,22 @@ def main():
         return 0
 
     if args.check:
+        # --check validates an existing envelope; nothing about a run applies to it.
+        # Silently ignoring run options would hide a mistyped command.
+        conflicting = [
+            name
+            for name, value in (
+                ("PROMPT_FILE", args.target),
+                ("--out", args.out),
+                ("--agy", args.agy),
+                ("--effort", args.effort),
+            )
+            if value is not None
+        ]
+        if conflicting:
+            die(
+                f"usage: --check takes no run options, got: {', '.join(conflicting)}", 2
+            )
         response, _ = validate(args.check)
         print(response)
         return 0
@@ -167,13 +196,37 @@ def main():
         die(f"FAILED: prompt file {args.target} is not valid UTF-8 ({e})", 2)
     if not prompt.strip():
         die("FAILED: prompt file is empty", 2)
+    if "\0" in prompt:
+        # exec() cannot carry a NUL; without this the failure is a ValueError traceback
+        # from deep inside subprocess.
+        die(f"FAILED: prompt file {args.target} contains a NUL byte", 2)
 
     binary = find_agy(args.agy)
 
-    out_dir = args.out or tempfile.mkdtemp(prefix="agy-review-")
-    os.makedirs(out_dir, exist_ok=True)
+    # Default to a private 0700 directory. A predictable shared path under /tmp would
+    # expose the review — prompt and response both — to any local user, and invites
+    # pre-created-file and symlink attacks.
+    try:
+        if args.out:
+            os.makedirs(args.out, mode=0o700, exist_ok=True)
+            out_dir = args.out
+        else:
+            out_dir = tempfile.mkdtemp(prefix="agy-review-")
+    except OSError as e:
+        die(f"FAILED: cannot use output directory {args.out or '(temp)'}: {e}", 2)
+
     out_path = os.path.join(out_dir, "out.json")
     err_path = os.path.join(out_dir, "err.txt")
+
+    # Refuse to clobber a previous run's raw report: two models written to one --out
+    # would destroy the first, and an attacker-planted symlink would be followed.
+    for path in (out_path, err_path):
+        if os.path.lexists(path):
+            die(
+                f"FAILED: {path} already exists — pick a different --out so an earlier "
+                "run's raw report is not overwritten",
+                2,
+            )
 
     cmd = [
         binary,
@@ -189,9 +242,12 @@ def main():
         cmd += ["--effort", "high"]
 
     try:
-        with open(out_path, "wb") as out_f, open(err_path, "wb") as err_f:
+        # "xb" is O_CREAT|O_EXCL: it will not follow a symlink into an existing file.
+        with open(out_path, "xb") as out_f, open(err_path, "xb") as err_f:
             rc = subprocess.call(cmd, stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f)
     except OSError as e:
+        die(f"FAILED: could not run {binary}: {e}", 2)
+    except ValueError as e:
         die(f"FAILED: could not run {binary}: {e}", 2)
 
     print(f"raw output: {out_path}", file=sys.stderr)

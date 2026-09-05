@@ -21,7 +21,13 @@
       },
       "license": "MIT",
       "category": "security",
-      "keywords": ["1password", "secrets", "security", "touchid", "env"]
+      "keywords": [
+        "1password",
+        "secrets",
+        "security",
+        "touchid",
+        "env"
+      ]
     },
     {
       "name": "linode",
@@ -73,14 +79,20 @@
       },
       "license": "MIT",
       "category": "development",
-      "keywords": ["codex", "openai", "review", "second-opinion", "cli"]
+      "keywords": [
+        "codex",
+        "openai",
+        "review",
+        "second-opinion",
+        "cli"
+      ]
     },
     {
       "name": "antigravity",
       "source": "./plugins/antigravity",
       "displayName": "Antigravity (second opinion)",
       "description": "Run Google's Antigravity CLI (agy) headless as a second-opinion code reviewer, refuse to trust its exit code, and report every finding to the user verbatim before touching any code.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "author": {
         "name": "hieuvo"
       },

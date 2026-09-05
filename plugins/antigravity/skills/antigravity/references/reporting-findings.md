@@ -62,8 +62,10 @@ opinions, not about which vendor produced them.
 
    **Antigravity-specific and non-negotiable**: exit 0 and `"status": "SUCCESS"` do _not_
    mean a review happened. A run whose tools were all denied returns exactly that, with an
-   empty `response`. Check `response` is non-empty and `denied_actions` is absent before
-   reporting anything at all. See `headless-permissions.md`.
+   empty `response`. Check that `response` is non-empty and that `denied_actions` is not a
+   non-empty collection — missing, `null` and `[]` are all successful shapes, and a good
+   run really does report `"denied_actions": null`. `agy-review` does this for you; do it
+   before reporting anything at all. See `headless-permissions.md`.
 
 ## Why
 

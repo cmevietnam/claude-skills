@@ -66,7 +66,8 @@ a non-`SUCCESS` status, any `denied_actions`, or an empty/whitespace response �
 tells you where the raw `out.json` and `err.txt` are. Confirmed against the live CLI: a
 prompt that triggers an auto-deny gives `agy` exit 0 / SUCCESS and `agy-review` exit 1.
 
-`scripts/test-agy-review.sh` covers all eight failure shapes plus a negative control.
+`scripts/test-agy-review.sh` has 49 cases, six of them meta-tests that deliberately make
+each assertion helper fail — because a test that cannot go red proves nothing.
 
 Do not substitute `jq -r '.response // "failed"'`: on a zero-byte file `jq` prints
 **nothing and exits 0**, so the fallback never fires and the failure reads as silence.
@@ -86,9 +87,13 @@ Put the material _in the prompt_. No tools means no permissions to configure, no
 be silently denied, and a deterministic run.
 
 ```bash
-S=/tmp/agy-review
-mkdir -p "$S"
-git diff main...HEAD > "$S/diff.txt"
+set -euo pipefail                      # an empty diff.txt must not become a clean review
+S="$(mktemp -d)"                       # private 0700, not a predictable shared path
+
+# Pick the scope deliberately. `main...HEAD` reviews committed work only and silently
+# omits uncommitted changes — usually not what you want mid-task.
+git diff main...HEAD > "$S/diff.txt"   # or: git diff (unstaged) / --cached / <SHA>
+[ -s "$S/diff.txt" ] || { echo "nothing to review"; exit 1; }
 
 {
   echo "Answer entirely from the material in this prompt. Do NOT call any tools, do NOT"
@@ -160,14 +165,21 @@ Headless, every tool that needs approval is denied. To grant access, add allow-r
 ```json
 {
   "permissions": {
-    "allow": ["command(cat)", "read_file(/abs/path/to/repo)"]
+    "allow": ["read_file(/abs/path/to/repo)"]
   }
 }
 ```
 
-`command(cat)` alone still leaves `read_file` denied, and vice versa. Tool names seen:
-`run_command` (`command(<binary>)`), `read_file` (`ViewFile`), `find_by_name`. Ask the user
-before writing to their global settings, and prefer the no-tools shape above.
+`read_file(<prefix>)` is the rule to reach for: it is scoped to a path. **`command(cat)`
+is not** — despite reading like "let it read the repo", it permits `cat` against every
+file the user can read, `~/.ssh/id_ed25519` and `~/.aws/credentials` included, and the
+rule is global and persists into every later session. Add it only if something truly needs
+a shell, say so explicitly, and remove it afterwards.
+
+One rule per tool: `command(cat)` alone still leaves `read_file` denied, and vice versa.
+Tool names seen: `run_command` (`command(<binary>)`), `read_file` (`ViewFile`),
+`find_by_name`. Ask the user before writing to their global settings, and prefer the
+no-tools shape above — it needs no permissions at all.
 
 `--dangerously-skip-permissions` auto-approves everything including writes. Ask first, say
 so plainly, and consider `--sandbox` alongside it.

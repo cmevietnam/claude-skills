@@ -12,7 +12,14 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$HERE/../bin/agy-review"
-TMP="$(mktemp -d)"
+
+# A failed mktemp would leave TMP empty, scatter fixtures at / and make `rm -rf "$TMP"`
+# a very bad line. Refuse to run rather than continue into that.
+TMP="$(mktemp -d)" || { echo "FATAL: mktemp -d failed"; exit 1; }
+if [ -z "$TMP" ] || [ ! -d "$TMP" ]; then
+  echo "FATAL: mktemp -d produced no usable directory (got '${TMP}')"
+  exit 1
+fi
 trap 'rm -rf "$TMP"' EXIT
 
 pass=0
@@ -21,10 +28,16 @@ fail=0
 note_pass() { echo "ok    $1"; pass=$((pass + 1)); }
 note_fail() { echo "FAIL  $1"; fail=$((fail + 1)); }
 
-# run_case CAPTURE_VAR -- runs $BIN with the given args, sets RC and OUT
+# run_bin -- runs $BIN with the given args. Streams are captured SEPARATELY: a wrapper
+# that printed the review to stderr must not be able to satisfy a stdout assertion.
 run_bin() {
-  OUT="$(python3 "$BIN" "$@" 2>&1)"
+  # Drop any previous argv capture so a stale one cannot satisfy this run's assertions.
+  rm -f "${STUB_ARGV:-/dev/null}" 2>/dev/null || true
+  python3 "$BIN" "$@" >"$TMP/.stdout" 2>"$TMP/.stderr"
   RC=$?
+  STDOUT="$(cat "$TMP/.stdout")"
+  STDERR="$(cat "$TMP/.stderr")"
+  OUT="$STDOUT$STDERR"
 }
 
 # expect_fail NAME EXPECTED_EXIT EXPECTED_SUBSTRING -- args...
@@ -45,12 +58,25 @@ expect_fail() {
   fi
 }
 
+# An argv assertion is only meaningful if the capture exists. Without this guard, a
+# missing capture makes every grep fail, which argv_lacks would read as "absent" — the
+# same silence-passes bug this suite exists to prevent.
+argv_capture_ok() {
+  local name="$1"
+  if [ ! -s "$STUB_ARGV" ]; then
+    note_fail "$name: no argv capture at $STUB_ARGV — the stub never ran"
+    return 1
+  fi
+  return 0
+}
+
 # argv_has NAME EXPECTED... -- every string must appear as its own argv entry
 argv_has() {
   local name="$1"; shift
+  argv_capture_ok "$name" || return
   local missing=""
   for want in "$@"; do
-    grep -qx -- "$want" "$STUB_ARGV" || missing="$missing $want"
+    grep -qxF -- "$want" "$STUB_ARGV" || missing="$missing $want"
   done
   if [ -n "$missing" ]; then
     note_fail "$name: argv missing:$missing"
@@ -62,9 +88,10 @@ argv_has() {
 # argv_lacks NAME UNEXPECTED...
 argv_lacks() {
   local name="$1"; shift
+  argv_capture_ok "$name" || return
   local present=""
   for bad in "$@"; do
-    grep -qx -- "$bad" "$STUB_ARGV" && present="$present $bad"
+    grep -qxF -- "$bad" "$STUB_ARGV" && present="$present $bad"
   done
   if [ -n "$present" ]; then
     note_fail "$name: argv unexpectedly contained:$present"
@@ -73,16 +100,20 @@ argv_lacks() {
   fi
 }
 
-# expect_pass NAME EXPECTED_SUBSTRING -- args...
+# expect_pass NAME EXPECTED_EXACT_STDOUT -- args...
+# The review must arrive on STDOUT, complete and byte-for-byte. A substring match would
+# accept a truncated review, and a merged capture would accept one printed to stderr.
 expect_pass() {
   local name="$1" want="$2"; shift 2
   run_bin "$@"
-  if [ -z "$OUT" ]; then
-    note_fail "$name: no output at all — the check did not run"
+  if [ -z "$STDOUT" ]; then
+    note_fail "$name: stdout empty — nothing was printed as the review"
   elif [ "$RC" -ne 0 ]; then
     note_fail "$name: exit $RC, should have passed — ${OUT:0:160}"
-  elif ! printf '%s' "$OUT" | grep -q -- "$want"; then
-    note_fail "$name: passed but output lacked '$want'"
+  elif [ "$STDOUT" != "$want" ]; then
+    note_fail "$name: stdout differed
+      want: $(printf '%q' "$want")
+      got:  $(printf '%q' "$STDOUT")"
   else
     note_pass "$name"
   fi
@@ -122,23 +153,38 @@ cat > "$TMP/token-limit.json" <<'EOF'
  "error":"Your previous response was cut off because it exceeded the output token limit."}
 EOF
 
+# The positive fixtures carry the FULL envelope agy really emits, so a test can never
+# pass by accident on a shape agy would never produce.
 cat > "$TMP/good.json" <<'EOF'
-{"conversation_id":"x","status":"SUCCESS",
+{"conversation_id":"8849d232-d82b-454f-b31e-fe23d47b3d6b","status":"SUCCESS",
  "response":"### Finding 1\nSomething is wrong at foo.py:12\n",
- "num_turns":1,"usage":{"total_tokens":123}}
+ "duration_seconds":2.62,"num_turns":1,
+ "usage":{"input_tokens":13282,"output_tokens":2,"thinking_tokens":0,
+          "cache_read_tokens":0,"total_tokens":13284}}
 EOF
+GOOD_STDOUT='### Finding 1
+Something is wrong at foo.py:12'
 
 cat > "$TMP/good-no-findings.json" <<'EOF'
-{"conversation_id":"x","status":"SUCCESS","response":"NO FINDINGS\n","num_turns":1}
+{"conversation_id":"8849d232-d82b-454f-b31e-fe23d47b3d6b","status":"SUCCESS",
+ "response":"NO FINDINGS\n","duration_seconds":1.01,"num_turns":1,
+ "usage":{"input_tokens":5141,"output_tokens":1,"thinking_tokens":0,
+          "cache_read_tokens":8128,"total_tokens":5142}}
 EOF
 
 cat > "$TMP/bool-response.json" <<'EOF'
 {"conversation_id":"x","status":"SUCCESS","response":true}
 EOF
 
+# A mistyped `usage` must be refused, not crash after a good review has been produced.
+cat > "$TMP/usage-string.json" <<'EOF'
+{"conversation_id":"x","status":"SUCCESS","response":"NO FINDINGS\n","usage":"bad"}
+EOF
+
 # Non-ASCII must survive a C locale: agy writes UTF-8 regardless of the environment.
 cat > "$TMP/utf8.json" <<'EOF'
-{"conversation_id":"x","status":"SUCCESS","response":"Finding 1 — cấu hình → hỏng\n"}
+{"conversation_id":"x","status":"SUCCESS","response":"Finding 1 — cấu hình → hỏng\n",
+ "duration_seconds":1.0,"num_turns":1,"usage":{"total_tokens":10}}
 EOF
 
 # --- --check cases -------------------------------------------------------------------
@@ -155,10 +201,17 @@ expect_fail "null response"            1 "empty response"          --check "$TMP
 expect_fail "status=ERROR"             1 "invalid model selection" --check "$TMP/error-status.json"
 expect_fail "output token limit"       1 "output token limit"      --check "$TMP/token-limit.json"
 expect_fail "missing file"             1 "cannot read"             --check "$TMP/nope.json"
+expect_fail "usage is not an object"   1 "not an object"           --check "$TMP/usage-string.json"
 
-expect_pass "real review"              "Finding 1"               --check "$TMP/good.json"
+# --check is about an existing envelope; run options alongside it mean a mistyped command
+expect_fail "--check with a prompt file"  2 "takes no run options" \
+  --check "$TMP/good.json" "$TMP/prompt.txt"
+expect_fail "--check with --out"          2 "takes no run options" \
+  --check "$TMP/good.json" --out "$TMP/somewhere"
+
+expect_pass "real review"              "$GOOD_STDOUT"            --check "$TMP/good.json"
 expect_pass "NO FINDINGS is a result"  "NO FINDINGS"             --check "$TMP/good-no-findings.json"
-expect_pass "non-ASCII response"       "→ hỏng"                  --check "$TMP/utf8.json"
+expect_pass "non-ASCII response"       "Finding 1 — cấu hình → hỏng" --check "$TMP/utf8.json"
 
 # --- run-path cases, driven by a stub agy --------------------------------------------
 
@@ -180,34 +233,65 @@ export STUB_RC=0
 printf 'review this please\n' > "$TMP/prompt.txt"
 : > "$TMP/empty-prompt.txt"
 
+printf 'review\0this' > "$TMP/nul-prompt.txt"
+
 expect_fail "missing prompt file"  2 "prompt file not found" "$TMP/no-such-prompt.txt"
 expect_fail "empty prompt file"    2 "prompt file is empty"  "$TMP/empty-prompt.txt"
 expect_fail "no prompt file given" 2 "usage:"                --model gemini-3.8-flash
 expect_fail "bad --agy path"       2 "not found or not executable" \
   --agy "$TMP/nope-binary" "$TMP/prompt.txt"
 
-expect_pass "run path prints review" "Finding 1" \
+# a NUL cannot cross exec(); rejecting it here beats a ValueError from inside subprocess
+expect_fail "NUL byte in prompt"   2 "NUL byte" \
+  --agy "$STUB" --out "$TMP/run-nul" "$TMP/nul-prompt.txt"
+
+# --out must not be silently turned into, or clobber, something that already exists
+expect_fail "--out is an existing file" 2 "cannot use output directory" \
+  --agy "$STUB" --out "$TMP/prompt.txt" "$TMP/prompt.txt"
+
+mkdir -p "$TMP/run-collide"
+: > "$TMP/run-collide/out.json"
+expect_fail "--out already holds a report" 2 "already exists" \
+  --agy "$STUB" --out "$TMP/run-collide" "$TMP/prompt.txt"
+
+expect_pass "run path prints review" "$GOOD_STDOUT" \
   --agy "$STUB" --out "$TMP/run1" "$TMP/prompt.txt"
+
+# The invocation contract, not just the flags: `agy -p` does not read stdin, so the
+# prompt MUST arrive as the argument after -p. Without this a wrapper that dropped the
+# prompt entirely would leave the suite green.
+argv_has "prompt is passed via -p, with its exact contents" \
+  "-p" "$(cat "$TMP/prompt.txt")"
 argv_has "gemini id gets --model and default --effort high" \
   "--model" "gemini-3.8-flash" "--effort" "high" \
-  "--disable-slash-commands" "--output-format" "json"
+  "--disable-slash-commands" "--output-format" "json" \
+  "--print-timeout" "9m"
+
+# -p and the prompt must be adjacent, in that order. The stub records "$@", so the
+# first flag is line 1 and its value line 2.
+if [ "$(grep -n -xF -- "-p" "$STUB_ARGV" | cut -d: -f1)" = "1" ] &&
+   [ "$(sed -n '2p' "$STUB_ARGV")" = "$(cat "$TMP/prompt.txt")" ]; then
+  note_pass "prompt immediately follows -p in argv"
+else
+  note_fail "prompt does not immediately follow -p in argv (line1=$(sed -n '1p' "$STUB_ARGV"))"
+fi
 
 # a suffixed id must NOT get --effort (agy: "conflicts with --effort=high"),
 # but the model itself must still be forwarded
-expect_pass "suffixed model runs" "Finding 1" \
+expect_pass "suffixed model runs" "$GOOD_STDOUT" \
   --agy "$STUB" --model gemini-3.8-flash-high --out "$TMP/run2" "$TMP/prompt.txt"
 argv_has   "suffixed id still forwards --model" "--model" "gemini-3.8-flash-high"
 argv_lacks "--effort suppressed for gemini-3.8-flash-high" "--effort"
 
 # a Claude id must NOT get --effort (agy: "--effort is not supported for model ...")
-expect_pass "claude model runs" "Finding 1" \
+expect_pass "claude model runs" "$GOOD_STDOUT" \
   --agy "$STUB" --model claude-opus-4-6-thinking --out "$TMP/run3" "$TMP/prompt.txt"
 argv_has   "claude id still forwards --model" "--model" "claude-opus-4-6-thinking"
 argv_lacks "--effort suppressed for claude-opus-4-6-thinking" "--effort"
 
 # an explicit --effort is passed through even for a model that will reject it,
 # so agy's own error surfaces instead of being silently dropped
-expect_pass "explicit --effort passed through" "Finding 1" \
+expect_pass "explicit --effort passed through" "$GOOD_STDOUT" \
   --agy "$STUB" --model claude-sonnet-4-6 --effort low --out "$TMP/run4" "$TMP/prompt.txt"
 argv_has "explicit --effort low reaches agy" "--model" "claude-sonnet-4-6" "--effort" "low"
 
@@ -222,7 +306,7 @@ STUB_RC=1 STUB_STDOUT="$TMP/effort-rejected.json" \
   --agy "$STUB" --model claude-sonnet-4-6 --effort low --out "$TMP/run4b" "$TMP/prompt.txt"
 
 # a bare binary name for --agy is resolved through PATH, not treated as ./agy
-PATH="$TMP:$PATH" expect_pass "bare --agy name resolves via PATH" "Finding 1" \
+PATH="$TMP:$PATH" expect_pass "bare --agy name resolves via PATH" "$GOOD_STDOUT" \
   --agy "stub-agy" --out "$TMP/run8" "$TMP/prompt.txt"
 
 # exit-code propagation: a non-zero agy exit must be reported with its code,
@@ -259,7 +343,7 @@ meta_expect_red() {
 }
 
 meta_expect_red "expect_pass rejects a denied envelope" \
-  expect_pass "META" "Finding 1" --check "$TMP/denied.json"
+  expect_pass "META" "$GOOD_STDOUT" --check "$TMP/denied.json"
 
 meta_expect_red "expect_fail rejects the wrong exit code" \
   expect_fail "META" 99 "empty output file" --check "$TMP/zero-byte.json"
@@ -272,6 +356,15 @@ meta_expect_red "argv_has notices a missing argument" \
 
 meta_expect_red "argv_lacks notices an argument that is present" \
   argv_lacks "META" "--model"
+
+# The subtle one: with no capture at all, every grep fails, which a naive argv_lacks
+# would read as "the argument is absent" and pass. It must fail instead.
+STUB_ARGV="$TMP/no-such-argv.txt" meta_expect_red \
+  "argv_lacks fails when the capture is missing" \
+  argv_lacks "META" "--model"
+STUB_ARGV="$TMP/no-such-argv.txt" meta_expect_red \
+  "argv_has fails when the capture is missing" \
+  argv_has "META" "--model"
 
 echo
 echo "passed=$pass failed=$fail"
