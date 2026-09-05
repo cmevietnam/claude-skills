@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Run one headless `agy` review and refuse to call it a success unless it really was.
+
+`agy` exits 0 with status=SUCCESS and an empty response when every tool it wanted was
+auto-denied, which is the default headless. This wrapper treats that — and an empty
+output file, non-JSON output, a populated `error`, and any `denied_actions` — as hard
+failures.
+
+Usage:
+  agy-review [options] PROMPT_FILE     run the prompt, validate, print the response
+  agy-review --check ENVELOPE_JSON     validate an envelope that already exists
+
+Options:
+  --model M      model id (default: gemini-3.8-flash)
+  --effort E     low|medium|high. Passed only when the model accepts it; see below.
+  --out DIR      where to keep out.json and err.txt (default: a mkdtemp directory)
+  --timeout T    --print-timeout value (default: 9m)
+  --agy PATH     path to the agy binary (default: agy, then ~/.local/bin/agy)
+
+Effort handling: `agy` rejects --effort for models that bake the level into the id
+(gemini-3.8-flash-high) and for models that do not support it at all (claude-sonnet-4-6,
+claude-opus-4-6-thinking). Given no explicit --effort, this wrapper applies the default
+only to an unsuffixed `gemini-*` id and omits it everywhere else. An explicit --effort is
+always passed through, so `agy`'s own error surfaces rather than being silently dropped.
+
+Exit codes: 0 review produced, 1 run failed or was incomplete, 2 usage error.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+EFFORT_SUFFIXES = ("-high", "-medium", "-low")
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def takes_effort(model):
+    """True when `model` is an id that accepts a separate --effort flag.
+
+    Verified against agy 1.1.27: a suffixed id conflicts ("conflicts with --effort=high")
+    and the Claude ids are refused outright ("--effort is not supported for model ...").
+    """
+    if model.endswith(EFFORT_SUFFIXES):
+        return False
+    return bool(re.match(r"^gemini-", model))
+
+
+def read_text(path):
+    """Read a text file as UTF-8 regardless of locale — agy emits raw UTF-8 JSON."""
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def read_envelope(path, err_path=None):
+    hint = f" — see {err_path}" if err_path else ""
+    try:
+        raw = read_text(path).strip()
+    except OSError as e:
+        die(f"FAILED: cannot read {path}: {e}")
+    except UnicodeDecodeError as e:
+        die(f"FAILED: {path} is not valid UTF-8 ({e}){hint}")
+
+    if not raw:
+        die(f"FAILED: empty output file, the run produced nothing{hint}")
+
+    try:
+        env = json.loads(raw)
+    except json.JSONDecodeError as e:
+        die(f"FAILED: output is not JSON ({e}){hint}\nfirst 200 bytes: {raw[:200]!r}")
+
+    if not isinstance(env, dict):
+        die(f"FAILED: output is not a JSON object, got {type(env).__name__}{hint}")
+    return env
+
+
+def validate(path, err_path=None):
+    """Return (response, envelope), or exit non-zero explaining why the run is unusable."""
+    env = read_envelope(path, err_path)
+    hint = f" — see {err_path}" if err_path else ""
+
+    if env.get("error"):
+        die(f"FAILED: status={env.get('status')} error={env['error']}")
+    if env.get("status") != "SUCCESS":
+        die(f"FAILED: status={env.get('status')}{hint}")
+    if env.get("denied_actions"):
+        die(
+            "FAILED: the run was incomplete — these tools were auto-denied: "
+            f"{env['denied_actions']}\n"
+            "Either put the material in the prompt and forbid tool use, or add "
+            "allow-rules to ~/.gemini/antigravity-cli/settings.json."
+        )
+
+    raw_response = env.get("response")
+    if raw_response is not None and not isinstance(raw_response, str):
+        die(
+            f"FAILED: `response` is {type(raw_response).__name__}, not a string{hint}"
+        )
+    response = (raw_response or "").strip()
+    if not response:
+        die(f"FAILED: empty response, nothing was reviewed{hint}")
+    return response, env
+
+
+def usable_binary(path):
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def find_agy(explicit):
+    if explicit:
+        # A bare name like `agy` is resolved through PATH; a path is used as given.
+        if os.sep not in explicit:
+            found = shutil.which(explicit)
+            if found:
+                return found
+        if usable_binary(explicit):
+            return explicit
+        die(f"FAILED: agy binary not found or not executable at {explicit}", 2)
+    found = shutil.which("agy")
+    if found:
+        return found
+    fallback = os.path.expanduser("~/.local/bin/agy")
+    if usable_binary(fallback):
+        return fallback
+    die("FAILED: `agy` not found on PATH or at ~/.local/bin/agy", 2)
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("target", nargs="?")
+    ap.add_argument("--check", metavar="ENVELOPE_JSON")
+    ap.add_argument("--model", default="gemini-3.8-flash")
+    ap.add_argument("--effort", default=None)
+    ap.add_argument("--out")
+    ap.add_argument("--timeout", default="9m")
+    ap.add_argument("--agy")
+    ap.add_argument("-h", "--help", action="store_true")
+    args = ap.parse_args()
+
+    if args.help:
+        print(__doc__)
+        return 0
+
+    if args.check:
+        response, _ = validate(args.check)
+        print(response)
+        return 0
+
+    if not args.target:
+        die("usage: agy-review [options] PROMPT_FILE | --check ENVELOPE_JSON", 2)
+    if not os.path.isfile(args.target):
+        die(f"FAILED: prompt file not found: {args.target}", 2)
+
+    try:
+        prompt = read_text(args.target)
+    except OSError as e:
+        die(f"FAILED: cannot read prompt file {args.target}: {e}", 2)
+    except UnicodeDecodeError as e:
+        die(f"FAILED: prompt file {args.target} is not valid UTF-8 ({e})", 2)
+    if not prompt.strip():
+        die("FAILED: prompt file is empty", 2)
+
+    binary = find_agy(args.agy)
+
+    out_dir = args.out or tempfile.mkdtemp(prefix="agy-review-")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "out.json")
+    err_path = os.path.join(out_dir, "err.txt")
+
+    cmd = [
+        binary,
+        "-p", prompt,
+        "--model", args.model,
+        "--disable-slash-commands",
+        "--output-format", "json",
+        "--print-timeout", args.timeout,
+    ]
+    if args.effort is not None:
+        cmd += ["--effort", args.effort]
+    elif takes_effort(args.model):
+        cmd += ["--effort", "high"]
+
+    try:
+        with open(out_path, "wb") as out_f, open(err_path, "wb") as err_f:
+            rc = subprocess.call(cmd, stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f)
+    except OSError as e:
+        die(f"FAILED: could not run {binary}: {e}", 2)
+
+    print(f"raw output: {out_path}", file=sys.stderr)
+    print(f"stderr:     {err_path}", file=sys.stderr)
+
+    # A non-zero exit is reported with its code before any envelope complaint, so the
+    # real failure is never masked by "empty output file".
+    if rc != 0:
+        detail = ""
+        try:
+            raw = read_text(out_path).strip()
+            if raw:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict) and parsed.get("error"):
+                    detail = f": {parsed['error']}"
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        die(f"FAILED: agy exited {rc}{detail} — see {err_path}")
+
+    response, env = validate(out_path, err_path)
+
+    usage = env.get("usage") or {}
+    print(
+        f"model={args.model} conversation={env.get('conversation_id')} "
+        f"tokens={usage.get('total_tokens')} turns={env.get('num_turns')}",
+        file=sys.stderr,
+    )
+    print(response)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

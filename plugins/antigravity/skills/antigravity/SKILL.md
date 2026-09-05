@@ -1,0 +1,226 @@
+---
+name: antigravity
+description: Use when the user asks to run Antigravity CLI or `agy` for code review, a second opinion, code analysis, or a headless agent run — "ask antigravity", "agy review this", "have gemini flash look at it", "second opinion on this diff". Google's Antigravity CLI, which replaced Gemini CLI for personal accounts; serves Gemini Flash/Pro, Claude and GPT-OSS models. Reports findings verbatim before any code changes.
+---
+
+# Antigravity CLI (`agy`)
+
+Antigravity is consulted precisely because its verdict may differ from mine. Everything
+here follows from that: the run is the cheap part, and **getting its words to the user
+intact, before any diff, is the whole point**.
+
+Sibling of the `codex` plugin — same discipline, different reviewer. It replaces the
+Gemini CLI path entirely: Google closed `gemini-cli` to personal Google accounts and
+points them here (`references/why-not-gemini-cli.md`).
+
+Verified against **agy 1.1.27** (2026-09-05) by running every command below. Re-verify
+after an upgrade — `agy` self-updates in the background, so the version can move under you.
+
+## Hard rule: present, then stop
+
+1. **Show the complete output, verbatim** — every finding, including the ones I disagree
+   with, consider out of scope, already knew, or plan to defer. Only cosmetic edits are
+   allowed (absolute path → repo-relative `file:line`, whitespace), and I say when I made
+   one.
+2. **Separate its words from mine.** Findings first, attributed to Antigravity with the
+   model used. My agreement, disagreement, or scoping opinion goes in a clearly marked
+   section after.
+3. **Stop and wait for explicit review before implementing anything** — no edits, no
+   tests, no implementation subagents, no rerun with `--dangerously-skip-permissions`.
+   This holds even under a prior "review it and then fix it": the user authorised fixing
+   the problems they knew about, not the ones the reviewer just found.
+4. **Verify every finding before presenting it as fact.** Reproduce each claim against the
+   code — without editing anything — and mark which ones reproduced. In the run that built
+   this plugin, **3 of 9 findings were fabricated**, including a confident claim that a
+   tool I use in every session does not exist. Present the unreproducible ones too, labelled.
+5. **A crashed or empty run is a reportable outcome**, not a gap to fill with my own
+   analysis.
+
+Full protocol: `references/reporting-findings.md`.
+
+## The trap that matters most: success is not success
+
+`agy` returns **exit 0 and `"status": "SUCCESS"` with an empty `response`** when a tool it
+wanted was auto-denied. A review that never read a line of code looks exactly like a clean
+review. Verified:
+
+```json
+{
+  "status": "SUCCESS",
+  "response": "",
+  "denied_actions": [{ "action": "command", "display_name": "RunCommand" }]
+}
+```
+
+So **never trust the exit code or `status`**, and never call `agy` directly for a review.
+Use `agy-review`, which this plugin puts on PATH — it runs the prompt and then refuses to
+print anything unless the envelope proves a review actually happened:
+
+```bash
+agy-review [--model M] [--effort E] [--out DIR] PROMPT_FILE   # run, validate, print
+agy-review --check out.json                                    # validate an existing run
+```
+
+It exits 1 with a diagnosis on an empty output file, non-JSON output, a populated `error`,
+a non-`SUCCESS` status, any `denied_actions`, or an empty/whitespace response — and it
+tells you where the raw `out.json` and `err.txt` are. Confirmed against the live CLI: a
+prompt that triggers an auto-deny gives `agy` exit 0 / SUCCESS and `agy-review` exit 1.
+
+`scripts/test-agy-review.sh` covers all eight failure shapes plus a negative control.
+
+Do not substitute `jq -r '.response // "failed"'`: on a zero-byte file `jq` prints
+**nothing and exits 0**, so the fallback never fires and the failure reads as silence.
+
+## Two more traps
+
+**`-p` does not read stdin.** Piping a diff into `agy -p "review this"` reviews _nothing_
+and reports SUCCESS. Verified with a marker string: the answer was `NONE`. Content must go
+into the prompt argument, or through `--input-format stream-json` on stdin.
+
+**`agy` does not run tools in your shell's working directory.** A relative `cat README.md`
+resolved somewhere under `~/.gemini/antigravity-cli`. Use absolute paths, or `--add-dir`.
+
+## Reviewing a diff — the default shape
+
+Put the material _in the prompt_. No tools means no permissions to configure, nothing to
+be silently denied, and a deterministic run.
+
+```bash
+S=/tmp/agy-review
+mkdir -p "$S"
+git diff main...HEAD > "$S/diff.txt"
+
+{
+  echo "Answer entirely from the material in this prompt. Do NOT call any tools, do NOT"
+  echo "run shell commands, do NOT read files — tool calls are auto-denied here and will"
+  echo "make you produce no output at all. Write the review directly."
+  echo
+  echo "Review the diff below. Report only defects you can point at in the diff."
+  echo "For each: file:line, what breaks, and the concrete input or state that triggers it."
+  echo "No style notes, no praise, no summary of the diff."
+  echo "If you find nothing, reply with exactly: NO FINDINGS"
+  echo
+  cat "$S/diff.txt"
+} > "$S/prompt.txt"
+
+agy-review --model gemini-3.8-flash --effort high --out "$S" "$S/prompt.txt"
+```
+
+`agy-review` adds `--disable-slash-commands`, `--output-format json` and
+`--print-timeout 9m`, keeps `out.json` and `err.txt` in `--out`, validates the envelope,
+and prints the review only if there is one. A non-zero exit means no review happened —
+report that, do not report a clean result.
+
+Its **default** effort is applied only to an unsuffixed `gemini-*` id, since every other
+id rejects `--effort`. An **explicit** `--effort` is always forwarded, so `agy`'s own error
+surfaces instead of being silently dropped — meaning
+`agy-review --model gemini-3.8-flash-high --effort high` still fails, by design.
+
+`--disable-slash-commands` matters: a diff containing a line that starts with `/` would
+otherwise be expanded as a slash command.
+
+More prompts: `references/review-prompts.md`.
+
+## Models
+
+`agy models` is authoritative and needs auth. As of 2026-09-05 it lists:
+
+| Model                                           | Notes                                                               |
+| ----------------------------------------------- | ------------------------------------------------------------------- |
+| `gemini-3.8-flash-high` / `-medium` / `-low`    | **Default choice.** Fast, cheap, good on diffs                      |
+| `gemini-3.7-flash-*`, `gemini-3.6-flash-*`      | Older Flash generations                                             |
+| `gemini-3.1-pro-high` / `-low`                  | Harder reasoning: concurrency, cross-module invariants              |
+| `claude-sonnet-4-6`, `claude-opus-4-6-thinking` | A genuinely different training run — best for a true second opinion |
+| `gpt-oss-120b-medium`                           | Open-weights option                                                 |
+
+Effort is either **baked into the model id** (`gemini-3.8-flash-high`) or passed separately
+against the base name (`--model gemini-3.8-flash --effort high`). Both at once is an error,
+and so is `--effort` on a model that does not take it:
+
+```
+--model gemini-3.8-flash-low --effort high  → conflicts with --effort=high
+--model claude-sonnet-4-6    --effort high  → --effort is not supported for model "claude-sonnet-4-6"
+```
+
+`agy-review` handles this: given no explicit `--effort` it applies the default only to an
+unsuffixed `gemini-*` id, and passes an explicit one straight through so `agy`'s own error
+surfaces rather than being swallowed.
+
+An unknown model is never silently substituted: exit 1, `"status":"ERROR"`, with the model
+list in `.error`.
+
+When the user wants a real second opinion on security-sensitive code, prefer
+`claude-opus-4-6-thinking` or run two models and diff their findings.
+
+## Letting it read the repo (only when needed)
+
+Headless, every tool that needs approval is denied. To grant access, add allow-rules to
+`~/.gemini/antigravity-cli/settings.json` — **one rule per tool**, verified working:
+
+```json
+{
+  "permissions": {
+    "allow": ["command(cat)", "read_file(/abs/path/to/repo)"]
+  }
+}
+```
+
+`command(cat)` alone still leaves `read_file` denied, and vice versa. Tool names seen:
+`run_command` (`command(<binary>)`), `read_file` (`ViewFile`), `find_by_name`. Ask the user
+before writing to their global settings, and prefer the no-tools shape above.
+
+`--dangerously-skip-permissions` auto-approves everything including writes. Ask first, say
+so plainly, and consider `--sandbox` alongside it.
+
+Rule-by-rule evidence: `references/headless-permissions.md`.
+
+## Sessions
+
+```bash
+agy -p "follow-up" --continue --output-format json </dev/null       # most recent
+agy -p "follow-up" --conversation <ID> --output-format json </dev/null
+```
+
+`conversation_id` comes back in every JSON envelope. Note that `num_turns`,
+`duration_seconds` and `usage` are **cumulative over the session**, not per-turn.
+
+## Failure modes
+
+| Exit | Meaning                                                                 |
+| ---- | ----------------------------------------------------------------------- |
+| 0    | `SUCCESS` — but see the trap above; 0 does not mean the review happened |
+| 1    | `ERROR` — bad flags, unknown model, auth missing                        |
+| 2    | `ERROR` — unsupported stream message in `--input-format stream-json`    |
+
+- **`Please sign in`** — headless cannot authenticate. The user runs `agy` in a **real
+  terminal** (not `!` in Claude Code, which has no TTY: `bubbletea: could not open TTY`).
+- **`exceeded the output token limit`** — `status: ERROR` with an empty response, seen on
+  a 57 KB review prompt that invited an unbounded answer. Bound the output in the prompt
+  ("at most 8 findings, each under 12 lines, quote only the line you object to") and rerun.
+  This one is invisible to anything that reads `.response` without checking `.error`.
+- **stderr carries the diagnosis**, including the auto-deny warning. Never discard it —
+  capture it to a file. Mixing it into stdout corrupts `stream-json` output with non-JSON
+  lines.
+- Any non-zero exit: stop, report it with the stderr text, ask for direction.
+
+## Production changes
+
+When the review covers anything headed for production, append the breaking-change
+checklist from `references/breaking-changes.md`. Short version: tightening validation on a
+READ or LOGIN path locks out existing users; tighten on WRITE/CREATE paths only, unless the
+existing data is migrated first.
+
+## Following up
+
+Present the findings in full first, then use `AskUserQuestion` for next steps. The
+follow-up question never stands in for showing the findings. Restate the model and effort
+when proposing anything further.
+
+## More
+
+- `references/reporting-findings.md` — the reporting protocol, and why it exists
+- `references/headless-permissions.md` — the soft-deny trap and working allow-rules
+- `references/cli-reference.md` — verified flags, JSON shapes, exit codes, install, auth
+- `references/review-prompts.md` — review prompts worth reusing
+- `references/why-not-gemini-cli.md` — why this replaced the `gemini` CLI path
+- `references/breaking-changes.md` — the production breaking-change checklist
