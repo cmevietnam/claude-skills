@@ -67,7 +67,7 @@
       "source": "./plugins/codex",
       "displayName": "Codex (second opinion)",
       "description": "Run OpenAI's Codex CLI non-interactively as a second opinion, and report every finding it returns to the user verbatim before touching any code.",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "author": {
         "name": "hieuvo"
       },

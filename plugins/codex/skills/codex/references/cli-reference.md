@@ -107,5 +107,5 @@ for m in d['models']:
 Note that a model's own `default_reasoning_level` (Astra and Sol ship `low`) is
 overridden by `model_reasoning_effort` in `~/.codex/config.toml` — check both before
 claiming what the effective default is. The same file's `model =` line decides which
-model an omitted `-m` selects — it is `gpt-6-astra` as of 2026-09-05, and it does not
+model an omitted `-m` selects — it is `gpt-5.6-sol` as of 2026-09-05, and it does not
 follow new releases on its own.

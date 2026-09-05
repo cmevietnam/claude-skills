@@ -1,6 +1,6 @@
 ---
 name: codex
-description: Use when the user asks to run Codex CLI (codex exec, codex resume, codex fork, codex review) or references OpenAI Codex for code analysis, code review, refactoring, or automated editing. Runs OpenAI's Codex agent non-interactively; the default model comes from ~/.codex/config.toml (currently gpt-6-astra, OpenAI's frontier model since 2026-09-03).
+description: Use when the user asks to run Codex CLI (codex exec, codex resume, codex fork, codex review) or references OpenAI Codex for code analysis, code review, refactoring, or automated editing. Runs OpenAI's Codex agent non-interactively; the default model comes from ~/.codex/config.toml (currently gpt-5.6-sol), with gpt-6-astra available for the hardest work.
 ---
 
 # Codex
@@ -38,16 +38,18 @@ Full protocol and the incident behind it: `references/reporting-findings.md`.
 ## Running a task
 
 - **Model**: omit `-m` to take the default from `~/.codex/config.toml`
-  (`gpt-6-astra` — OpenAI's frontier model since 2026-09-03, and first in the `/model`
-  list). Pass `-m` only for a cheaper or faster run (`gpt-5.6-luna`), or when the user
-  names a model. Astra needs a CLI that knows it (`0.149.1` did not; `0.153.4` does), so
+  (`gpt-5.6-sol`). Pass `-m gpt-6-astra` — OpenAI's frontier model since 2026-09-03, and
+  first in the `/model` list — for the hardest work, or `-m gpt-5.6-luna` for a cheaper,
+  faster run. Astra needs a CLI that knows it (`0.149.1` did not; `0.153.4` does), so
   `codex update` if a run is rejected for the model. To confirm what an omitted `-m` will
-  actually pick: `grep '^model' ~/.codex/config.toml`.
+  actually pick: `grep '^model' ~/.codex/config.toml` — it does not follow new releases
+  on its own.
 - **Effort**: ask via `AskUserQuestion`. On `gpt-6-astra` and `gpt-5.6-sol`/`-terra` the
   ladder is `ultra`, `max`, `xhigh`, `high`, `medium`, `low` (Luna stops at `max`;
   `gpt-5.5` and `gpt-5.4-mini` stop at `xhigh`). Pass as
-  `-c model_reasoning_effort="<effort>"`. Astra ships a default of `low` and is strong
-  there — start lower and raise it, rather than defaulting to the top of the ladder.
+  `-c model_reasoning_effort="<effort>"`. Astra and Sol both ship `low` as their own
+  default and are strong there — start lower and raise it, rather than defaulting to the
+  top of the ladder.
 - **Sandbox**: `read-only` by default; `workspace-write` to let it edit;
   `danger-full-access` only when network or broad access is genuinely required, and only
   after asking.
@@ -108,8 +110,8 @@ upgrade. Prices drift; do not hardcode them.
 
 | Model | Notes | Efforts |
 |---|---|---|
-| `gpt-6-astra` | **Default**; GPT-6 frontier model, for complex, demanding work | low → ultra |
-| `gpt-5.6-sol` | Previous frontier; reliable agentic workhorse | low → ultra |
+| `gpt-6-astra` | GPT-6 frontier model, for complex, demanding work — pass `-m` | low → ultra |
+| `gpt-5.6-sol` | **Config default**; reliable agentic workhorse | low → ultra |
 | `gpt-5.6-terra` | Balanced, for everyday work | low → ultra |
 | `gpt-5.6-luna` | Fast and affordable | low → max |
 | `gpt-5.5` | Proven previous generation | low → xhigh |
