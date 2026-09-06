@@ -1,7 +1,7 @@
 {
   "name": "hieuvo-skills",
   "description": "Shared skills for hieuvo's projects.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "owner": {
     "name": "hieuvo",
     "url": "https://github.com/hieuvo"
@@ -126,6 +126,29 @@
         "rancher-desktop",
         "kustomize",
         "traefik"
+      ]
+    },
+    {
+      "name": "vinvoice",
+      "source": "./plugins/vinvoice",
+      "displayName": "Viettel e-invoice (vInvoice)",
+      "description": "Issue Vietnamese e-invoices through Viettel S-Invoice: the verified API contract, a pipeline that cannot file one sale twice, and a read-only probe CLI that refuses to create an invoice.",
+      "version": "0.1.0",
+      "author": {
+        "name": "hieuvo"
+      },
+      "license": "MIT",
+      "category": "integration",
+      "keywords": [
+        "viettel",
+        "vinvoice",
+        "s-invoice",
+        "einvoice",
+        "hoa-don-dien-tu",
+        "vietnam",
+        "tax",
+        "vat",
+        "tt78"
       ]
     }
   ]

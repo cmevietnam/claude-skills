@@ -27,6 +27,7 @@ claude --plugin-dir ./plugins/onepassword
 | [`codex`](plugins/codex)             | Run OpenAI's Codex CLI as a second opinion, and require every finding to reach the user verbatim before any code is changed.                                                                                     |
 | [`antigravity`](plugins/antigravity) | Run Google's Antigravity CLI (`agy`) headless as a second-opinion reviewer — and refuse to trust its exit code, which reports SUCCESS on runs whose every tool was denied and whose output is empty.             |
 | [`k8s-local`](plugins/k8s-local)     | Run a project's whole stack on a local Kubernetes cluster: build straight into the cluster's image store, refuse any context whose name and API server address are not local, and keep the datastores throwaway. |
+| [`vinvoice`](plugins/vinvoice)       | Issue Vietnamese e-invoices through Viettel S-Invoice: the verified API contract, a pipeline that cannot file one sale twice, and a read-only probe CLI that refuses to create an invoice.                       |
 
 ## Thêm một skill mới
 
