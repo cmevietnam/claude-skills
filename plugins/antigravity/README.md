@@ -44,6 +44,16 @@ build; a consumer Gemini Pro subscription does not change it. Full record in
 (`--effort low|medium|high`) and serves Claude and GPT-OSS models next to Gemini, so a
 two-reviewer diff is one flag.
 
+## The default model does not go stale
+
+Google ships a new Flash generation every few months and the old id keeps working, so a
+pinned default quietly reviews with a superseded model and nothing ever says so. With no
+`--model`, `agy-review` asks `agy models` for the newest `gemini-<version>-flash`,
+comparing versions as numbers rather than strings, and prints the id it chose next to
+where it came from. The answer is cached for a day; a listing that cannot be fetched falls
+back to a pinned id with a warning rather than failing the review. `--model <id>` pins the
+reviewer when a result has to be reproducible.
+
 ## Relationship to `codex` and `review`
 
 The [`review`](../review) plugin runs adversarial review with multiple **Claude** models

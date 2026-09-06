@@ -114,8 +114,13 @@ git diff main...HEAD > "$S/diff.txt"     # committed only — omits uncommitted 
 
 cat "$S/preamble.txt" "$S/instructions.txt" "$S/diff.txt" > "$S/prompt.txt"
 
-agy-review --model gemini-3.8-flash --effort high --out "$S/flash" "$S/prompt.txt"
+agy-review --out "$S/flash" "$S/prompt.txt"        # newest Flash, effort high
 ```
+
+With no `--model`, `agy-review` asks `agy models` for the newest Flash generation and
+prints which id it picked. Pass `--model <id>` when the run has to be reproducible — a
+re-run weeks later would otherwise silently use a newer model than the one the findings
+were attributed to.
 
 Without `set -e` and the emptiness check, a missing base branch leaves `diff.txt` empty,
 the model reviews the instructions alone, and a confident `NO FINDINGS` comes back on a
@@ -143,8 +148,9 @@ and exits 0, so a failed run is indistinguishable from a quiet one.
 
 ## Choosing the model
 
-Start with `gemini-3.8-flash` at `--effort high`. Escalate to `gemini-3.1-pro-high` for
-subtle concurrency, cross-module invariants, or cryptographic logic.
+Start with the default — the newest Flash, at `--effort high`. Escalate to
+`gemini-3.1-pro-high` for subtle concurrency, cross-module invariants, or cryptographic
+logic.
 
 For a genuine second opinion — a different training run, different blind spots — use
 `claude-opus-4-6-thinking`. On security-sensitive code run both and diff the findings

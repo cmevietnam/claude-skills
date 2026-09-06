@@ -116,6 +116,11 @@ comfortably as an argument.
 Subcommands: `models`, `agents`, `mcp`, `plugin`, `install`, `update`, `changelog`,
 `remote-control`, `mic-serve`.
 
+`agy models` prints the listing on **stdout**, one `<id>\t<label>` per line, and its
+`Fetching available models...` progress note on **stderr** — so the listing can be parsed
+without filtering. It needs auth and a network round-trip (~3s measured); `agy-review`
+uses it to resolve its default model and caches the answer for a day.
+
 Always pass `--disable-slash-commands` when the prompt carries user or repository content —
 a diff line beginning with `/` is otherwise expanded.
 
@@ -170,7 +175,8 @@ discards the explanation of any failure.
 
 ## Models
 
-`agy models` prints `id<TAB>label`. Live list on 2026-09-05:
+`agy models` prints `id<TAB>label`. Live list on 2026-09-07, unchanged from
+2026-09-05:
 
 ```
 gemini-3.8-flash-high      Gemini 3.8 Flash (High)
@@ -211,6 +217,10 @@ So the rule is narrower than "unsuffixed ids take `--effort`": only **unsuffixed
 `agy-review` applies its **default** effort under exactly that rule, and forwards an
 **explicit** `--effort` unconditionally, including to models that will reject it, so
 `agy`'s own error reaches you instead of being silently dropped.
+
+It is also why its default model is the **unsuffixed** newest Flash: every id the listing
+offers carries a suffix, and resolving to `gemini-3.8-flash-high` would turn the default
+`--effort high` into the conflict above.
 
 A long prompt that invites a long answer can also fail after the model has run:
 

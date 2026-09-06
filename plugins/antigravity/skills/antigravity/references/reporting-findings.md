@@ -93,6 +93,11 @@ Verified each finding against the code: N correct, N partly correct, N did not r
 <which is which, and why — clearly mine, clearly after>
 ```
 
+The model in that heading is the one `agy-review` printed on its `model:` line, not
+the one you asked for or expected — with no `--model` the newest Flash is resolved at run
+time, so the id can change between runs. A run that fell back to the pinned id says so
+there, and the report has to say so too.
+
 Then `AskUserQuestion` on which findings to act on. Not before.
 
 ## Two reviewers beat one
