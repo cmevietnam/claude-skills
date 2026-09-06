@@ -26,7 +26,8 @@ klocal up
 ```
 
 `klocal` needs `kubectl`, a container engine, and `jq` or `python3`. Nothing from
-Claude Code — symlink `bin/klocal` onto `PATH` and use it as an ordinary tool.
+Claude Code — symlink `bin/klocal` onto `PATH` and use it as an ordinary tool; it
+resolves the symlink to find its own libraries.
 
 ## The guard
 
@@ -41,13 +42,24 @@ both must hold:
    dotted-decimal literal rather than matched as a text prefix (`10.*` as a glob
    also matches the hostname `10.prod.example.com`). The name is chosen by
    whoever created the cluster, so a remote cluster can be called `kind-prod`.
+   The URL's **userinfo field is stripped first**: `https://127.0.0.1:x@prod:6443`
+   is a legal URL whose host is `prod`, and trimming at the first `:` read it as
+   loopback — the address check is only unfakeable if it parses the address.
 3. **No `proxy-url` or `tls-server-name`** on the cluster entry, since either
    means the server address says nothing about where requests actually go.
 
 The context name is read via `kubectl config view --minify --context <name>`, so
 it is always a flag _value_. Interpolating it into a JSONPath expression let a
 crafted name close the expression and point the address check at a loopback decoy
-while every real call used a remote cluster.
+while every real call used a remote cluster. The name may also contain no glob
+characters: `KL_KUBECTL` is exported to the secret hook as a command string that
+has to expand unquoted, so `kind-?` globbed against the project directory.
+
+**Every write path re-verifies before it writes.** A build takes minutes and
+`down` waits at a confirmation prompt indefinitely — both are windows in which
+another terminal can remap the same context name onto a different cluster. `up`,
+`rebuild` and `down` all re-read the whole server URL (not just the host: two
+local clusters differ only by port) and refuse if anything moved.
 
 The check is honest about its limit: RFC1918 establishes address _scope_, not
 that the cluster is on this machine. A production cluster reachable at
@@ -100,7 +112,7 @@ below is optional except `project`.
 | `secret.name` / `.envFile` / `.hook` | —                       | See below                                                |
 | `database.name` / `.superuser`       | —                       | Database and owning role `klocal psql` connects to       |
 | `database.appRole`                   | —                       | The least-privilege role `klocal psql --app` connects as |
-| `tls.port` / `.certDir`              | —                       | Reported in the closing message                          |
+| `tls.port` / `.certDir`              | —                       | Reported in the closing message; `port` must be 1-65535  |
 
 ### Secrets
 

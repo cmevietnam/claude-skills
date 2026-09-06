@@ -19,6 +19,15 @@ kl_context_name_is_local() { # <context>
   case "$1" in
     *[[:space:]]*) return 1 ;;
   esac
+  # Glob metacharacters would EXPAND when the name travels through an unquoted
+  # expansion. KL_KUBECTL is exported as a command string and the documented hook
+  # invokes it unquoted (it has to, to split into arguments), so a context named
+  # `kind-?` in a project containing a file `kind-p` rewrote the hook's own
+  # --context to a different cluster. The loaders were already fixed by passing an
+  # explicit argument list; the hook cannot be, so the name is refused instead.
+  case "$1" in
+    *[*?[]* | *]*) return 1 ;;
+  esac
   case "$1" in
     rancher-desktop | docker-desktop | minikube | colima) return 0 ;;
     kind-* | k3d-*) return 0 ;;
@@ -39,13 +48,33 @@ kl_cluster_field() { # <context> <jsonpath-after-.cluster>
     "jsonpath={.clusters[0].cluster.$2}" 2>/dev/null || true
 }
 
-# Host part of a cluster's API server URL. Handles the bracketed IPv6 form.
-kl_context_server_host() { # <context>
-  local server host
+# The whole `server` field, used to prove the cluster behind a context has not
+# been swapped. The HOST alone is not enough: two different local clusters differ
+# only by port, and comparing hosts accepted a switch between them.
+kl_context_server_url() { # <context>
+  local server
   server=$(kl_cluster_field "$1" server)
   [ -n "$server" ] || return 1
+  printf '%s\n' "$server"
+}
+
+# Host part of a cluster's API server URL. Handles the bracketed IPv6 form.
+#
+# The USERINFO field is removed first, and this is the whole point of the
+# function. `https://127.0.0.1:unused@prod.example.com:6443` is a legal URL whose
+# host is prod.example.com; trimming at the first `:` instead returned
+# "127.0.0.1", so the one check that naming cannot fake accepted a remote cluster
+# outright. RFC 3986: userinfo runs to the LAST `@` in the authority.
+kl_context_server_host() { # <context>
+  local server host
+  server=$(kl_context_server_url "$1") || return 1
   host=${server#*://}
   host=${host%%/*}
+  host=${host%%\?*}
+  host=${host%%#*}
+  case "$host" in
+    *@*) host=${host##*@} ;;
+  esac
   case "$host" in
     "["*)
       host=${host#[}
@@ -53,6 +82,8 @@ kl_context_server_host() { # <context>
       ;; # [::1]:6443
     *) host=${host%%:*} ;;
   esac
+  # An empty or still-suspicious authority is a refusal, not a pass.
+  [ -n "$host" ] || return 1
   printf '%s\n' "$host"
 }
 
@@ -159,21 +190,25 @@ kl_context_is_local() { # <context>
   return 0
 }
 
-# A build takes minutes; another terminal can switch the kubeconfig, or remap the
-# same context name onto a different cluster, while it runs. Pinning --context
-# carries the NAME forward, not the cluster it pointed at, so re-verify both
-# before anything is applied.
-kl_assert_context_unchanged() { # <context> <server-host-seen-earlier>
-  local now host
+# A build takes minutes, and `down` waits at a confirmation prompt for as long as
+# the operator takes to answer. In either window another terminal can switch the
+# kubeconfig, or remap the same context name onto a different cluster. Pinning
+# --context carries the NAME forward, not the cluster it pointed at, so re-verify
+# before anything is written or deleted.
+#
+# Compares the whole server URL, not just the host: two local clusters commonly
+# differ only by port, and a host-only comparison let a swap between them through.
+kl_assert_context_unchanged() { # <context> <server-url-seen-earlier> [what]
+  local now url what=${3:-the build}
   now=$(kl_current_context)
   [ "$now" = "$1" ] || kl_die \
-    "REFUSING: the current context changed from '$1' to '${now:-<none>}' during the build"
-  host=$(kl_context_server_host "$1") ||
+    "REFUSING: the current context changed from '$1' to '${now:-<none>}' during $what"
+  url=$(kl_context_server_url "$1") ||
     kl_die "REFUSING: cannot re-read the API server address for '$1'"
-  [ "$host" = "$2" ] || kl_die \
-    "REFUSING: context '$1' now points at $host, not $2, as it did before the build"
+  [ "$url" = "$2" ] || kl_die \
+    "REFUSING: context '$1' now points at $url, not $2, as it did before $what"
   kl_context_has_indirection "$1" &&
-    kl_die "REFUSING: context '$1' gained proxy-url/tls-server-name during the build"
+    kl_die "REFUSING: context '$1' gained proxy-url/tls-server-name during $what"
   return 0
 }
 
@@ -276,17 +311,32 @@ kl_image_load_cmd() { # <context> <image> -> prints the load command, or nothing
   esac
 }
 
+# Contexts whose cluster reads the DOCKER store, either by sharing the daemon
+# (docker-desktop) or because their loader imports from it (kind/k3d/minikube).
+# A reachable nerdctl socket says a containerd exists somewhere on the machine —
+# it does not say the selected cluster reads it. With Rancher Desktop on
+# containerd installed alongside Docker Desktop, both probes answer, and picking
+# nerdctl by probe order built the image into a store `docker-desktop` never
+# reads, with no error anywhere: the stale-image symptom this file exists to stop.
+kl_context_wants_docker() { # <context>
+  [ -n "$(kl_image_load_cmd "$1" x)" ] && return 0
+  case "$1" in
+    docker-desktop) return 0 ;;
+  esac
+  return 1
+}
+
 # Builds into the local engine, then imports into the cluster when the engine and
 # the cluster do not share a store.
 kl_build_image() { # <image> <context-dir>
   local image=$1 context=$2 engine load
   engine=$(kl_detect_engine)
 
-  # When the cluster needs an explicit import, the loader looks in its PROVIDER's
+  # When the cluster reads the docker store, the loader looks in its PROVIDER's
   # store — Docker for a default kind/k3d/minikube cluster. Building into
   # nerdctl's k8s.io namespace just because that socket answers would leave the
-  # loader unable to find the tag, so prefer docker whenever a loader is involved.
-  if [ -n "$(kl_image_load_cmd "${KL_CONTEXT:-}" "$image")" ] && [ "$engine" = "nerdctl" ]; then
+  # loader (or the kubelet) unable to find the tag.
+  if kl_context_wants_docker "${KL_CONTEXT:-}" && [ "$engine" = "nerdctl" ]; then
     if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
       kl_step "context ${KL_CONTEXT} imports from the docker store; using docker, not nerdctl"
       engine=docker
@@ -344,6 +394,13 @@ kl_run_image_load() { # <context> <image>
 # Treating case 2 as case 1 makes the caller generate a fresh value and overwrite
 # a credential a running container still holds — the exact outage kl_keep_or_generate
 # exists to prevent.
+#
+# Every failing command below is captured with `x=$(cmd) && rc=0 || rc=$?`, never
+# `x=$(cmd); rc=$?`. Under the caller's `set -e` — which bin/klocal has and the
+# test suite did NOT — the second form never reaches the `rc=$?` line at all: the
+# shell exits at the assignment. That silently turned this whole three-way
+# contract into "exit 1, no message", including for a genuinely absent Secret,
+# where the generator then never ran.
 kl_secret_value() { # <namespace> <secret> <key>
   local ns=$1 secret=$2 key=$3 exists rc keys raw
 
@@ -358,8 +415,8 @@ kl_secret_value() { # <namespace> <secret> <key>
   # Secret gives empty output and exit 0, while RBAC denial or an API failure
   # gives a non-zero exit. Inferring absence from a failed read instead meant a
   # forbidden Secret looked absent, and the caller then rotated a live credential.
-  exists=$(kl_kubectl get secret "$secret" -n "$ns" -o name --ignore-not-found 2>/dev/null)
-  rc=$?
+  exists=$(kl_kubectl get secret "$secret" -n "$ns" -o name --ignore-not-found 2>/dev/null) &&
+    rc=0 || rc=$?
   [ "$rc" -eq 0 ] || return 2
   [ -n "$exists" ] || return 1 # genuinely not there
 
@@ -367,13 +424,16 @@ kl_secret_value() { # <namespace> <secret> <key>
   # nested path that does not exist and returns empty, so any key containing a
   # dot read as "absent". A range over .data has no such problem.
   keys=$(kl_kubectl get secret "$secret" -n "$ns" \
-    -o "go-template={{range \$k, \$v := .data}}{{\$k}}{{\"\n\"}}{{end}}" 2>/dev/null) || return 2
+    -o "go-template={{range \$k, \$v := .data}}{{\$k}}{{\"\n\"}}{{end}}" 2>/dev/null) &&
+    rc=0 || rc=$?
+  [ "$rc" -eq 0 ] || return 2
   printf '%s\n' "$keys" | grep -Fxq -- "$key" || return 1 # key not set
 
   # Present. An empty value is a real value, not an absence, so this returns 0
   # with empty output rather than inviting the caller to generate a replacement.
   raw=$(kl_kubectl get secret "$secret" -n "$ns" \
-    -o "go-template={{index .data \"$key\"}}" 2>/dev/null) || return 2
+    -o "go-template={{index .data \"$key\"}}" 2>/dev/null) && rc=0 || rc=$?
+  [ "$rc" -eq 0 ] || return 2
   [ -n "$raw" ] || return 0
   printf '%s' "$raw" | base64 -d 2>/dev/null || return 2
 }
@@ -385,8 +445,7 @@ kl_secret_value() { # <namespace> <secret> <key>
 kl_keep_or_generate() { # <namespace> <secret> <key> <generator...>
   local ns=$1 secret=$2 key=$3 existing rc
   shift 3
-  existing=$(kl_secret_value "$ns" "$secret" "$key")
-  rc=$?
+  existing=$(kl_secret_value "$ns" "$secret" "$key") && rc=0 || rc=$?
   case "$rc" in
     0)
       # Present, possibly empty. An empty stored value is still a decision
@@ -429,11 +488,57 @@ kl_keep_or_generate() { # <namespace> <secret> <key> <generator...>
 #
 # Prints one line per entry: "value<TAB>source", source being "value",
 # "secret:<name>/<key>", "configmap:<name>/<key>", "fieldRef" or "other".
+#
+# Exit codes matter here, because "the variable is not set" and "I could not
+# find out" are different answers and only one of them is a finding:
+#   0  the read succeeded; any lines printed are the live entries
+#   2  the read failed (RBAC, API down, no JSON parser) — nothing was learned
+# Returning 0 for both let a denied read print "not present on deploy/x", which
+# is a confident negative about something never observed.
 kl_env_of() { # <namespace> <workload> <containerKind> <container> <var>
-  local json
-  json=$(kl_kubectl get deploy "$2" -n "$1" -o json 2>/dev/null) || return 0
-  [ -n "$json" ] || return 0
-  KL_C_KIND=$3 KL_C_NAME=$4 KL_VAR=$5 python3 -c '
+  local json rc
+  json=$(kl_kubectl get deploy -n "$1" -o json -- "$2" 2>/dev/null) && rc=0 || rc=$?
+  [ "$rc" -eq 0 ] || return 2
+  [ -n "$json" ] || return 2
+  # jq OR python3, matching what kl_json_get accepts and what the README
+  # advertises. Requiring python3 here meant a jq-only machine got a drift report
+  # that said "not present" about every variable in the file.
+  if command -v python3 >/dev/null 2>&1; then
+    kl_env_of_python "$3" "$4" "$5" <<EOF || return 2
+$json
+EOF
+  elif command -v jq >/dev/null 2>&1; then
+    kl_env_of_jq "$3" "$4" "$5" <<EOF || return 2
+$json
+EOF
+  else
+    return 2
+  fi
+  return 0
+}
+
+# The value and the source are TAB-separated, so a TAB inside a value would split
+# the record and make the reader show a truncated value beside a bogus source.
+# Escaped alongside the newline that was already handled.
+kl_env_of_jq() { # <containerKind> <container> <var>  (JSON on stdin)
+  jq -r --arg kind "$1" --arg cname "$2" --arg var "$3" '
+    def src: if has("value") then "value"
+             else (.valueFrom // {}) as $f
+               | if $f.secretKeyRef then "secret:\($f.secretKeyRef.name)/\($f.secretKeyRef.key)"
+                 elif $f.configMapKeyRef then "configmap:\($f.configMapKeyRef.name)/\($f.configMapKeyRef.key)"
+                 elif $f.fieldRef then "fieldRef"
+                 else "other" end
+             end;
+    (.spec.template.spec[$kind] // [])[]
+    | select(.name == $cname)
+    | (.env // [])[]
+    | select(.name == $var)
+    | ((.value // "") | gsub("\n"; "\\n") | gsub("\t"; "\\t")) + "\t" + src
+  '
+}
+
+kl_env_of_python() { # <containerKind> <container> <var>  (JSON on stdin)
+  KL_C_KIND=$1 KL_C_NAME=$2 KL_VAR=$3 python3 -c '
 import json, os, sys
 d = json.load(sys.stdin)
 spec = d.get("spec", {}).get("template", {}).get("spec", {})
@@ -455,10 +560,8 @@ for c in spec.get(os.environ["KL_C_KIND"], []) or []:
                 v, src = "", "fieldRef"
             else:
                 v, src = "", "other"
-        print("%s\t%s" % (v.replace("\n", "\\n"), src))
-' <<EOF || true
-$json
-EOF
+        print("%s\t%s" % (v.replace("\n", "\\n").replace("\t", "\\t"), src))
+'
 }
 
 # Report env names a manifest declares more than once WITHIN one container's env
@@ -475,22 +578,46 @@ kl_duplicate_env_vars() { # <manifest-file>
             (container == "" ? "?" : container), k, seen[k]
       delete seen
     }
-    # A new YAML document resets everything.
-    /^---[[:space:]]*$/ { flush(); doc++; workload=""; container=""; ckind="containers"; inenv=0; next }
+    # Turn a raw YAML scalar into the value it denotes. A trailing comment is NOT
+    # part of the name: `name: demo-api # the app` yielded the workload
+    # "demo-api # the app", which then went to kubectl as an object name, failed,
+    # and made klocal status report every variable as absent from the cluster.
+    # In YAML a # only opens a comment when preceded by whitespace, and never
+    # inside a quoted scalar — so quoted values are cut at their closing quote
+    # instead, and an unquoted `a#b` stays intact.
+    function scrub(v,   q) {
+      sub(/^[[:space:]]+/, "", v)
+      q = substr(v, 1, 1)
+      if (q == "\"" || q == "'"'"'") {
+        v = substr(v, 2)
+        sub(q ".*$", "", v)
+        return v
+      }
+      sub(/[[:space:]]+#.*$/, "", v)
+      sub(/[[:space:]]+$/, "", v)
+      return v
+    }
+    function unreadable(why) {
+      if (!warned[why]) { printf "UNREADABLE %s %s\n", FILENAME, why; warned[why] = 1 }
+    }
+    # A new YAML document resets everything. `--- # a comment` and `---   ` are
+    # both ordinary separators; anchoring at end-of-line missed them and merged
+    # the documents, so a duplicate was attributed to the previous object.
+    /^---([[:space:]].*)?$/ { flush(); doc++; workload=""; container=""; ckind="containers"; inenv=0; next }
     # The workload this document defines, so a duplicate is looked up against the
     # right object: previously every finding was queried against the app
     # Deployment, so a duplicate in the Postgres manifest read as "not set".
     /^  name:[[:space:]]*/ && workload == "" {
-      w = $0; sub(/^  name:[[:space:]]*/, "", w); gsub(/^["'"'"']|["'"'"']$/, "", w)
-      workload = w; next
+      w = $0; sub(/^  name:[[:space:]]*/, "", w)
+      workload = scrub(w); next
     }
     /^[[:space:]]*initContainers:[[:space:]]*(#.*)?$/ { flush(); ckind="initContainers"; container=""; inenv=0; next }
     /^[[:space:]]*containers:[[:space:]]*(#.*)?$/ { flush(); ckind="containers"; container=""; inenv=0; next }
     # Shapes this line-oriented scanner cannot read. Reporting them is the point:
     # silently skipping one would be a false all-clear on the very file the user
     # asked about.
-    /^[[:space:]]*env:[[:space:]]*[\[&*]/ { printf "UNREADABLE %s flow-or-anchor-env\n", FILENAME; next }
-    /^[[:space:]]*<<:[[:space:]]*\*/ { printf "UNREADABLE %s merge-key-alias\n", FILENAME; next }
+    /^[[:space:]]*env:[[:space:]]*[\[&*]/ { unreadable("flow-or-anchor-env"); next }
+    /^[[:space:]]*<<:[[:space:]]*\*/ { unreadable("merge-key-alias"); next }
     # Only a LIST ENTRY ("- name:") is significant. A bare "name:" is a field of
     # some other object — the secret in a valueFrom.secretKeyRef, the target of an
     # envFrom.secretRef — and counting those reported "demo-api-secrets 2" for the
@@ -499,7 +626,7 @@ kl_duplicate_env_vars() { # <manifest-file>
     match($0, /^[[:space:]]*- name:[[:space:]]*/) {
       indent = index($0, "name:") - 1
       val = $0; sub(/^[[:space:]]*(- )?name:[[:space:]]*/, "", val)
-      gsub(/^["'"'"']|["'"'"']$/, "", val)
+      val = scrub(val)
       # Deeper than the env: key means this is an entry in that env list.
       if (inenv && indent > envindent) { seen[val]++; next }
       # Otherwise it is a container name — and if we were inside an env list, a
@@ -510,6 +637,15 @@ kl_duplicate_env_vars() { # <manifest-file>
       container = val
       scope = "doc" doc "/" container
       next
+    }
+    # An env entry whose FIRST key is not `name:` — `- value: "1"` with `name:`
+    # on the next line is equally valid YAML. This scanner is line-oriented and
+    # cannot pair those up, so it says so. Staying quiet printed "no duplicate env
+    # declarations", which is a false all-clear on the one file the user asked
+    # about — the exact failure the UNREADABLE branch exists to prevent.
+    inenv && /^[[:space:]]*- / {
+      here = match($0, /[^[:space:]]/) - 1
+      if (here > envindent) { unreadable("env-entry-not-starting-with-name"); next }
     }
     /^[[:space:]]*env:[[:space:]]*(#.*)?$/ { inenv=1; envindent = index($0, "env:") - 1; next }
     # Any key at or left of the env: indentation ends the env list.

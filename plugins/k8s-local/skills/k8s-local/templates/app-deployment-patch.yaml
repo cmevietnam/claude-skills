@@ -52,7 +52,16 @@ spec:
             # optional: true so a scaffold with no secret hook configured still
             # starts. Drop the flag once secret.hook is set in project.json, so a
             # missing Secret becomes a loud failure rather than a silent unset.
+            #
+            # `value: null` is load-bearing once this overlay inherits a
+            # production base. Strategic merge merges the two entries by name, so
+            # a base that sets DATABASE_URL with a literal `value` would leave
+            # BOTH `value` and `valueFrom` on the merged entry — which the API
+            # server rejects, because an EnvVar may name only one source. The
+            # null deletes the inherited field. Harmless while app.yaml is the
+            # only source, since there is nothing to delete.
             - name: DATABASE_URL
+              value: null
               valueFrom:
                 secretKeyRef:
                   name: PROJECT-api-secrets

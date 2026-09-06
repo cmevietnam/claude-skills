@@ -262,8 +262,12 @@ kl_context_server_host "$evil" >/dev/null 2>&1 || true
 # The name appearing as a --context VALUE is correct and expected; what must
 # never happen is the name landing inside the jsonpath expression itself.
 jsonpath_args=$(grep '^ARG\[jsonpath=' "$KL_TEST_ARGV_LOG" | grep -F 'contexts[' || true)
+# The control must prove the call HAPPENED, so it is the jsonpath argument
+# itself. `grep -c` was used here and prints "0" when nothing matched — a
+# non-empty string, so want_empty's "control produced nothing" guard could
+# never fire and a run that never called kubectl scored a pass.
 want_empty "the context name never reaches a jsonpath expression" "$jsonpath_args" \
-  "$(grep -c '^ARG\[jsonpath=' "$KL_TEST_ARGV_LOG" || true)"
+  "$(grep '^ARG\[jsonpath=' "$KL_TEST_ARGV_LOG" | head -1 || true)"
 passed_as_value=$(grep -Fc "ARG[$evil]" "$KL_TEST_ARGV_LOG" || true)
 if [ "${passed_as_value:-0}" -gt 0 ]; then
   ok "the context is passed as a flag value instead" "$passed_as_value"
@@ -283,7 +287,9 @@ if kl_context_is_local rancher-desktop; then
 else ok "proxy-url makes a context non-local"; fi
 mkproj "$work/pproxy" '{"project":"demo","namespace":"demo-local","workloads":{"app":"demo-api"}}'
 out=$(cd "$work/pproxy" && "$KLOCAL" up --no-build 2>&1)
+rc=$?
 want "up refuses a context with proxy-url" "proxy-url or tls-server-name" "$out"
+want_status "  and exits non-zero" 1 "$rc"
 unset KL_TEST_PROXY_URL
 export KL_TEST_TLS_SERVER_NAME="prod.internal"
 if kl_context_is_local rancher-desktop; then
@@ -356,8 +362,14 @@ printf '\ncontext pinning\n'
 # minutes and another terminal can switch the shared kubeconfig meanwhile.
 : >"$KL_TEST_CTX_LOG"
 (cd "$work/p1" && "$KLOCAL" status >/dev/null 2>&1)
-want "cluster calls pass an explicit --context" "rancher-desktop" \
-  "$(cut -d'|' -f1 "$KL_TEST_CTX_LOG" | sort -u | grep . || true)"
+# Every recorded context must be rancher-desktop. Matching a substring of the
+# whole `sort -u` list passed as long as ONE line was right, so a call leaking to
+# a different context was invisible. Assert the list has exactly one entry AND
+# that it is the expected one.
+ctxs=$(cut -d'|' -f1 "$KL_TEST_CTX_LOG" | grep . | sort -u)
+nctx=$(printf '%s\n' "$ctxs" | grep -c . || true)
+want "cluster calls pass an explicit --context" "rancher-desktop" "$ctxs"
+want_status "  and no call used any other context" 1 "$nctx"
 
 # Only context DISCOVERY may be unpinned (`config current-context`, `config
 # view`); everything that reads or writes cluster state must carry --context, or
@@ -390,11 +402,18 @@ printf '\nconfig validation (option injection)\n'
 for badns in "--all" "-n" "UPPER" "has space" "ends-" "-starts" \
   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; do
   mkproj "$work/bad" "{\"project\":\"demo\",\"namespace\":\"$badns\",\"workloads\":{\"app\":\"demo-api\"}}"
+  : >"$KL_TEST_CTX_LOG"
   out=$(cd "$work/bad" && "$KLOCAL" down --yes 2>&1)
   rc=$?
   want "namespace rejected: $badns" "must be a lowercase DNS label" "$out"
   want_status "  and exits non-zero" 1 "$rc"
-  want_absent "  and never reaches kubectl" "delete namespace" "must be a lowercase DNS label" "$out"
+  # Assert against the LOG, not stdout. The kubectl stub has no branch for
+  # `delete namespace` and exits silently, so searching stdout for that string
+  # could never have found it whether kubectl ran or not — the check named the
+  # right danger and observed a place it could never appear.
+  want_empty "  and never reaches kubectl" \
+    "$(grep -F 'delete namespace' "$KL_TEST_CTX_LOG" || true)" \
+    "$(cd "$work/p1" && "$KLOCAL" status >/dev/null 2>&1; grep -c . "$KL_TEST_CTX_LOG" | grep -v '^0$' || echo control-failed)"
 done
 
 for goodns in demo-local a demo123 my-app-local; do
@@ -410,9 +429,14 @@ want "image name beginning with dash is rejected" "must not be empty or begin wi
 # kubectl lets a LATER --context win, so an unvalidated ingressClass reaching the
 # command line as a positional argument overrides the pin entirely.
 mkproj "$work/badic" '{"project":"demo","namespace":"demo-local","ingressClass":"--context=prod","workloads":{"app":"demo-api"}}'
+: >"$KL_TEST_CTX_LOG"
 out=$(cd "$work/badic" && "$KLOCAL" up --no-build 2>&1)
 want "ingressClass that looks like a flag is rejected" "must be a lowercase DNS label" "$out"
-want_absent "  and never reaches kubectl" "get ingressclass" "must be a lowercase DNS label" "$out"
+# Same correction: the stub records `get ingressclass` in the log and prints
+# nothing, so stdout was the wrong place to look.
+want_empty "  and never reaches kubectl" \
+  "$(grep -F 'get ingressclass' "$KL_TEST_CTX_LOG" || true)" \
+  "$(cd "$work/p1" && "$KLOCAL" status >/dev/null 2>&1; grep -c . "$KL_TEST_CTX_LOG" | grep -v '^0$' || echo control-failed)"
 
 # grep -q succeeds when ANY line matches, so an anchored pattern accepted a
 # multiline value whose second line was a flag.
@@ -551,19 +575,38 @@ want_absent "  and did not build into containerd" "nerdctl ran: build" "docker r
 want "  and still runs the import" "kind ran: load docker-image" "$out"
 mk_stub nerdctl 1
 
+# "This binary is absent" must mean absent, not "absent from the stub dir".
+# Deleting a stub used to fall through to the real /usr/local/bin/docker, so
+# whether these cases passed depended on whether a docker daemon happened to be
+# reachable — the suite was green here only because HOME had been redirected and
+# Docker's context config lives under $HOME. PATH is narrowed to the stub
+# directory alone, so nothing outside it can be reached by accident.
+# /usr/bin:/bin is kept because the stubs' `#!/usr/bin/env bash` needs to find
+# bash; it is NOT where a real docker lives (/usr/local/bin or Homebrew), and the
+# assertion below proves that on whatever machine this runs.
+absent_path="$work/stub:/usr/bin:/bin"
+
 # A missing loader must be fatal: skipping the import silently is the bug.
 mv "$work/stub/kind" "$work/kind.hidden"
-KL_CONTEXT=kind-dev out=$(kl_build_image demo:local "$work" 2>&1)
+out=$(PATH="$absent_path" KL_CONTEXT=kind-dev kl_build_image demo:local "$work" 2>&1)
 rc=$?
 want "missing kind binary is fatal, not skipped" "needs it to see the image" "$out"
 want_status "  and exits non-zero" 1 "$rc"
 mv "$work/kind.hidden" "$work/stub/kind"
 export KL_CONTEXT=rancher-desktop
 
+# Prove the narrowed PATH really hides the engines, or the two checks below are
+# assertions about an environment rather than about the code.
 rm -f "$work/stub/nerdctl" "$work/stub/docker"
-engine_out=$(kl_detect_engine)
+if PATH="$absent_path" command -v docker >/dev/null 2>&1 ||
+  PATH="$absent_path" command -v nerdctl >/dev/null 2>&1; then
+  bad "the no-engine PATH really has no engine" "a real docker/nerdctl is still reachable"
+else
+  ok "the no-engine PATH really has no engine"
+fi
+engine_out=$(PATH="$absent_path" kl_detect_engine)
 want_empty "no engine at all yields no engine name" "$engine_out" "docker"
-out=$(kl_build_image demo:local "$work" 2>&1)
+out=$(PATH="$absent_path" kl_build_image demo:local "$work" 2>&1)
 rc=$?
 want "no engine is a clear failure" "no working container engine" "$out"
 want_status "no engine exits non-zero" 1 "$rc"
@@ -614,7 +657,11 @@ unset KL_TEST_SECRET_VALUE
 out=$(kl_keep_or_generate demo-local demo-api-secrets REDIS_PASSWORD gen)
 rc=$?
 want_status "an empty stored value counts as present" 0 "$rc"
-want_empty "  and is returned as empty, not regenerated" "$out" "FRESHLY-GENERATED-control"
+# The control is a REAL call of the same function on a known-good input, not a
+# string literal. A literal can never report that the function is broken, which
+# is the one thing want_empty's control argument exists to do.
+kg_control=$(KL_TEST_SECRET_EXISTS_RC=1 kl_keep_or_generate demo-local demo-api-secrets CTRL gen)
+want_empty "  and is returned as empty, not regenerated" "$out" "$kg_control"
 
 # A dotted key: jsonpath {.data.tls.crt} looked up a nested path and returned
 # empty, so any key with a dot read as absent.
@@ -681,7 +728,7 @@ spec:
               value: "dev"
 YAML
 want_empty "two documents each declaring it once is not a duplicate" \
-  "$(kl_duplicate_env_vars "$work/twodocs.yaml")" "$dup_control"
+  "$(kl_duplicate_env_vars "$work/twodocs.yaml" 2>&1)" "$dup_control"
 
 # Container names, port names and volume names are not env vars.
 cat >"$work/names.yaml" <<'YAML'
@@ -949,11 +996,15 @@ want "a space before the colon is still checked" "namespace mismatch" "$out"
 rm -f "$work/drift/deploy/k8s-local/kustomization.yaml"
 printf 'namespace: somewhere-else\n' >"$work/drift/deploy/k8s-local/kustomization.yml"
 out=$(cd "$work/drift" && "$KLOCAL" up --no-build 2>&1)
+rc=$?
 want "kustomization.yml is checked too" "namespace mismatch" "$out"
+want_status "  and exits non-zero" 1 "$rc"
 rm -f "$work/drift/deploy/k8s-local/kustomization.yml"
 printf 'namespace: somewhere-else\n' >"$work/drift/deploy/k8s-local/Kustomization"
 out=$(cd "$work/drift" && "$KLOCAL" up --no-build 2>&1)
+rc=$?
 want "Kustomization is checked too" "namespace mismatch" "$out"
+want_status "  and exits non-zero" 1 "$rc"
 rm -f "$work/drift/deploy/k8s-local/Kustomization"
 
 # Agreement must actually proceed to apply, not merely reach preflight — the old
@@ -961,8 +1012,13 @@ rm -f "$work/drift/deploy/k8s-local/Kustomization"
 printf 'namespace: demo-local\n' >"$work/drift/deploy/k8s-local/kustomization.yaml"
 out=$(cd "$work/drift" && "$KLOCAL" up --no-build 2>&1)
 want_absent "matching namespaces are accepted" "namespace mismatch" "preflight" "$out"
-want "  and the run proceeds to apply the overlay" "apply deploy/k8s-local" "$out"
-want "  and waits for the rollout" "waiting for rollout" "$out"
+# `kl_info "apply ..."` and `kl_info "waiting for rollout"` are both printed
+# BEFORE the operation they announce, so asserting on them proved only that
+# klocal reached the print. Assert on the recorded kubectl calls instead.
+want "  and the run proceeds to apply the overlay" "apply -k" \
+  "$(cut -d'|' -f2 "$KL_TEST_CTX_LOG" | grep '^apply' || true)"
+want "  and waits for the rollout" "rollout status" \
+  "$(cut -d'|' -f2 "$KL_TEST_CTX_LOG" | grep '^rollout' || true)"
 
 # ===========================================================================
 printf '\nconfig loading\n'
@@ -1048,16 +1104,391 @@ python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
   ok "scaffolded project.json is valid JSON" ||
   bad "scaffolded project.json is valid JSON" "json.load failed"
 
+# An unmatched glob stays literal and kl_duplicate_env_vars returns 0 on a
+# non-existent file, so a scaffold that wrote nothing scored a row of passes.
+tmpl_seen=0
 for t in "$work/fresh"/deploy/k8s-local/*.yaml; do
+  [ -f "$t" ] || continue
+  tmpl_seen=$((tmpl_seen + 1))
   want_empty "shipped template has no duplicate env: ${t##*/}" \
-    "$(kl_duplicate_env_vars "$t")" "$dup_control"
+    "$(kl_duplicate_env_vars "$t" 2>&1)" "$dup_control"
 done
+if [ "$tmpl_seen" -ge 5 ]; then
+  ok "the template scan actually saw files" "$tmpl_seen"
+else
+  bad "the template scan actually saw files" "only $tmpl_seen matched; the loop proved nothing"
+fi
 
 printf 'EDITED BY THE USER\n' >"$work/fresh/deploy/k8s-local/ingress.yaml"
 out=$("$KLOCAL" scaffold "$work/fresh" 2>&1)
 want "re-scaffold skips existing files" "skip (exists)" "$out"
 want "re-scaffold preserved user edits" "EDITED BY THE USER" \
   "$(cat "$work/fresh/deploy/k8s-local/ingress.yaml")"
+
+# ===========================================================================
+printf '\nround-3 review: the context guard\n'
+# ===========================================================================
+# Every case below is an input that the previous version accepted. They exist
+# because a guard that has never been shown refusing a real attack is a comment.
+
+# URL userinfo. `https://127.0.0.1:unused@prod.example.com:6443` is a legal URL
+# whose HOST is prod.example.com; trimming at the first ':' returned 127.0.0.1,
+# so the address check — the one thing a context name cannot fake — passed.
+for evil in \
+  "https://127.0.0.1:unused@prod.example.com:6443" \
+  "https://10.0.0.1@prod.example.com:6443" \
+  "https://user:127.0.0.1@203.0.113.9:6443"; do
+  export KL_TEST_SERVER="$evil"
+  printf 'rancher-desktop\n' >"$KL_TEST_CTX_FILE"
+  host=$(kl_context_server_host rancher-desktop || true)
+  want_absent "userinfo does not become the host: $evil" "127.0.0.1" "$host" "$host"
+  if kl_context_is_local rancher-desktop; then
+    bad "  and the context is refused" "was ACCEPTED as local"
+  else ok "  and the context is refused"; fi
+done
+export KL_TEST_SERVER="https://127.0.0.1:6443"
+host=$(kl_context_server_host rancher-desktop)
+want "a plain loopback server still parses" "127.0.0.1" "$host"
+export KL_TEST_SERVER="https://[::1]:6443"
+host=$(kl_context_server_host rancher-desktop)
+want "a bracketed IPv6 server still parses" "::1" "$host"
+
+# Glob metacharacters. KL_KUBECTL is exported as a command string and the hook
+# has to expand it unquoted, so `kind-?` globbed against the project directory.
+for g in "kind-?" "kind-*" "k3d-[ab]" "kind-a]b"; do
+  if kl_context_name_is_local "$g"; then
+    bad "glob metacharacter in a context name is refused: $g" "was ACCEPTED"
+  else ok "glob metacharacter in a context name is refused: $g"; fi
+done
+for g in kind-dev k3d-mycluster rancher-desktop; do
+  if kl_context_name_is_local "$g"; then ok "ordinary context still accepted: $g"; else
+    bad "ordinary context still accepted: $g" "was refused"
+  fi
+done
+
+# The re-check compares the WHOLE server URL. Two local clusters differ only by
+# port, and comparing hosts let a swap between them through.
+export KL_TEST_SERVER="https://127.0.0.1:6443"
+printf 'rancher-desktop\n' >"$KL_TEST_CTX_FILE"
+before=$(kl_context_server_url rancher-desktop)
+export KL_TEST_SERVER="https://127.0.0.1:16443"
+out=$(KL_CONTEXT=rancher-desktop kl_assert_context_unchanged rancher-desktop "$before" "the build" 2>&1)
+rc=$?
+want "a port-only cluster swap is caught" "now points at" "$out"
+want_status "  and refuses" 1 "$rc"
+export KL_TEST_SERVER="https://127.0.0.1:6443"
+out=$(KL_CONTEXT=rancher-desktop kl_assert_context_unchanged rancher-desktop "$before" "the build" 2>&1)
+rc=$?
+want_status "an unchanged context passes the re-check" 0 "$rc"
+want_empty "  and says nothing when nothing changed" "$out" "$before"
+
+# rebuild and down are write paths and must re-verify, exactly as up does.
+# `up` had the only call site, so a context remapped during a rebuild, or during
+# the unbounded wait at `down`'s confirmation prompt, was never re-checked.
+grep -q 'kl_assert_context_unchanged' "$plugin/bin/klocal" &&
+  n_assert=$(grep -c 'kl_assert_context_unchanged "\$KL_CONTEXT"' "$plugin/bin/klocal") || n_assert=0
+if [ "${n_assert:-0}" -ge 3 ]; then
+  ok "up, rebuild and down all re-verify the context" "$n_assert call sites"
+else
+  bad "up, rebuild and down all re-verify the context" \
+    "only ${n_assert:-0} of 3 write paths call kl_assert_context_unchanged"
+fi
+
+# ===========================================================================
+printf '\nround-3 review: psql connection override\n'
+# ===========================================================================
+# psql accepts -U demo, -Udemo and a bare positional dbname. Only the first was
+# refused, so `--app -Udemo` silently reconnected as the superuser and the RLS
+# check that is the entire point of --app proved nothing.
+mkproj "$work/pg" '{"project":"demo","namespace":"demo-local","workloads":{"app":"demo-api","db":"demo-postgres"},"database":{"name":"demo_dev","superuser":"demo","appRole":"demo_app"}}'
+for bad_arg in "-Udemo" "-dpostgres://evil/db" "-hprod.example.com" \
+  "--username=demo" "--dbname=other" "mydb" "postgresql://postgres@prod/production"; do
+  : >"$KL_TEST_ARGV_LOG"
+  out=$(cd "$work/pg" && "$KLOCAL" psql --app "$bad_arg" 2>&1)
+  rc=$?
+  want "psql refuses a connection override: $bad_arg" "refusing" "$out"
+  want_status "  and exits non-zero" 1 "$rc"
+  want_empty "  and never reached the pod" \
+    "$(grep -F 'ARG[exec]' "$KL_TEST_ARGV_LOG" || true)" \
+    "$(cd "$work/pg" && "$KLOCAL" psql --app -c 'select 1' >/dev/null 2>&1
+      grep -c . "$KL_TEST_ARGV_LOG" | grep -v '^0$' || echo control-failed)"
+done
+# Legitimate arguments must still work, or the guard has just broken the command.
+: >"$KL_TEST_ARGV_LOG"
+out=$(cd "$work/pg" && "$KLOCAL" psql --app -c 'select current_user' 2>&1)
+want "psql still allows -c with its value" "kubectl exec ran" "$out"
+want "  and connects as the app role" "demo_app" "$(grep -F 'ARG[demo_app]' "$KL_TEST_ARGV_LOG" || true)"
+out=$(cd "$work/pg" && "$KLOCAL" psql -f /tmp/x.sql 2>&1)
+want "psql still allows -f with its value" "kubectl exec ran" "$out"
+out=$(cd "$work/pg" && "$KLOCAL" psql -c 2>&1)
+rc=$?
+want "an option with no value is refused, not forwarded" "expects a value" "$out"
+want_status "  and exits non-zero" 1 "$rc"
+
+# ===========================================================================
+printf '\nround-3 review: kustomization namespace spellings\n'
+# ===========================================================================
+mkproj "$work/ns" '{"project":"demo","namespace":"demo-local","workloads":{"app":"demo-api"}}'
+mkdir -p "$work/ns/deploy/k8s-local"
+ns_case() { # <label> <kustomization-content> <want-substring-in-output> <want-rc>
+  printf '%s' "$2" >"$work/ns/deploy/k8s-local/kustomization.yaml"
+  out=$(cd "$work/ns" && "$KLOCAL" up --no-build 2>&1)
+  rc=$?
+  want "$1" "$3" "$out"
+  want_status "  rc" "$4" "$rc"
+}
+# JSON is a legal kustomization, and the line-anchored reader saw nothing at all,
+# so resources went to `other` while klocal waited in — and would delete —
+# demo-local.
+ns_case "a JSON kustomization naming another namespace is caught" \
+  '{"namespace":"other","resources":["app.yaml"]}
+' "namespace mismatch" 1
+ns_case "a quoted-key namespace is caught" \
+  '"namespace": "other"
+' "namespace mismatch" 1
+# A trailing comment used to end up inside the compared name and fail a config
+# that was perfectly correct.
+ns_case "a trailing comment does not break a matching namespace" \
+  'namespace: demo-local # the local overlay
+resources:
+  - app.yaml
+' "apply deploy/k8s-local" 0
+ns_case "a JSON kustomization that agrees is accepted" \
+  '{"namespace":"demo-local","resources":["app.yaml"]}
+' "apply deploy/k8s-local" 0
+# A namespace key whose value cannot be extracted must REFUSE, not shrug: a
+# silent pass here is what lets `down` delete the wrong namespace.
+ns_case "an unreadable namespace value is refused, not assumed" \
+  'namespace:
+resources:
+  - app.yaml
+' "cannot read the namespace" 1
+# No namespace at all is the ordinary case and must still run.
+ns_case "no namespace key at all still runs" \
+  'resources:
+  - app.yaml
+' "apply deploy/k8s-local" 0
+# Enough matching lines to fill a pipe buffer used to kill klocal with SIGPIPE
+# and no message, because head -1 exited before sed finished writing.
+awk 'BEGIN{print "namespace: demo-local"; for(i=0;i<20000;i++) print "namespace: demo-local"}' \
+  >"$work/ns/deploy/k8s-local/kustomization.yaml"
+out=$(cd "$work/ns" && "$KLOCAL" up --no-build 2>&1)
+rc=$?
+want "a huge kustomization does not die of SIGPIPE" "apply deploy/k8s-local" "$out"
+want_status "  and exits cleanly" 0 "$rc"
+rm -rf "$work/ns/deploy"
+
+# ===========================================================================
+printf '\nround-3 review: the manifest scanner reads or says it cannot\n'
+# ===========================================================================
+# A trailing comment used to become part of the workload name, which then went to
+# kubectl, failed, and made every variable read as absent from the cluster.
+cat >"$work/cmt.yaml" <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-api # the application
+spec:
+  template:
+    spec:
+      containers:
+        - name: api # the only container
+          env:
+            - name: DUPE # first
+              value: "one"
+            - name: DUPE # second
+              value: "two"
+YAML
+scan=$(kl_duplicate_env_vars "$work/cmt.yaml" 2>&1)
+want "a commented workload name is read without the comment" "DUP demo-api containers api DUPE 2" "$scan"
+want_absent "  and the comment text is gone" "#" "DUP demo-api" "$scan"
+
+# `--- # comment` is an ordinary separator; missing it merged the documents and
+# attributed the duplicate to the previous object.
+cat >"$work/sep.yaml" <<'YAML'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: first-thing
+--- # the second document
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: second-api
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          env:
+            - name: DUPE
+              value: "one"
+            - name: DUPE
+              value: "two"
+YAML
+scan=$(kl_duplicate_env_vars "$work/sep.yaml" 2>&1)
+want "a commented document separator still separates" "DUP second-api" "$scan"
+want_absent "  and the duplicate is not blamed on the previous document" \
+  "first-thing" "DUP second-api" "$scan"
+
+# An env entry whose first key is not `name:` is valid YAML this line-oriented
+# scanner cannot pair up. Staying quiet printed "no duplicate env declarations",
+# a false all-clear on the very file the user asked about.
+cat >"$work/order.yaml" <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-api
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          env:
+            - value: "1"
+              name: FOO
+            - value: "2"
+              name: FOO
+YAML
+scan=$(kl_duplicate_env_vars "$work/order.yaml" 2>&1)
+want "an env entry not starting with name: is reported as unreadable" \
+  "UNREADABLE" "$scan"
+want "  and names the reason" "env-entry-not-starting-with-name" "$scan"
+
+# ===========================================================================
+printf '\nround-3 review: a failed read is not an absence\n'
+# ===========================================================================
+export KL_TEST_LIVE_JSON=''
+if kl_env_of demo-local demo-api containers api APP_ENV >/dev/null 2>&1; then
+  bad "an unreadable Deployment is not reported as absent" "returned success"
+else
+  ok "an unreadable Deployment is not reported as absent" "rc=$?"
+fi
+export KL_TEST_LIVE_JSON='{"spec":{"template":{"spec":{"containers":[{"name":"api","env":[{"name":"APP_ENV","value":"dev"}]}]}}}}'
+live=$(kl_env_of demo-local demo-api containers api APP_ENV)
+want "a readable Deployment yields the live value" "dev" "$live"
+want "  tagged with its source" "value" "$live"
+# A TAB inside a value used to split the record, truncating the value and
+# turning the source column into the rest of the value.
+export KL_TEST_LIVE_JSON='{"spec":{"template":{"spec":{"containers":[{"name":"api","env":[{"name":"APP_ENV","value":"a\tb"}]}]}}}}'
+live=$(kl_env_of demo-local demo-api containers api APP_ENV)
+want "a TAB in a value is escaped, not left to split the record" 'a\tb' "$live"
+want "  so the source column survives" "value" "$(printf '%s' "$live" | cut -f2)"
+unset KL_TEST_LIVE_JSON
+
+# ===========================================================================
+printf '\nround-3 review: behaviour under the caller errexit\n'
+# ===========================================================================
+# bin/klocal runs `set -euo pipefail`; this suite runs `set -uo pipefail`. That
+# single difference hid a broken contract: with errexit the shell exits AT the
+# assignment, so `x=$(cmd); rc=$?` never reached the rc line, and a genuinely
+# absent Secret killed the caller instead of running the generator.
+errexit_case() { # <label> <env-assignments> <expected-output-substring> <expected-rc>
+  cat >"$work/errexit.sh" <<EOF
+set -euo pipefail
+. "$plugin/scripts/lib/common.sh"
+. "$plugin/scripts/lib/cluster.sh"
+KL_CONTEXT=rancher-desktop
+gen() { printf 'FRESHLY-GENERATED'; }
+v=\$(kl_keep_or_generate demo-local demo-api-secrets REDIS_PASSWORD gen) && r=0 || r=\$?
+printf 'OUT=[%s] RC=%s\n' "\$v" "\$r"
+EOF
+  out=$(env $2 bash "$work/errexit.sh" 2>&1)
+  want "$1" "$3" "$out"
+}
+errexit_case "under set -e, an absent Secret still generates" \
+  "KL_TEST_SECRET_EXISTS_RC=1" "OUT=[FRESHLY-GENERATED] RC=0"
+errexit_case "under set -e, an existing value is still reused" \
+  "KL_TEST_SECRET_EXISTS_RC=0 KL_TEST_SECRET_KEYS=REDIS_PASSWORD KL_TEST_SECRET_VALUE=kept" \
+  "OUT=[kept] RC=0"
+errexit_case "under set -e, a forbidden read still refuses out loud" \
+  "KL_TEST_SECRET_FORBIDDEN=1" "refusing to generate"
+# And the documented status code survives, rather than collapsing to a bare 1.
+cat >"$work/rc.sh" <<EOF
+set -euo pipefail
+. "$plugin/scripts/lib/common.sh"
+. "$plugin/scripts/lib/cluster.sh"
+KL_CONTEXT=rancher-desktop
+kl_secret_value demo-local demo-api-secrets REDIS_PASSWORD && r=0 || r=\$?
+printf 'RC=%s\n' "\$r"
+EOF
+out=$(KL_TEST_SECRET_FORBIDDEN=1 bash "$work/rc.sh" 2>&1)
+want "under set -e, 'cannot read' is still code 2, not 1" "RC=2" "$out"
+out=$(KL_TEST_SECRET_EXISTS_RC=1 bash "$work/rc.sh" 2>&1)
+want "under set -e, 'absent' is still code 1" "RC=1" "$out"
+
+# ===========================================================================
+printf '\nround-3 review: config validation and path handling\n'
+# ===========================================================================
+# tls.port is interpolated into the reachable URL. Unvalidated, a `|` closed the
+# sed substitution and the rest became further sed commands, `w <path>` included.
+for badport in "8443|w /tmp/klocal-should-not-exist" "80&81" "notaport" "0" "70000" "-1"; do
+  mkproj "$work/badport" "{\"project\":\"demo\",\"namespace\":\"demo-local\",\"workloads\":{\"app\":\"demo-api\"},\"tls\":{\"port\":\"$badport\"}}"
+  out=$(cd "$work/badport" && "$KLOCAL" status 2>&1)
+  rc=$?
+  want "tls.port rejected: $badport" "tls.port" "$out"
+  want_status "  and exits non-zero" 1 "$rc"
+done
+if [ -e /tmp/klocal-should-not-exist ]; then
+  bad "the rejected tls.port wrote no file" "/tmp/klocal-should-not-exist was created"
+  rm -f /tmp/klocal-should-not-exist
+else
+  ok "the rejected tls.port wrote no file"
+fi
+mkproj "$work/goodport" '{"project":"demo","namespace":"demo-local","workloads":{"app":"demo-api"},"tls":{"port":8443}}'
+out=$(cd "$work/goodport" && "$KLOCAL" status 2>&1)
+want_absent "a valid tls.port is accepted" "tls.port" "context:" "$out"
+
+# dirname is a fixed point at "." as well as "/", so a relative start looped
+# forever with no exit condition.
+( cd "$work" && kl_find_config "." >/dev/null 2>&1 ) &
+find_pid=$!
+find_done=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  kill -0 "$find_pid" 2>/dev/null || { find_done=1; break; }
+  sleep 0.3
+done
+if [ "$find_done" = 1 ]; then
+  ok "kl_find_config terminates on a relative path"
+else
+  kill -9 "$find_pid" 2>/dev/null
+  bad "kl_find_config terminates on a relative path" "still running after 3s — infinite loop"
+fi
+wait "$find_pid" 2>/dev/null || true
+cfg=$(cd "$work/p1" && kl_find_config "." || true)
+want "  and still finds the config from a relative path" "project.json" "$cfg"
+
+# The README tells you to symlink bin/klocal onto PATH. pwd -P resolves the
+# link's DIRECTORY, not the link, so every command died before dispatching.
+mkdir -p "$work/linkbin"
+ln -sf "$KLOCAL" "$work/linkbin/klocal"
+out=$("$work/linkbin/klocal" help 2>&1)
+rc=$?
+want "a symlinked klocal finds its libraries" "klocal - run this project's stack" "$out"
+want_status "  and exits cleanly" 0 "$rc"
+ln -sf "$work/linkbin/klocal" "$work/linkbin/klocal2"
+out=$("$work/linkbin/klocal2" help 2>&1)
+want "a symlink to a symlink also works" "klocal - run this project's stack" "$out"
+
+# ===========================================================================
+printf '\nround-3 review: the engine must match the cluster, not the socket\n'
+# ===========================================================================
+# nerdctl answering says a containerd exists somewhere, not that THIS cluster
+# reads it. With both engines installed and the context on docker-desktop, the
+# build used to land in a store docker-desktop never reads.
+mk_stub docker 0
+mk_stub nerdctl 0 # both sockets answer: Rancher on containerd + Docker Desktop
+export KL_CONTEXT=docker-desktop
+out=$(kl_build_image demo:local "$work" 2>&1)
+want "docker-desktop builds with docker even when nerdctl answers" "docker ran: build" "$out"
+# The unwanted string is "nerdctl ran:", not "nerdctl ran: build" — nerdctl is
+# always invoked as `--namespace k8s.io build`, so the longer string could never
+# have appeared and the check would have passed even on a containerd build.
+want_absent "  and not into containerd" "nerdctl ran:" "docker ran: build" "$out"
+export KL_CONTEXT=rancher-desktop
+out=$(kl_build_image demo:local "$work" 2>&1)
+want "rancher-desktop on containerd still uses nerdctl" "nerdctl ran: --namespace k8s.io build" "$out"
+mk_stub nerdctl 1
 
 # ===========================================================================
 printf '\nCLI surface\n'
@@ -1093,6 +1524,10 @@ if [ "$SELF_CHECK" = 1 ]; then
 fi
 
 printf '\n%s passed, %s failed, %s skipped\n' "$pass" "$fail" "$skip"
+# A skip is not a pass. Saying so out loud is the difference between "the suite
+# is green" and "the suite is green over the parts that ran".
+[ "$skip" -eq 0 ] || printf \
+  'NOTE: %s check(s) did not run — this is not a full-coverage green.\n' "$skip"
 [ "$fail" -eq 0 ] || exit 1
 [ "$pass" -gt 0 ] || {
   printf 'no assertions ran at all — treating that as failure\n'

@@ -51,6 +51,11 @@ spec:
 # NodePort so a desktop SQL client can connect without holding a port-forward
 # open. 30432 keeps it clear of a 5432 already taken by a docker-compose stack.
 #
+# CHANGE THIS NUMBER IN THE SECOND PROJECT YOU SCAFFOLD. NodePorts are allocated
+# per CLUSTER, not per namespace, so a second project asking for 30432 fails to
+# allocate — and it fails partway through the apply, after other resources have
+# already landed. The valid range is 30000-32767; pick one per project.
+#
 # Accepted trade-off: some engines' forwarders bind 0.0.0.0, which puts this port
 # and the password above on the local network, not just this machine. Fine on a
 # trusted network; on a shared one delete this Service and use

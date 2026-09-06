@@ -45,8 +45,22 @@ if command -v nerdctl >/dev/null && nerdctl --namespace k8s.io info >/dev/null 2
   nerdctl --namespace k8s.io build -t "$IMAGE" "$CONTEXT"   # containerd: k3s reads k8s.io
 elif command -v docker >/dev/null && docker info >/dev/null 2>&1; then
   docker build -t "$IMAGE" "$CONTEXT"                        # moby: the cluster shares this daemon
+else
+  echo "no working container engine — start Rancher Desktop (or Docker)" >&2
+  exit 1                                                     # the else is the point
 fi
 ```
+
+The `else` is not decoration. Without it the block falls through silently, nothing
+is built, and the failure surfaces minutes later as `ImagePullBackOff` on an image
+that was never made — a symptom that sends you looking at the registry and the
+pull policy rather than at the build.
+
+**A socket that answers is not proof the cluster reads it.** On a machine with
+Rancher Desktop on containerd _and_ Docker Desktop installed, both probes succeed.
+If the selected context is `docker-desktop`, building with `nerdctl` puts the image
+in a store that cluster never reads — same silent-stale-image symptom. Decide by
+the context first, and only then by which socket answers.
 
 The `k8s.io` namespace is not optional on containerd. An image built into the
 default namespace is invisible to the kubelet, exactly as if it had never been
@@ -104,28 +118,65 @@ The naive version of this is worse than none, because `|| true` turns _every_
 failure into "absent" and then generates: an RBAC denial or a momentary API
 error rotates the very credential you were protecting. Separate the three cases.
 
+The variables below are the ones klocal exports into the hook: `$KL_SECRET`,
+`$KL_NAMESPACE` and `$KL_KUBECTL`. Use those names — an earlier version of this
+example used `$SECRET` and `$NS`, which are defined nowhere, so a hook copied from
+it queried an empty Secret name.
+
 ```bash
+# Three outcomes, and conflating any two of them is the bug:
+#   present -> print it        absent -> generate        cannot read -> refuse
+# Returns 3 for "cannot read" rather than exiting, because this runs inside
+# $(...) and `exit` there kills only the subshell — see below.
 keep() { # <key> <generator...>
-  local key=$1 exists v; shift
+  local key=$1 exists keys v rc; shift
   # --ignore-not-found is the discriminator: a missing Secret is empty output
   # with exit 0, while a denied or failed read is a non-zero exit.
-  exists=$($KUBECTL get secret "$SECRET" -n "$NS" -o name --ignore-not-found) \
-    || { echo "cannot read secret/$SECRET — refusing to generate" >&2; exit 1; }
+  exists=$($KL_KUBECTL get secret "$KL_SECRET" -n "$KL_NAMESPACE" \
+    -o name --ignore-not-found) && rc=0 || rc=$?
+  [ "$rc" -eq 0 ] || return 3
   [ -n "$exists" ] || { "$@"; return; }          # genuinely absent
   # Range over the keys: {.data.tls.crt} would look up a nested path and come
-  # back empty, so any key containing a dot reads as absent.
-  $KUBECTL get secret "$SECRET" -n "$NS" \
-      -o "go-template={{range \$k, \$v := .data}}{{\$k}}{{\"\n\"}}{{end}}" \
-    | grep -Fxq -- "$key" || { "$@"; return; }   # key not set
-  v=$($KUBECTL get secret "$SECRET" -n "$NS" -o "go-template={{index .data \"$key\"}}")
+  # back empty, so any key containing a dot reads as absent. Capture it FIRST:
+  # piping straight into grep makes a FAILED read indistinguishable from
+  # "key not set", and then generates — the exact rotation this guards against.
+  keys=$($KL_KUBECTL get secret "$KL_SECRET" -n "$KL_NAMESPACE" \
+      -o "go-template={{range \$k, \$v := .data}}{{\$k}}{{\"\n\"}}{{end}}") \
+    && rc=0 || rc=$?
+  [ "$rc" -eq 0 ] || return 3
+  printf '%s\n' "$keys" | grep -Fxq -- "$key" || { "$@"; return; }   # key not set
+  v=$($KL_KUBECTL get secret "$KL_SECRET" -n "$KL_NAMESPACE" \
+    -o "go-template={{index .data \"$key\"}}") && rc=0 || rc=$?
+  [ "$rc" -eq 0 ] || return 3
   printf '%s' "$v" | base64 -d                   # present (possibly empty)
 }
-REDIS_PASSWORD=$(keep REDIS_PASSWORD openssl rand -hex 16)
+
+REDIS_PASSWORD=$(keep REDIS_PASSWORD openssl rand -hex 16) && rc=0 || rc=$?
+[ "$rc" -ne 3 ] || {
+  echo "cannot read secret/$KL_SECRET — refusing to generate a replacement" >&2
+  exit 1
+}
 ```
 
-`$KUBECTL` here is `klocal`'s `$KL_KUBECTL`, which carries `--context`. A hook
-that calls bare `kubectl` is not covered by klocal's pin and will follow whatever
-the kubeconfig says at that moment.
+Three things in that snippet are load-bearing, and each was wrong in an earlier
+version of this document:
+
+- **`exit` does not work inside `$(...)`.** `REDIS_PASSWORD=$(keep …)` runs `keep`
+  in a subshell, so an `exit 1` in there kills the subshell and the script carries
+  on with an empty password. The status has to be returned and checked outside.
+- **Capture before you pipe.** `kubectl … | grep -Fxq` reports the _grep's_ view:
+  a read that failed produces no lines, `grep` exits 1, and the `||` branch
+  generates a new credential. `pipefail` does not help, because the branch is
+  taken on any non-zero status.
+- **`x=$(cmd); rc=$?` is not safe under `set -e`.** The shell exits at the
+  assignment and never reaches `rc=$?`. Use `x=$(cmd) && rc=0 || rc=$?`, which is
+  a tested context and preserves the code.
+
+`$KL_KUBECTL` carries the `--context` klocal verified. A hook that calls bare
+`kubectl` is not covered by that pin and will follow whatever the kubeconfig says
+at that moment. Quote it as `$KL_KUBECTL` (unquoted, so it splits into two
+arguments) — klocal refuses any context name containing glob characters, so the
+split cannot pick up a filename from the working directory.
 
 If a value does change anyway, restart the workload that holds the stale copy in
 the same run.
@@ -186,12 +237,18 @@ Then **assert it**, and fail the bring-up if the assertion does not hold:
 # Attributes AND membership, INCLUDING indirect chains. A direct-membership check
 # misses `GRANT postgres TO bridge; GRANT bridge TO app_role;` — app_role can
 # still SET ROLE postgres through bridge. pg_has_role follows the whole chain.
+#
+# BOTH 'USAGE' and 'MEMBER' are checked, and this is not belt and braces: since
+# PostgreSQL 16 a grant can be `WITH INHERIT FALSE, SET TRUE`, which confers no
+# inherited privilege — so 'USAGE' answers false — while still permitting
+# `SET ROLE elevated`. Checking USAGE alone reported such a role as safe.
 [ "$(psql -tAc "SELECT rolsuper OR rolbypassrls OR rolreplication OR NOT rolcanlogin
                        OR EXISTS (SELECT 1 FROM pg_roles g
                                    WHERE (g.rolsuper OR g.rolbypassrls
                                           OR g.rolname = 'pg_read_all_data')
                                      AND g.rolname <> 'app_role'
-                                     AND pg_has_role('app_role', g.oid, 'USAGE'))
+                                     AND (pg_has_role('app_role', g.oid, 'USAGE')
+                                          OR pg_has_role('app_role', g.oid, 'MEMBER')))
                 FROM pg_roles WHERE rolname='app_role'")" = "f" ] \
   || { echo "FAIL: app_role is not a safe login role" >&2; exit 1; }
 ```
@@ -250,8 +307,15 @@ read logs, and how to tear down.
 ## Teardown
 
 ```bash
-kubectl delete namespace PROJECT-local
+klocal down                                             # checks the context first
+kubectl --context rancher-desktop delete namespace PROJECT-local   # by hand
 ```
 
 That is the whole uninstall, which is the reason everything lives in one
 namespace.
+
+**Pass `--context` on every `kubectl` you run by hand.** A bare `kubectl` uses
+whatever the kubeconfig currently says, which is precisely the one stale-context
+mistake this whole document is organised around — and `delete namespace` is the
+command where getting it wrong costs the most. `klocal down` runs the guard for
+you; a hand-typed command has only the flag.

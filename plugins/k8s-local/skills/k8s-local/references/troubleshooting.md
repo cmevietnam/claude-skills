@@ -11,8 +11,8 @@ Three different causes, distinguished by where the response stops.
 applied cleanly and will never route.
 
 ```bash
-kubectl get ingressclass                 # empty, or missing the one you named
-kubectl get ingress -A                   # ADDRESS column empty
+kubectl --context rancher-desktop get ingressclass   # empty, or missing yours
+kubectl --context rancher-desktop get ingress -A     # ADDRESS column empty
 ```
 
 Install a controller, or drop ingress and use `kubectl port-forward`. See
@@ -59,8 +59,14 @@ absent (`bring-up.md` §2). To recover now, restart the workload holding the sta
 copy:
 
 ```bash
-kubectl rollout restart deployment/PROJECT-redis -n PROJECT-local
+kubectl --context rancher-desktop rollout restart \
+  deployment/PROJECT-redis -n PROJECT-local
 ```
+
+Every `kubectl` in this file carries `--context` deliberately. A bare one follows
+the current kubeconfig, and "the context was stale" is the failure this whole
+plugin exists to prevent — a troubleshooting page is the worst place to teach the
+unguarded form, because it is read when something is already going wrong.
 
 ## An env var has a value that is in no manifest — or the wrong one of two
 
@@ -83,7 +89,8 @@ merge, before `kubectl` sees anything, so no tool reports it at all.
 
 ```bash
 klocal status                            # distinguishes the two cases
-kubectl get deploy APP -n NS -o jsonpath='{.spec.template.spec.containers[0].env}'
+kubectl --context rancher-desktop get deploy APP -n NS \
+  -o jsonpath='{.spec.template.spec.containers[0].env}'
 ```
 
 Always compare against the **live object**. The manifest is a hypothesis about
@@ -152,7 +159,7 @@ kubectl config use-context rancher-desktop
 ```
 
 If a _genuinely_ local context is refused, add its exact name to
-`kl_context_is_local` in `scripts/lib/cluster.sh` and add a test case. Never
+`kl_context_name_is_local` in `scripts/lib/cluster.sh` and add a test case. Never
 widen it to a substring match.
 
 ## klocal: no .k8s-local/project.json found
