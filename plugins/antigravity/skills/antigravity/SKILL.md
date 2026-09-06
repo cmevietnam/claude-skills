@@ -13,8 +13,9 @@ Sibling of the `codex` plugin — same discipline, different reviewer. It replac
 Gemini CLI path entirely: Google closed `gemini-cli` to personal Google accounts and
 points them here (`references/why-not-gemini-cli.md`).
 
-Verified against **agy 1.1.27** (2026-09-05) by running every command below. Re-verify
-after an upgrade — `agy` self-updates in the background, so the version can move under you.
+Verified against **agy 1.1.27** (2026-09-05, model discovery 2026-09-07) by running
+every command below. Re-verify after an upgrade — `agy` self-updates in the background,
+so the version can move under you.
 
 ## Hard rule: present, then stop
 
@@ -61,6 +62,8 @@ print anything unless the envelope proves a review actually happened:
 
 ```bash
 agy-review [--model M] [--effort E] [--out DIR] PROMPT_FILE   # run, validate, print
+agy-review --refresh-models [...] PROMPT_FILE                  # re-ask which Flash is newest
+agy-review --no-retry [...] PROMPT_FILE                        # never step the effort down
 agy-review --check out.json                                    # validate an existing run
 ```
 
@@ -128,13 +131,22 @@ git diff main...HEAD > "$S/diff.txt"   # or: git diff (unstaged) / --cached / <S
   cat "$S/diff.txt"
 } > "$S/prompt.txt"
 
-agy-review --model gemini-3.8-flash --out "$S/flash" "$S/prompt.txt"
+agy-review --out "$S/flash" "$S/prompt.txt"   # newest Flash, resolved at run time
 ```
 
 `agy-review` adds `--disable-slash-commands`, `--output-format json` and
 `--print-timeout 9m`, keeps `out.json` and `err.txt` in `--out`, validates the envelope,
 and prints the review only if there is one. A non-zero exit means no review happened —
 report that, do not report a clean result.
+
+It prints the model it chose, and where the id came from, before the run:
+
+```
+model:      gemini-3.8-flash (latest Flash from `agy models`)
+```
+
+**That line is what you attribute the findings to** — not "the default", and not the id
+you expected. A fallback says so in the same place.
 
 Its **default** effort is applied only to an unsuffixed `gemini-*` id, since every other
 id rejects `--effort`. An **explicit** `--effort` is always forwarded, so `agy`'s own error
@@ -148,11 +160,39 @@ More prompts: `references/review-prompts.md`.
 
 ## Models
 
-`agy models` is authoritative and needs auth. As of 2026-09-05 it lists:
+### The default is the newest Flash, resolved at run time
+
+Google ships a new Flash generation every few months and the superseded id keeps working,
+so a pinned default quietly reviews with an older model and nothing ever tells you. With
+no `--model`, `agy-review` asks `agy models` and takes the newest `gemini-<version>-flash`
+it offers, compared as version numbers rather than strings — `gemini-3.10-flash` beats
+`gemini-3.9-flash`, `gemini-4-flash` beats both. It picks the unsuffixed base id so the
+default `--effort high` still applies.
+
+The answer is cached for a day in `$XDG_CACHE_HOME/agy-review/latest-flash.json` (falling
+back to `~/.cache`), because the listing costs ~3s per call and the answer changes on the
+scale of months. A failed listing — no auth, no network — never fails the review: a cached
+id is kept if there is one, otherwise `gemini-3.8-flash` is used, and stderr says which. A
+failure with no cache to fall back on is remembered for 10 minutes, so an offline machine
+does not pay the timeout on every review.
+
+- `--model <id>` pins the reviewer and skips the listing entirely. Use it whenever a
+  result has to be reproducible, or when a second opinion needs a specific model.
+- `--refresh-models` re-asks immediately, ignoring the cache.
+- `AGY_REVIEW_CACHE_TTL` (seconds, default 86400; `0` never trusts the cache) and
+  `AGY_REVIEW_MODELS_TIMEOUT` (seconds, default 30) tune it.
+
+An id `agy` does not offer is never invented: anything that is not a well-formed
+`gemini-<version>-flash` is skipped, and if the listing holds no Flash at all the pinned
+fallback is used with a warning.
+
+### What `agy models` lists
+
+`agy models` is authoritative and needs auth. As of 2026-09-07 it lists:
 
 | Model                                           | Notes                                                               |
 | ----------------------------------------------- | ------------------------------------------------------------------- |
-| `gemini-3.8-flash-high` / `-medium` / `-low`    | **Default choice.** Fast, cheap, good on diffs                      |
+| `gemini-3.8-flash-high` / `-medium` / `-low`    | Newest Flash today, so the default. Fast, cheap, good on diffs      |
 | `gemini-3.7-flash-*`, `gemini-3.6-flash-*`      | Older Flash generations                                             |
 | `gemini-3.1-pro-high` / `-low`                  | Harder reasoning: concurrency, cross-module invariants              |
 | `claude-sonnet-4-6`, `claude-opus-4-6-thinking` | A genuinely different training run — best for a true second opinion |
@@ -169,7 +209,8 @@ and so is `--effort` on a model that does not take it:
 
 `agy-review` handles this: given no explicit `--effort` it applies the default only to an
 unsuffixed `gemini-*` id, and passes an explicit one straight through so `agy`'s own error
-surfaces rather than being swallowed.
+surfaces rather than being swallowed. It is also why model discovery resolves to the base
+id: a discovered `gemini-3.8-flash-high` would make the default effort an error.
 
 An unknown model is never silently substituted: exit 1, `"status":"ERROR"`, with the model
 list in `.error`.
@@ -239,14 +280,22 @@ like any other denied run; `--check` is what catches it.
 
 - **`Please sign in`** — headless cannot authenticate. The user runs `agy` in a **real
   terminal** (not `!` in Claude Code, which has no TTY: `bubbletea: could not open TTY`).
-- **`exceeded the output token limit`** — `status: ERROR` with an empty response.
-  **Thinking tokens count against that budget**, and they dominate: a successful 92 KB
-  review reported `output_tokens: 55850` of which `thinking_tokens: 54977`. Two levers,
-  in this order:
-  1. **Lower the effort.** On a 92 KB bundle, `--effort high` failed twice and
-     `--effort medium` succeeded on the same prompt. Big input wants less effort, not more.
-  2. Bound the answer in the prompt: "at most 6 findings, each at most 6 lines, quote only
-     the line you object to".
+- **`exceeded the output token limit`** — `status: ERROR` with an empty response, and it
+  arrives **after** the model has run, so the attempt is already spent. **Thinking tokens
+  count against that budget and dominate it**: a successful 92 KB review reported
+  `output_tokens: 55850` of which `thinking_tokens: 54977`. `agy --help` offers no flag
+  for the budget — only `--model` and `--effort` move it.
+
+  `agy-review` **retries one effort rung lower** (high → medium → low), keeps each
+  attempt's raw report (`out.json`, `out-2.json`, …), and prints
+  `effort=… attempts=…` — the effort on that line is the one the findings are attributed
+  to, not the one you asked for.
+
+  **To keep the effort, shrink the input.** The budget is per run, so half the diff is
+  half the thinking: `references/review-prompts.md` has the split-and-merge recipe, and
+  `--no-retry` turns the ladder off so a run either answers at the effort you asked for
+  or fails. A different model has a different budget, also at full effort. Bounding the
+  answer in the prompt buys little — the visible answer was ~2% of that budget.
 
   Invisible to anything that reads `.response` without checking `.error`; `agy-review`
   catches it.

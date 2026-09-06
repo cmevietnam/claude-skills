@@ -114,8 +114,13 @@ git diff main...HEAD > "$S/diff.txt"     # committed only — omits uncommitted 
 
 cat "$S/preamble.txt" "$S/instructions.txt" "$S/diff.txt" > "$S/prompt.txt"
 
-agy-review --model gemini-3.8-flash --effort high --out "$S/flash" "$S/prompt.txt"
+agy-review --out "$S/flash" "$S/prompt.txt"        # newest Flash, effort high
 ```
+
+With no `--model`, `agy-review` asks `agy models` for the newest Flash generation and
+prints which id it picked. Pass `--model <id>` when the run has to be reproducible — a
+re-run weeks later would otherwise silently use a newer model than the one the findings
+were attributed to.
 
 Without `set -e` and the emptiness check, a missing base branch leaves `diff.txt` empty,
 the model reviews the instructions alone, and a confident `NO FINDINGS` comes back on a
@@ -124,6 +129,63 @@ diff nobody looked at.
 Give each model its own `--out` subdirectory: `agy-review` refuses to overwrite an
 existing `out.json`, so a second model pointed at the same directory fails rather than
 destroying the first raw report.
+
+## When one run exceeds the output token limit
+
+`agy` answers `status: ERROR` with an empty `response` and
+`error: "...exceeded the output token limit..."` — after the model has run, so the attempt
+is already spent. Thinking tokens dominate that budget (a successful 92 KB review spent
+54977 of its 55850 output tokens thinking) and `agy --help` has no flag that raises it:
+only `--model` and `--effort` move it.
+
+`agy-review` retries a rung lower on its own. **To keep the effort, shrink the input** —
+the budget is spent per run, so half the diff is half the thinking:
+
+```bash
+set -euo pipefail
+S="$(mktemp -d)"
+BUDGET=$((40 * 1024))        # bytes of diff per part; 92 KB in one run hit the limit
+BASE=main                    # review scope, same as a single-run review
+
+git diff "$BASE...HEAD" --name-only > "$S/files.txt"
+[ -s "$S/files.txt" ] || { echo "nothing to review"; exit 1; }
+
+part=1; size=0; : > "$S/part-1.diff"
+while IFS= read -r f; do
+  git diff "$BASE...HEAD" -- "$f" > "$S/one.diff"
+  fsize=$(wc -c < "$S/one.diff")
+  # A file bigger than the budget still goes in alone — splitting inside a file would
+  # hand the reviewer a hunk with no surrounding context.
+  if [ "$size" -gt 0 ] && [ $((size + fsize)) -gt "$BUDGET" ]; then
+    part=$((part + 1)); size=0; : > "$S/part-$part.diff"
+  fi
+  cat "$S/one.diff" >> "$S/part-$part.diff"
+  size=$((size + fsize))
+done < "$S/files.txt"
+
+for d in "$S"/part-*.diff; do
+  n="$(basename "$d" .diff)"
+  cat "$S/preamble.txt" "$S/instructions.txt" "$d" > "$S/$n.prompt"
+  # --no-retry: a part that still overruns must be reported, not quietly answered at a
+  # lower effort than its siblings — mixed efforts in one review are not comparable.
+  agy-review --effort high --no-retry --out "$S/$n" "$S/$n.prompt" > "$S/$n.review" \
+    || { echo "$n failed — see $S/$n/err.txt"; exit 1; }
+done
+```
+
+What this costs, and it is not nothing:
+
+- **Cross-file findings disappear.** Each part is reviewed alone, so an invariant broken
+  across two files in different parts is invisible. Group related files into the same part
+  when you know which they are.
+- **Every part is billed separately**, and the shared preamble is re-sent with each.
+- Report the findings **per part**, naming the part in the heading — merging them silently
+  hides that no reviewer saw the whole change.
+
+The other way to keep the effort is a model with a different budget:
+`--model gemini-3.1-pro-high`, or a Claude id. That changes the reviewer, so it is a
+second opinion rather than the same review — which on security-sensitive code you wanted
+anyway.
 
 ## Reading the result
 
@@ -143,8 +205,9 @@ and exits 0, so a failed run is indistinguishable from a quiet one.
 
 ## Choosing the model
 
-Start with `gemini-3.8-flash` at `--effort high`. Escalate to `gemini-3.1-pro-high` for
-subtle concurrency, cross-module invariants, or cryptographic logic.
+Start with the default — the newest Flash, at `--effort high`. Escalate to
+`gemini-3.1-pro-high` for subtle concurrency, cross-module invariants, or cryptographic
+logic.
 
 For a genuine second opinion — a different training run, different blind spots — use
 `claude-opus-4-6-thinking`. On security-sensitive code run both and diff the findings

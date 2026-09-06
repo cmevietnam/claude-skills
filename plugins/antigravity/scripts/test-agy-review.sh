@@ -28,6 +28,24 @@ trap 'rm -rf "$TMP"' EXIT
 STUB_ARGV="$TMP/argv.bin"
 export STUB_ARGV
 
+# One line per `agy models` call the stub answers, so a test can prove the cache stopped
+# a second fetch — and prove a fetch happened at all, which no argv assertion can show
+# (the review call that follows overwrites the argv capture).
+STUB_MODELS_CALLS="$TMP/models-calls.txt"
+export STUB_MODELS_CALLS
+: > "$STUB_MODELS_CALLS"
+
+# One line per review call, so a retry ladder can be counted. The stub also writes
+# "$STUB_ARGV.<n>" per attempt, which is what ARGV_FILE_OVERRIDE points the argv
+# assertions at when a case cares about an attempt other than the last.
+STUB_CALLS="$TMP/review-calls.txt"
+export STUB_CALLS
+: > "$STUB_CALLS"
+
+# The default model is discovered and cached. Pin the cache inside the suite's own
+# directory so no case can read, write or invalidate the real user's cache.
+export XDG_CACHE_HOME="$TMP/cache"
+
 pass=0
 fail=0
 
@@ -39,7 +57,7 @@ note_fail() { echo "FAIL  $1"; fail=$((fail + 1)); }
 run_bin() {
   # Drop any previous argv capture so a stale one cannot satisfy this run's assertions.
   case "$STUB_ARGV" in
-    "$TMP"/*) rm -f "$STUB_ARGV" ;;
+    "$TMP"/*) rm -f "$STUB_ARGV" "$STUB_ARGV".[0-9] ;;
     *) echo "FATAL: refusing to delete $STUB_ARGV, outside $TMP"; exit 1 ;;
   esac
   python3 "$BIN" "$@" >"$TMP/.stdout" 2>"$TMP/.stderr"
@@ -83,10 +101,14 @@ expect_fail() {
 # An argv assertion is only meaningful if the capture exists. Without this guard, a
 # missing capture makes every match fail, which argv_lacks would read as "absent" — the
 # same silence-passes bug this suite exists to prevent.
+# Which capture the argv assertions read: the last review call by default, or one
+# attempt of a retry ladder when ARGV_FILE_OVERRIDE names it.
+argv_file() { printf '%s' "${ARGV_FILE_OVERRIDE:-$STUB_ARGV}"; }
+
 argv_capture_ok() {
   local name="$1"
-  if [ ! -s "$STUB_ARGV" ]; then
-    note_fail "$name: no argv capture at $STUB_ARGV — the stub never ran"
+  if [ ! -s "$(argv_file)" ]; then
+    note_fail "$name: no argv capture at $(argv_file) — the stub never ran that far"
     return 1
   fi
   return 0
@@ -99,7 +121,7 @@ argv_capture_ok() {
 argv_equals() {
   local name="$1"; shift
   argv_capture_ok "$name" || return
-  if ARGV_FILE="$STUB_ARGV" python3 - "$@" <<'PY'
+  if ARGV_FILE="$(argv_file)" python3 - "$@" <<'PY'
 import os, sys
 want = sys.argv[1:]
 got = open(os.environ["ARGV_FILE"], "rb").read().split(b"\0")
@@ -125,7 +147,7 @@ argv_has() {
   argv_capture_ok "$name" || return
   local missing=""
   for want in "$@"; do
-    ARGV_FILE="$STUB_ARGV" python3 -c '
+    ARGV_FILE="$(argv_file)" python3 -c '
 import os, sys
 got = open(os.environ["ARGV_FILE"], "rb").read().split(b"\0")
 sys.exit(0 if sys.argv[1].encode() in got else 1)' "$want" || missing="$missing $want"
@@ -143,7 +165,7 @@ argv_lacks() {
   argv_capture_ok "$name" || return
   local present=""
   for bad in "$@"; do
-    ARGV_FILE="$STUB_ARGV" python3 -c '
+    ARGV_FILE="$(argv_file)" python3 -c '
 import os, sys
 got = open(os.environ["ARGV_FILE"], "rb").read().split(b"\0")
 sys.exit(0 if sys.argv[1].encode() in got else 1)' "$bad" && present="$present $bad"
@@ -171,6 +193,60 @@ expect_pass() {
       got:  $(printf '%q' "$STDOUT")"
   else
     note_pass "$name"
+  fi
+}
+
+# expect_stderr NAME PATTERN -- the last run's stderr must contain PATTERN.
+# For diagnostics that accompany a SUCCESSFUL run (a fallback warning, the model line),
+# which expect_pass deliberately ignores because it only looks at stdout.
+expect_stderr() {
+  local name="$1" want="$2"
+  if [ -z "$STDERR" ]; then
+    note_fail "$name: stderr empty — the wrapper said nothing"
+  elif printf '%s' "$STDERR" | grep -q -- "$want"; then
+    note_pass "$name"
+  else
+    note_fail "$name: stderr lacked '$want' — got: ${STDERR:0:200}"
+  fi
+}
+
+# expect_stderr_absent NAME PATTERN -- the last run's stderr must NOT contain PATTERN.
+# Only ever used where a companion case proves the same message CAN appear, since an
+# absence on its own cannot tell a working check from one that never ran.
+expect_stderr_absent() {
+  local name="$1" unwanted="$2"
+  if printf '%s' "$STDERR" | grep -q -- "$unwanted"; then
+    note_fail "$name: stderr unexpectedly contained '$unwanted'"
+  else
+    note_pass "$name"
+  fi
+}
+
+# expect_calls NAME COUNT -- how many review calls the stub answered.
+# Reset the counter with `: > "$STUB_CALLS"` before the run being measured.
+expect_calls() {
+  local name="$1" want="$2" got=0
+  if [ -f "$STUB_CALLS" ]; then
+    got="$(wc -l < "$STUB_CALLS" | tr -d ' ')"
+  fi
+  if [ "$got" = "$want" ]; then
+    note_pass "$name"
+  else
+    note_fail "$name: agy ran $got times, expected $want"
+  fi
+}
+
+# expect_models_calls NAME COUNT -- how many times the stub answered `agy models`.
+# Reset the counter with `: > "$STUB_MODELS_CALLS"` before the run being measured.
+expect_models_calls() {
+  local name="$1" want="$2" got=0
+  if [ -f "$STUB_MODELS_CALLS" ]; then
+    got="$(wc -l < "$STUB_MODELS_CALLS" | tr -d ' ')"
+  fi
+  if [ "$got" = "$want" ]; then
+    note_pass "$name"
+  else
+    note_fail "$name: \`agy models\` ran $got times, expected $want"
   fi
 }
 
@@ -328,17 +404,54 @@ LC_ALL=C PYTHONUTF8=0 expect_pass "non-ASCII response under LC_ALL=C" \
 STUB="$TMP/stub-agy"
 cat > "$STUB" <<'EOF'
 #!/bin/bash
+# `agy models` is a different call shape: a listing on stdout, a progress note on stderr,
+# and it happens BEFORE the review. It is counted rather than recorded in $STUB_ARGV,
+# which the review call that follows would overwrite anyway.
+if [ "${1:-}" = "models" ]; then
+  echo "models" >> "$STUB_MODELS_CALLS"
+  [ -n "${STUB_MODELS_SLEEP:-}" ] && sleep "$STUB_MODELS_SLEEP"
+  [ -n "${STUB_MODELS:-}" ] && cat "$STUB_MODELS"
+  [ -n "${STUB_MODELS_ERR:-}" ] && cat "$STUB_MODELS_ERR" >&2
+  exit "${STUB_MODELS_RC:-0}"
+fi
 # Records its argv NUL-delimited so arguments containing newlines keep their boundaries,
-# then emits whatever the fixture files dictate.
+# then emits whatever the fixture files dictate. The attempt number picks the fixture, so
+# a retry ladder can be driven: STUB_STDOUT_2 answers the second attempt, STUB_STDOUT the
+# rest; STUB_RC_<n> does the same for the exit code.
+echo "review" >> "$STUB_CALLS"
+N="$(wc -l < "$STUB_CALLS" | tr -d ' ')"
 printf '%s\0' "$@" > "$STUB_ARGV"
-cat "$STUB_STDOUT"
+printf '%s\0' "$@" > "$STUB_ARGV.$N"
+OUT_VAR="STUB_STDOUT_$N"
+RC_VAR="STUB_RC_$N"
+cat "${!OUT_VAR:-$STUB_STDOUT}"
 [ -n "${STUB_STDERR:-}" ] && cat "$STUB_STDERR" >&2
-exit "${STUB_RC:-0}"
+exit "${!RC_VAR:-${STUB_RC:-0}}"
 EOF
 chmod +x "$STUB"
 
 export STUB_STDOUT="$TMP/good.json"
 export STUB_RC=0
+
+# The listing `agy models` really printed at 1.1.27, verbatim — including the tab before
+# each label and the baked-in effort suffix on every id.
+cat > "$TMP/models-real.txt" <<'EOF'
+gemini-3.8-flash-high	Gemini 3.8 Flash (High)
+gemini-3.8-flash-medium	Gemini 3.8 Flash (Medium)
+gemini-3.8-flash-low	Gemini 3.8 Flash (Low)
+gemini-3.7-flash-high	Gemini 3.7 Flash (High)
+gemini-3.7-flash-medium	Gemini 3.7 Flash (Medium)
+gemini-3.7-flash-low	Gemini 3.7 Flash (Low)
+gemini-3.6-flash-high	Gemini 3.6 Flash (High)
+gemini-3.6-flash-medium	Gemini 3.6 Flash (Medium)
+gemini-3.6-flash-low	Gemini 3.6 Flash (Low)
+gemini-3.1-pro-high	Gemini 3.1 Pro (High)
+gemini-3.1-pro-low	Gemini 3.1 Pro (Low)
+claude-sonnet-4-6	Claude Sonnet 4.6 (Thinking)
+claude-opus-4-6-thinking	Claude Opus 4.6 (Thinking)
+gpt-oss-120b-medium	GPT-OSS 120B (Medium)
+EOF
+export STUB_MODELS="$TMP/models-real.txt"
 
 # A realistic prompt: several lines, a blank line, and a trailing newline. The
 # single-line prompt that used to be here made the -p assertions pass for the wrong
@@ -551,6 +664,410 @@ else
   note_fail "public --out produced no warning"
 fi
 
+# --- the default model: discovered from `agy models`, not pinned ---------------------
+# The whole point is that the default stops being right the day Google ships a newer
+# Flash. Every case here fixes its own XDG_CACHE_HOME so it starts from a cold cache and
+# cannot be answered by an earlier case's.
+
+# The listing agy really produces resolves to the base id, not a suffixed one: a
+# suffixed --model makes agy reject the default --effort.
+: > "$STUB_MODELS_CALLS"
+XDG_CACHE_HOME="$TMP/c-real" expect_pass "default model comes from the real listing" \
+  "$GOOD_STDOUT" --agy "$STUB" --out "$TMP/run-disc1" "$TMP/prompt.txt"
+argv_equals "suffixed listing collapses to the unsuffixed base id" \
+  "-p" "$PROMPT_ARG" "--model" "gemini-3.8-flash" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
+  "--effort" "high"
+expect_models_calls "a cold cache costs exactly one models call" 1
+expect_stderr "the model line names where the id came from" \
+  "model:      gemini-3.8-flash (latest Flash from"
+
+# A newer generation must be picked up with no code change — this is the whole feature.
+cat > "$TMP/models-newer.txt" <<'EOF'
+gemini-4-flash-high	Gemini 4 Flash (High)
+gemini-3.10-flash-high	Gemini 3.10 Flash (High)
+gemini-3.8-flash-high	Gemini 3.8 Flash (High)
+gemini-3.1-pro-high	Gemini 3.1 Pro (High)
+claude-opus-4-6-thinking	Claude Opus 4.6 (Thinking)
+EOF
+XDG_CACHE_HOME="$TMP/c-newer" STUB_MODELS="$TMP/models-newer.txt" \
+  expect_pass "a newer Flash generation is used without a code change" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-disc2" "$TMP/prompt.txt"
+argv_equals "newest generation wins over the pinned fallback" \
+  "-p" "$PROMPT_ARG" "--model" "gemini-4-flash" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
+  "--effort" "high"
+
+# Versions are numbers, not strings: "3.9" > "3.10" lexically, and that would pick the
+# older model forever once a .10 exists.
+cat > "$TMP/models-3-10.txt" <<'EOF'
+gemini-3.9-flash-high	Gemini 3.9 Flash (High)
+gemini-3.10-flash-high	Gemini 3.10 Flash (High)
+gemini-3.8-flash-low	Gemini 3.8 Flash (Low)
+EOF
+XDG_CACHE_HOME="$TMP/c-310" STUB_MODELS="$TMP/models-3-10.txt" \
+  expect_pass "3.10 beats 3.9" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-disc3" "$TMP/prompt.txt"
+argv_has "versions compare numerically, not lexically" "--model" "gemini-3.10-flash"
+argv_lacks "the lexically-larger older id is not chosen" "gemini-3.9-flash"
+
+# Ids this wrapper does not understand must be ignored, never guessed at: passing an id
+# agy does not offer turns the whole review into an ERROR envelope.
+cat > "$TMP/models-odd.txt" <<'EOF'
+gemini-99999-flash-high	Absurd version, outside the bounded digit range
+gemini-9.9-flash-turbo	Unknown effort suffix
+gemini-flash-high	No version at all
+gemini-4.2-flash-high	Gemini 4.2 Flash (High)
+gemini-3.8-flash-high	Gemini 3.8 Flash (High)
+EOF
+XDG_CACHE_HOME="$TMP/c-odd" STUB_MODELS="$TMP/models-odd.txt" \
+  expect_pass "unrecognised Flash-ish ids are skipped" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-disc4" "$TMP/prompt.txt"
+argv_has "the newest well-formed id is chosen" "--model" "gemini-4.2-flash"
+argv_lacks "an out-of-range version and an unknown suffix are both skipped" \
+  "gemini-99999-flash" "gemini-9.9-flash"
+
+# No Flash at all in the listing: fall back, and say so rather than inventing an id.
+cat > "$TMP/models-noflash.txt" <<'EOF'
+gemini-3.1-pro-high	Gemini 3.1 Pro (High)
+claude-sonnet-4-6	Claude Sonnet 4.6 (Thinking)
+gpt-oss-120b-medium	GPT-OSS 120B (Medium)
+EOF
+XDG_CACHE_HOME="$TMP/c-noflash" STUB_MODELS="$TMP/models-noflash.txt" \
+  expect_pass "a Flash-less listing falls back" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-disc5" "$TMP/prompt.txt"
+argv_has "the fallback id is used" "--model" "gemini-3.8-flash"
+expect_stderr "a Flash-less listing is reported" "no gemini-\*-flash id"
+
+# `agy models` failing (no auth, no network) must not fail the review.
+printf 'Please sign in to continue.\n' > "$TMP/models-err.txt"
+XDG_CACHE_HOME="$TMP/c-modelfail" STUB_MODELS_RC=1 STUB_MODELS="" \
+  STUB_MODELS_ERR="$TMP/models-err.txt" \
+  expect_pass "a failing models call still runs the review" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-disc6" "$TMP/prompt.txt"
+argv_has "the fallback id is used when the listing cannot be fetched" \
+  "--model" "gemini-3.8-flash"
+expect_stderr "the listing failure is reported with agy's own message" "Please sign in"
+
+# A hung `agy models` must not hang the review behind it.
+: > "$STUB_MODELS_CALLS"
+XDG_CACHE_HOME="$TMP/c-timeout" AGY_REVIEW_MODELS_TIMEOUT=1 STUB_MODELS_SLEEP=4 \
+  expect_pass "a hung models call times out and falls back" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-disc7" "$TMP/prompt.txt"
+expect_stderr "the timeout is reported" "timed out after 1s"
+argv_has "a timed-out listing still yields a usable model" "--model" "gemini-3.8-flash"
+
+# An explicit --model is the user pinning the reviewer: no listing call at all.
+: > "$STUB_MODELS_CALLS"
+XDG_CACHE_HOME="$TMP/c-explicit" expect_pass "an explicit --model is used as given" \
+  "$GOOD_STDOUT" --agy "$STUB" --model claude-opus-4-6-thinking \
+  --out "$TMP/run-disc8" "$TMP/prompt.txt"
+expect_models_calls "an explicit --model asks for no listing" 0
+expect_stderr "an explicit --model is labelled as such" "explicit --model"
+
+# --refresh-models alongside --model changes nothing, so it must not look like it did.
+: > "$STUB_MODELS_CALLS"
+XDG_CACHE_HOME="$TMP/c-explicit2" expect_pass "--refresh-models with --model still runs" \
+  "$GOOD_STDOUT" --agy "$STUB" --model gemini-3.6-flash --refresh-models \
+  --out "$TMP/run-disc9" "$TMP/prompt.txt"
+expect_stderr "--refresh-models with --model is called out" \
+  "has no effect alongside an explicit --model"
+expect_models_calls "--refresh-models with --model asks for no listing" 0
+
+# --- the cache -----------------------------------------------------------------------
+# A 3-second listing call on every review would be paid for nothing: the answer changes
+# every few months.
+: > "$STUB_MODELS_CALLS"
+XDG_CACHE_HOME="$TMP/c-cache" expect_pass "first run populates the cache" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-cache1" "$TMP/prompt.txt"
+XDG_CACHE_HOME="$TMP/c-cache" expect_pass "second run reuses it" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-cache2" "$TMP/prompt.txt"
+expect_models_calls "two runs, one listing call" 1
+argv_has "the cached id is still the right one" "--model" "gemini-3.8-flash"
+expect_stderr "a cache hit is labelled" "latest Flash, cached"
+
+CACHE_JSON="$TMP/c-cache/agy-review/latest-flash.json"
+if [ -f "$CACHE_JSON" ]; then
+  note_pass "the cache file is where it is documented to be"
+  cmode="$(stat -f '%Lp' "$TMP/c-cache/agy-review" 2>/dev/null || stat -c '%a' "$TMP/c-cache/agy-review")"
+  jmode="$(stat -f '%Lp' "$CACHE_JSON" 2>/dev/null || stat -c '%a' "$CACHE_JSON")"
+  if [ "$cmode" = "700" ]; then
+    note_pass "the cache directory is 0700"
+  else
+    note_fail "the cache directory is $cmode, expected 700"
+  fi
+  if [ "$jmode" = "600" ]; then
+    note_pass "the cache file is 0600"
+  else
+    note_fail "the cache file is $jmode, expected 600"
+  fi
+else
+  note_fail "no cache file at $CACHE_JSON"
+fi
+
+# --refresh-models is the escape hatch when a new generation lands mid-day.
+: > "$STUB_MODELS_CALLS"
+XDG_CACHE_HOME="$TMP/c-cache" STUB_MODELS="$TMP/models-newer.txt" \
+  expect_pass "--refresh-models re-asks" "$GOOD_STDOUT" \
+  --agy "$STUB" --refresh-models --out "$TMP/run-cache3" "$TMP/prompt.txt"
+expect_models_calls "--refresh-models forces a listing call" 1
+argv_has "--refresh-models picks up the newer generation" "--model" "gemini-4-flash"
+
+# TTL 0 means never trust the cache.
+: > "$STUB_MODELS_CALLS"
+XDG_CACHE_HOME="$TMP/c-cache" AGY_REVIEW_CACHE_TTL=0 \
+  expect_pass "TTL 0 re-asks" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-cache4" "$TMP/prompt.txt"
+expect_models_calls "AGY_REVIEW_CACHE_TTL=0 forces a listing call" 1
+
+# ...including a remembered failure, which is the other half of the cache.
+: > "$STUB_MODELS_CALLS"
+XDG_CACHE_HOME="$TMP/c-negttl" STUB_MODELS_RC=1 STUB_MODELS="" \
+  STUB_MODELS_ERR="$TMP/models-err.txt" \
+  expect_pass "a failure is remembered under the default TTL" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-negttl1" "$TMP/prompt.txt"
+XDG_CACHE_HOME="$TMP/c-negttl" AGY_REVIEW_CACHE_TTL=0 \
+  expect_pass "TTL 0 retries a remembered failure" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-negttl2" "$TMP/prompt.txt"
+expect_models_calls "AGY_REVIEW_CACHE_TTL=0 ignores the remembered failure too" 2
+argv_has "the TTL 0 retry resolves a real model" "--model" "gemini-3.8-flash"
+expect_stderr "the TTL 0 retry is a fresh listing, not a cache hit" \
+  "latest Flash from"
+
+XDG_CACHE_HOME="$TMP/c-cache" AGY_REVIEW_CACHE_TTL=nonsense \
+  expect_pass "an unparseable TTL still runs" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-cache5" "$TMP/prompt.txt"
+expect_stderr "an unparseable TTL is reported" "AGY_REVIEW_CACHE_TTL"
+
+# A cache is untrusted input: its id lands in agy's argv. Every rejected shape below must
+# cost one listing call, never a bad --model.
+write_cache_file() {   # write_cache_file DIR JSON
+  mkdir -p "$1/agy-review"
+  printf '%s' "$2" > "$1/agy-review/latest-flash.json"
+}
+NOW="$(python3 -c 'import time; print(int(time.time()))')"
+
+: > "$STUB_MODELS_CALLS"
+write_cache_file "$TMP/c-bad1" 'this is not json at all'
+XDG_CACHE_HOME="$TMP/c-bad1" expect_pass "a corrupt cache is ignored" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-bad1" "$TMP/prompt.txt"
+argv_has "a corrupt cache does not choose the model" "--model" "gemini-3.8-flash"
+expect_models_calls "a corrupt cache is refetched" 1
+
+: > "$STUB_MODELS_CALLS"
+write_cache_file "$TMP/c-bad2" "{\"model\":\"claude-opus-4-6-thinking\",\"agy\":\"$STUB\",\"fetched_at\":$NOW}"
+XDG_CACHE_HOME="$TMP/c-bad2" STUB_MODELS="$TMP/models-newer.txt" \
+  expect_pass "a non-Flash cached id is ignored" \
+  "$GOOD_STDOUT" --agy "$STUB" --out "$TMP/run-bad2" "$TMP/prompt.txt"
+argv_lacks "a planted cache cannot swap the reviewer" "claude-opus-4-6-thinking"
+argv_has "a planted cache is replaced by a real listing" "--model" "gemini-4-flash"
+
+: > "$STUB_MODELS_CALLS"
+write_cache_file "$TMP/c-bad3" "{\"model\":\"gemini-4-flash\",\"agy\":\"/somewhere/else/agy\",\"fetched_at\":$NOW}"
+XDG_CACHE_HOME="$TMP/c-bad3" expect_pass "a cache from another agy is ignored" \
+  "$GOOD_STDOUT" --agy "$STUB" --out "$TMP/run-bad3" "$TMP/prompt.txt"
+argv_has "another binary's cache does not answer for this one" \
+  "--model" "gemini-3.8-flash"
+expect_models_calls "another binary's cache is refetched" 1
+
+: > "$STUB_MODELS_CALLS"
+write_cache_file "$TMP/c-bad4" "{\"model\":\"gemini-4-flash\",\"agy\":\"$STUB\",\"fetched_at\":$((NOW - 200000))}"
+XDG_CACHE_HOME="$TMP/c-bad4" expect_pass "an expired cache is ignored" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-bad4" "$TMP/prompt.txt"
+argv_has "an expired cache is replaced" "--model" "gemini-3.8-flash"
+expect_models_calls "an expired cache is refetched" 1
+
+: > "$STUB_MODELS_CALLS"
+write_cache_file "$TMP/c-bad5" "{\"model\":\"gemini-4-flash\",\"agy\":\"$STUB\",\"fetched_at\":$((NOW + 200000))}"
+XDG_CACHE_HOME="$TMP/c-bad5" expect_pass "a cache from the future is ignored" \
+  "$GOOD_STDOUT" --agy "$STUB" --out "$TMP/run-bad5" "$TMP/prompt.txt"
+expect_models_calls "a future-dated cache is refetched" 1
+
+# A failed listing is remembered too, briefly: otherwise an offline machine pays the
+# timeout on every single review.
+: > "$STUB_MODELS_CALLS"
+XDG_CACHE_HOME="$TMP/c-negcache" STUB_MODELS_RC=1 STUB_MODELS="" \
+  STUB_MODELS_ERR="$TMP/models-err.txt" \
+  expect_pass "a failed listing is recorded" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-neg1" "$TMP/prompt.txt"
+XDG_CACHE_HOME="$TMP/c-negcache" STUB_MODELS_RC=1 STUB_MODELS="" \
+  STUB_MODELS_ERR="$TMP/models-err.txt" \
+  expect_pass "the next run does not retry it" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-neg2" "$TMP/prompt.txt"
+expect_models_calls "a remembered failure is not retried every run" 1
+argv_has "a remembered failure still yields the fallback model" \
+  "--model" "gemini-3.8-flash"
+expect_stderr "a remembered failure explains how to retry" "--refresh-models retries it"
+
+: > "$STUB_MODELS_CALLS"
+XDG_CACHE_HOME="$TMP/c-negcache" \
+  expect_pass "--refresh-models retries a remembered failure" "$GOOD_STDOUT" \
+  --agy "$STUB" --refresh-models --out "$TMP/run-neg3" "$TMP/prompt.txt"
+expect_models_calls "--refresh-models overrides the remembered failure" 1
+argv_has "the retry produces a real model" "--model" "gemini-3.8-flash"
+
+# A --refresh-models that cannot reach the listing must keep the answer it already
+# has rather than replacing a known-good id with the pinned fallback.
+: > "$STUB_MODELS_CALLS"
+XDG_CACHE_HOME="$TMP/c-keep" STUB_MODELS="$TMP/models-newer.txt" \
+  expect_pass "a good answer is cached first" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-keep1" "$TMP/prompt.txt"
+argv_has "the cached answer is the newer generation" "--model" "gemini-4-flash"
+XDG_CACHE_HOME="$TMP/c-keep" STUB_MODELS_RC=1 STUB_MODELS="" \
+  STUB_MODELS_ERR="$TMP/models-err.txt" \
+  expect_pass "a failed refresh still runs the review" "$GOOD_STDOUT" \
+  --agy "$STUB" --refresh-models --out "$TMP/run-keep2" "$TMP/prompt.txt"
+argv_has "a failed refresh keeps the cached id, not the fallback" \
+  "--model" "gemini-4-flash"
+argv_lacks "a failed refresh does not downgrade to the pinned id" "gemini-3.8-flash"
+expect_stderr "a failed refresh says what it kept" "keeping the cached gemini-4-flash"
+XDG_CACHE_HOME="$TMP/c-keep" STUB_MODELS="$TMP/models-newer.txt" \
+  expect_pass "the cache survived the failed refresh" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-keep3" "$TMP/prompt.txt"
+argv_has "the next run still has the cached id" "--model" "gemini-4-flash"
+
+# An unwritable cache directory is an inconvenience, not a failed review.
+mkdir -p "$TMP/c-ro"
+: > "$TMP/c-ro/agy-review"      # a FILE where the cache directory must go
+XDG_CACHE_HOME="$TMP/c-ro" expect_pass "an unwritable cache does not fail the run" \
+  "$GOOD_STDOUT" --agy "$STUB" --out "$TMP/run-ro" "$TMP/prompt.txt"
+argv_has "an unwritable cache still resolves a model" "--model" "gemini-3.8-flash"
+expect_stderr "an unwritable cache is warned about" "could not write the model cache"
+
+# --- the output token limit: retried a rung lower, or explained ----------------------
+# This failure arrives AFTER the model has run and been paid for, with either exit code,
+# so the run is already spent — reporting it without retrying wastes the whole attempt.
+# `$TMP/token-limit.json` is the envelope a real limit failure produced.
+
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" STUB_STDOUT="$TMP/token-limit.json" \
+  STUB_STDOUT_2="$TMP/good.json" \
+  expect_pass "a limit failure is retried a rung lower" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-retry1" "$TMP/prompt.txt"
+expect_calls "the retry costs exactly one more run" 2
+expect_stderr "the retry is announced with both efforts" \
+  "exceeded the output token limit; retrying at --effort medium"
+expect_stderr "the summary names the effort that produced the review" \
+  "effort=medium attempts=2"
+ARGV_FILE_OVERRIDE="$STUB_ARGV.1" argv_equals "attempt 1 runs at the default effort" \
+  "-p" "$PROMPT_ARG" "--model" "gemini-3.8-flash" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
+  "--effort" "high"
+ARGV_FILE_OVERRIDE="$STUB_ARGV.2" argv_equals "attempt 2 differs only in the effort" \
+  "-p" "$PROMPT_ARG" "--model" "gemini-3.8-flash" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
+  "--effort" "medium"
+
+# The failed attempt is the evidence that the retry was warranted, so it is kept.
+if [ -f "$TMP/run-retry1/out.json" ] && [ -f "$TMP/run-retry1/out-2.json" ]; then
+  note_pass "both attempts keep their raw report"
+  if grep -q "output token limit" "$TMP/run-retry1/out.json"; then
+    note_pass "the first report still holds the limit failure"
+  else
+    note_fail "the first report was overwritten by the retry"
+  fi
+  rmode="$(stat -f '%Lp' "$TMP/run-retry1/out-2.json" 2>/dev/null || stat -c '%a' "$TMP/run-retry1/out-2.json")"
+  if [ "$rmode" = "600" ]; then
+    note_pass "the retry's report is 0600 like the first"
+  else
+    note_fail "the retry's report is $rmode, expected 600"
+  fi
+else
+  note_fail "the retry did not keep one report per attempt"
+fi
+
+# The ladder is finite: high, medium, low, then stop.
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" STUB_STDOUT="$TMP/token-limit.json" \
+  expect_fail "an exhausted ladder fails rather than looping" 1 \
+  "effort tried: high, medium, low" \
+  --agy "$STUB" --out "$TMP/run-retry2" "$TMP/prompt.txt"
+expect_calls "the ladder stops at low" 3
+expect_stderr "the exhausted ladder leads with the keep-the-effort lever" \
+  "split the bundle and review it in parts"
+expect_stderr "the exhausted ladder says agy has no budget flag" \
+  "agy has no budget flag"
+expect_stderr "the exhausted ladder puts the thinking numbers on the record" \
+  "54977 of its 55850"
+
+# --no-retry is for a caller who wants the effort they asked for, or nothing.
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" STUB_STDOUT="$TMP/token-limit.json" \
+  expect_fail "--no-retry keeps the effort and fails" 1 "drop --no-retry" \
+  --agy "$STUB" --no-retry --out "$TMP/run-retry3" "$TMP/prompt.txt"
+expect_calls "--no-retry runs exactly once" 1
+expect_stderr "--no-retry still names the keep-the-effort route" "split the bundle"
+
+# A suffixed id carries its effort in the id, and the sibling id need not exist —
+# gemini-3.1-pro has no -medium — so the step down is handed back, never invented.
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" STUB_STDOUT="$TMP/token-limit.json" \
+  expect_fail "a suffixed id is not stepped down" 1 \
+  "re-run as --model gemini-3.8-flash --effort medium" \
+  --agy "$STUB" --model gemini-3.8-flash-high --out "$TMP/run-retry4" "$TMP/prompt.txt"
+expect_calls "a suffixed id runs once" 1
+argv_lacks "no sibling id is invented" "gemini-3.8-flash-medium" "--effort"
+
+# A model with no effort control at all.
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" STUB_STDOUT="$TMP/token-limit.json" \
+  expect_fail "a model without an effort setting says so" 1 "takes no effort setting" \
+  --agy "$STUB" --model claude-opus-4-6-thinking --out "$TMP/run-retry5" "$TMP/prompt.txt"
+expect_calls "a model without an effort setting runs once" 1
+
+# Only THIS error is retried. Anything else means a second run buys the same answer
+# twice — the exact waste this whole branch exists to avoid.
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" STUB_STDOUT="$TMP/error-status.json" \
+  expect_fail "a different error is not retried" 1 "invalid model selection" \
+  --agy "$STUB" --out "$TMP/run-retry6" "$TMP/prompt.txt"
+expect_calls "a non-limit error runs once" 1
+
+# The limit failure has been seen with a non-zero exit too, and the exit-code branch
+# used to run first — a retryable failure must not be reported as a dead end.
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" STUB_RC_1=1 STUB_STDOUT="$TMP/token-limit.json" \
+  STUB_STDOUT_2="$TMP/good.json" \
+  expect_pass "a limit failure on a non-zero exit is still retried" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-retry7" "$TMP/prompt.txt"
+expect_calls "the non-zero-exit limit failure is retried once" 2
+
+# An explicitly requested effort is stepped down too — a review at medium beats none —
+# but only where the effort travels in the flag.
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" STUB_STDOUT="$TMP/token-limit.json" \
+  STUB_STDOUT_2="$TMP/good.json" \
+  expect_pass "an explicit --effort is stepped down as well" "$GOOD_STDOUT" \
+  --agy "$STUB" --model gemini-3.8-flash --effort high --out "$TMP/run-retry8" \
+  "$TMP/prompt.txt"
+ARGV_FILE_OVERRIDE="$STUB_ARGV.2" argv_has "the retry lowered the explicit effort" \
+  "--effort" "medium"
+
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" STUB_STDOUT="$TMP/token-limit.json" \
+  expect_fail "the bottom rung has nothing below it" 1 "effort tried: low" \
+  --agy "$STUB" --model gemini-3.8-flash --effort low --out "$TMP/run-retry9" \
+  "$TMP/prompt.txt"
+expect_calls "the bottom rung runs once" 1
+
+# A big prompt at high effort is where this failure lives, so say so before the run
+# rather than after the bill.
+python3 -c 'import sys; open(sys.argv[1], "w").write("Review this:\n" + "x\n" * 30000)' \
+  "$TMP/big-prompt.txt"
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" expect_pass "a large prompt still runs" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-big" "$TMP/big-prompt.txt"
+expect_stderr "a large prompt at high effort is flagged before the run" \
+  "KB of prompt at --effort high"
+XDG_CACHE_HOME="$TMP/c-retry" expect_pass "an ordinary prompt runs unremarked" \
+  "$GOOD_STDOUT" --agy "$STUB" --out "$TMP/run-small" "$TMP/prompt.txt"
+expect_stderr_absent "an ordinary prompt is not flagged" "KB of prompt at --effort high"
+
+# --check validates an envelope, so the run options the retry added are rejected there
+# too rather than silently ignored.
+expect_fail "--check with --no-retry" 2 "takes no run options" \
+  --check "$TMP/good.json" --no-retry
+
 # --- meta-tests: prove each helper can actually go red -------------------------------
 # Without these, a crashing binary or a mis-wired assertion would make cases pass by
 # accident — which is exactly the defect this suite exists to catch in agy itself.
@@ -611,6 +1128,32 @@ STUB_ARGV="$TMP/no-such-argv.txt" meta_expect_red \
 STUB_ARGV="$TMP/no-such-argv.txt" meta_expect_red \
   "argv_has fails when the capture is missing" \
   argv_has "META" "--model"
+
+# The two helpers added for model discovery must be able to go red as well.
+run_bin --check "$TMP/good.json"    # a run whose stderr holds no warning at all
+meta_expect_red "expect_stderr notices a message that is absent" \
+  expect_stderr "META" "this string never appears on stderr"
+
+: > "$STUB_MODELS_CALLS"
+meta_expect_red "expect_models_calls notices the wrong count" \
+  expect_models_calls "META" 7
+
+: > "$STUB_CALLS"
+meta_expect_red "expect_calls notices the wrong count" \
+  expect_calls "META" 7
+
+# The per-attempt captures are a new way for an assertion to pass on nothing: a case
+# that names an attempt the ladder never reached must fail, not read as "absent".
+seed_argv
+ARGV_FILE_OVERRIDE="$TMP/no-such-attempt.bin" meta_expect_red \
+  "argv_equals fails when the named attempt never ran" \
+  argv_equals "META" "--model" "gemini-3.8-flash"
+
+# Needs a run that DOES print to stderr: a --check success prints nothing, so the
+# absence would hold for the wrong reason and the meta-test could never go red.
+run_bin --agy "$STUB" --out "$TMP/run-meta-absent" "$TMP/prompt.txt"
+meta_expect_red "expect_stderr_absent notices a message that IS present" \
+  expect_stderr_absent "META" "raw output"
 
 echo
 echo "passed=$pass failed=$fail"

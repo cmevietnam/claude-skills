@@ -44,6 +44,32 @@ build; a consumer Gemini Pro subscription does not change it. Full record in
 (`--effort low|medium|high`) and serves Claude and GPT-OSS models next to Gemini, so a
 two-reviewer diff is one flag.
 
+## The default model does not go stale
+
+Google ships a new Flash generation every few months and the old id keeps working, so a
+pinned default quietly reviews with a superseded model and nothing ever says so. With no
+`--model`, `agy-review` asks `agy models` for the newest `gemini-<version>-flash`,
+comparing versions as numbers rather than strings, and prints the id it chose next to
+where it came from. The answer is cached for a day; a listing that cannot be fetched falls
+back to a pinned id with a warning rather than failing the review. `--model <id>` pins the
+reviewer when a result has to be reproducible.
+
+## A run that overruns the output budget is not thrown away
+
+`agy` reports `exceeded the output token limit` **after** the model has run, so the
+attempt is already paid for — and thinking tokens dominate that budget (a successful
+92 KB review spent 54977 of its 55850 output tokens thinking). `agy --help` has no flag
+that raises it: only `--model` and `--effort` move it.
+
+So `agy-review` steps the effort one rung down and runs again (high → medium → low),
+keeps every attempt's raw report, and prints which effort actually produced the review —
+findings are attributed to that, not to the effort you asked for.
+
+To keep the effort instead, shrink the input: the budget is spent per run, so half the
+diff is half the thinking. `--no-retry` turns the ladder off, and
+`skills/antigravity/references/review-prompts.md` carries the split-and-merge recipe
+along with what it costs (cross-file findings are the price).
+
 ## Relationship to `codex` and `review`
 
 The [`review`](../review) plugin runs adversarial review with multiple **Claude** models
