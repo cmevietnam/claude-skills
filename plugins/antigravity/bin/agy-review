@@ -15,6 +15,8 @@ Options:
                  offers, resolved at run time and cached for a day. Pass an id to pin
                  the reviewer instead.
   --refresh-models  ignore the cached answer and ask `agy models` again
+  --no-retry     do not step the effort down and retry when agy reports that the answer
+                 exceeded the output token limit
   --effort E     low|medium|high. Given explicitly it is ALWAYS forwarded, even to a
                  model that rejects it, so agy's own error surfaces. See below for when
                  the default is applied.
@@ -38,6 +40,22 @@ is cached under $XDG_CACHE_HOME/agy-review (falling back to ~/.cache) for a day.
 list cannot be fetched, a cached id is kept if there is one and the pinned fallback used
 otherwise — never a failed run — and stderr says which. Which model was used, and where
 the id came from, is printed before the run.
+
+Output token limit: agy answers `status=ERROR`, `response=""`,
+`error="...exceeded the output token limit..."` when the answer overruns the model's
+output budget — and thinking tokens dominate that budget, so a big prompt at a high
+effort fails AFTER the model has already run and been paid for. The documented lever is
+to think less, not more: on a 92 KB bundle `--effort high` failed twice where
+`--effort medium` succeeded. So this wrapper steps the effort one rung down and runs
+again, keeping every attempt's raw report, until the ladder runs out. It only steps an
+effort it passes as a FLAG: stepping `gemini-3.1-pro-high` down would mean inventing
+`gemini-3.1-pro-medium`, which agy does not offer.
+
+To keep the effort instead, shrink the input: the budget is per run, so reviewing half a
+diff spends half the thinking at the same effort. `agy --help` has no budget flag — only
+--model and --effort move it — and capping the visible answer buys little, since a
+measured run spent 54977 of its 55850 output tokens on thinking. Both routes are printed
+when a run cannot be retried.
 
 Environment:
   AGY_REVIEW_CACHE_TTL       seconds to trust the cached id (default 86400, 0 = never)
@@ -84,6 +102,17 @@ FAILURE_TTL = 600.0        # ...but an offline machine must not pay the timeout 
 
 # Distinguishes "no usable cache" from "the cache remembers a recent failure".
 CACHED_FAILURE = object()
+
+# agy's wording when the answer overruns the output budget. Matched as a lowercase
+# substring because the rest of the message varies ("Retries remaining: 3").
+OUTPUT_LIMIT_MARKER = "output token limit"
+
+# agy's effort ladder, strongest first.
+EFFORT_LADDER = ("high", "medium", "low")
+
+# A 92 KB prompt at --effort high was observed to hit the limit twice, and to succeed at
+# medium. Warn a little below that, where the run is worth a heads-up but not a refusal.
+LARGE_PROMPT_BYTES = 50 * 1024
 
 # The review is UTF-8 whatever the locale says: agy emits UTF-8, and printing it through
 # an ASCII stdout would raise UnicodeEncodeError on a perfectly good review.
@@ -138,6 +167,96 @@ def takes_effort(model):
     if model.endswith(EFFORT_SUFFIXES):
         return False
     return bool(re.match(r"^gemini-", model))
+
+
+def strip_effort_suffix(model):
+    """`gemini-3.8-flash-high` -> `gemini-3.8-flash`; anything else unchanged."""
+    for suffix in EFFORT_SUFFIXES:
+        if model.endswith(suffix):
+            return model[: -len(suffix)]
+    return model
+
+
+def lower_effort(effort):
+    """The next rung down agy's effort ladder, or None at the bottom or off it."""
+    if effort not in EFFORT_LADDER:
+        return None
+    nxt = EFFORT_LADDER.index(effort) + 1
+    return EFFORT_LADDER[nxt] if nxt < len(EFFORT_LADDER) else None
+
+
+def envelope_error_text(raw):
+    """The `error` string in an envelope, or "".
+
+    Never raises: this runs on a failure path, where a parse problem must not replace
+    the failure it was called to explain.
+    """
+    try:
+        env = json.loads(raw)
+    except (ValueError, RecursionError):
+        return ""
+    if isinstance(env, dict) and isinstance(env.get("error"), str):
+        return env["error"]
+    return ""
+
+
+def hit_output_limit(error_text):
+    return OUTPUT_LIMIT_MARKER in error_text.lower()
+
+
+def limit_guidance(model, tried, no_retry):
+    """Why the limit failure could not be retried away, and what is actually left.
+
+    Ordered by what the measurements support rather than by what sounds plausible.
+    `agy --help` exposes no budget flag at all — only --model and --effort move it — and
+    thinking dominates the budget: a successful 92 KB review reported output_tokens
+    55850 of which thinking_tokens 54977. So shrinking the INPUT is the lever that keeps
+    the effort, and capping the visible answer is close to free of effect.
+    """
+    keep = [
+        "split the bundle and review it in parts — the budget is per run, so half the "
+        "diff is half the thinking, at the same effort",
+        "switch to a model with a different budget at the same effort: "
+        "--model gemini-3.1-pro-high, or a claude id",
+    ]
+    lower = []
+    if no_retry:
+        nxt = lower_effort(tried[-1]) if tried else None
+        if nxt is not None:
+            lower.append(
+                f"drop --no-retry, or pass --effort {nxt}, to make it think less"
+            )
+    elif model is not None and not takes_effort(model):
+        base = strip_effort_suffix(model)
+        if base != model:
+            lower.append(
+                f"re-run as --model {base} --effort medium — the effort is baked into "
+                f"{model}, and stepping a suffixed id down is left to you because the "
+                "sibling id need not exist (gemini-3.1-pro has no -medium)"
+            )
+        else:
+            lower.append(
+                f"{model} takes no effort setting; only a different model or a smaller "
+                "bundle can make it think less"
+            )
+
+    lines = [
+        "the model ran and its answer — thinking tokens included — overran the output "
+        "budget, so re-running it unchanged cannot help. agy has no budget flag: only "
+        "--model and --effort move it."
+    ]
+    if tried:
+        lines.append("effort tried: " + ", ".join(tried))
+    lines.append("keeping the effort:")
+    lines += [f"  - {s}" for s in keep]
+    if lower:
+        lines.append("or lowering it:")
+        lines += [f"  - {s}" for s in lower]
+    lines.append(
+        "capping the answer buys little: a measured run spent 54977 of its 55850 "
+        "output tokens on thinking, so the visible answer is ~2% of the budget."
+    )
+    return "\n".join(lines)
 
 
 def read_text(path):
@@ -480,6 +599,7 @@ def main():
     ap.add_argument("--timeout", default=None)
     ap.add_argument("--agy")
     ap.add_argument("--refresh-models", action="store_true")
+    ap.add_argument("--no-retry", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
     args = ap.parse_args()
 
@@ -509,6 +629,7 @@ def main():
                 ("--model", args.model),
                 ("--timeout", args.timeout),
                 ("--refresh-models", args.refresh_models or None),
+                ("--no-retry", args.no_retry or None),
             )
             if value is not None
         ]
@@ -591,19 +712,6 @@ def main():
     else:
         model, model_source = resolve_default_model(binary, args.refresh_models)
 
-    cmd = [
-        binary,
-        "-p", prompt,
-        "--model", model,
-        "--disable-slash-commands",
-        "--output-format", "json",
-        "--print-timeout", timeout,
-    ]
-    if args.effort is not None:
-        cmd += ["--effort", args.effort]
-    elif takes_effort(model):
-        cmd += ["--effort", "high"]
-
     def private_create(path):
         """Create at exactly 0600, never following a symlink.
 
@@ -619,29 +727,106 @@ def main():
             pass
         return os.fdopen(fd, "w+b")
 
-    # Announce the paths BEFORE running: a pre-exec failure (a bad shebang in the target,
-    # say) would otherwise leave an implicitly created temp directory nobody can find.
-    # The model goes here too, so a fallback is visible even when the run then fails —
-    # every finding has to be reported with the model that produced it.
-    print(f"model:      {model} ({model_source})", file=sys.stderr)
-    print(f"raw output: {out_path}", file=sys.stderr)
-    print(f"stderr:     {err_path}", file=sys.stderr)
+    # The effort this run owns. An explicit --effort is forwarded verbatim; the default
+    # is applied only where agy accepts it. Only an effort that travels in the FLAG can
+    # be stepped down on a retry — stepping a suffixed id would mean inventing
+    # `gemini-3.1-pro-medium`, which agy does not offer.
+    effort = args.effort if args.effort is not None else (
+        "high" if takes_effort(model) else None
+    )
+    steppable = takes_effort(model) and not args.no_retry
 
-    envelope_bytes = None
-    try:
-        with private_create(out_path) as out_f, private_create(err_path) as err_f:
-            rc = subprocess.call(cmd, stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f)
-            # Read the envelope back through the SAME descriptor we handed the child.
-            # Re-opening by pathname would let anyone who can write the output directory
-            # unlink out.json and drop a forged SUCCESS envelope in its place between the
-            # run and the check.
-            out_f.flush()
-            out_f.seek(0)
-            envelope_bytes = out_f.read()
-    except OSError as e:
-        die(f"FAILED: could not run {binary}: {e}", 2)
-    except ValueError as e:
-        die(f"FAILED: could not run {binary}: {e}", 2)
+    prompt_bytes = len(prompt.encode("utf-8", "surrogateescape"))
+    if prompt_bytes >= LARGE_PROMPT_BYTES and effort == "high":
+        print(
+            f"warning: {prompt_bytes // 1024} KB of prompt at --effort high. Thinking "
+            "tokens count against the output budget: a 92 KB bundle exceeded the output "
+            "token limit at high effort and succeeded at medium. A limit failure here is "
+            "retried a rung lower.",
+            file=sys.stderr,
+        )
+
+    tried = []
+    while True:
+        attempt = len(tried) + 1
+        if attempt > 1:
+            # Each attempt keeps its own raw report: the failed one is the evidence that
+            # the retry was warranted, and overwriting it would destroy that.
+            out_path = os.path.join(out_dir, f"out-{attempt}.json")
+            err_path = os.path.join(out_dir, f"err-{attempt}.txt")
+            for path in (out_path, err_path):
+                if os.path.lexists(path):
+                    die(
+                        f"FAILED: {path} already exists — pick a different --out so an "
+                        "earlier run's raw report is not overwritten",
+                        2,
+                    )
+
+        cmd = [
+            binary,
+            "-p", prompt,
+            "--model", model,
+            "--disable-slash-commands",
+            "--output-format", "json",
+            "--print-timeout", timeout,
+        ]
+        if effort is not None:
+            cmd += ["--effort", effort]
+
+        # Announce the paths BEFORE running: a pre-exec failure (a bad shebang in the
+        # target, say) would otherwise leave an implicitly created temp directory nobody
+        # can find. The model goes here too, so a fallback is visible even when the run
+        # then fails — every finding has to be reported with the model that produced it.
+        print(
+            f"model:      {model} ({model_source})"
+            + (f", effort {effort}" if effort is not None else ""),
+            file=sys.stderr,
+        )
+        print(f"raw output: {out_path}", file=sys.stderr)
+        print(f"stderr:     {err_path}", file=sys.stderr)
+
+        envelope_bytes = None
+        try:
+            with private_create(out_path) as out_f, private_create(err_path) as err_f:
+                rc = subprocess.call(
+                    cmd, stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f
+                )
+                # Read the envelope back through the SAME descriptor we handed the child.
+                # Re-opening by pathname would let anyone who can write the output
+                # directory unlink out.json and drop a forged SUCCESS envelope in its
+                # place between the run and the check.
+                out_f.flush()
+                out_f.seek(0)
+                envelope_bytes = out_f.read()
+        except OSError as e:
+            die(f"FAILED: could not run {binary}: {e}", 2)
+        except ValueError as e:
+            die(f"FAILED: could not run {binary}: {e}", 2)
+
+        tried.append(effort if effort is not None else "n/a")
+
+        # The limit error arrives with either exit code, so it is inspected before the
+        # exit-code branch below: a retryable failure must not be reported as a dead end.
+        # Only THIS error is retried — every other one means running again changes
+        # nothing, and would just bill a second time for the same answer.
+        if hit_output_limit(
+            envelope_error_text(envelope_bytes.decode("utf-8", "replace"))
+        ):
+            nxt = lower_effort(effort) if steppable else None
+            if nxt is not None:
+                print(
+                    f"warning: attempt {attempt} at --effort {effort} exceeded the "
+                    f"output token limit; retrying at --effort {nxt}. The failed "
+                    f"attempt is kept at {out_path}.",
+                    file=sys.stderr,
+                )
+                effort = nxt
+                continue
+            die(
+                f"FAILED: {limit_guidance(model, tried, args.no_retry)}\n"
+                f"— see {err_path}"
+            )
+        break
 
     # A non-zero exit is reported with its code before any envelope complaint, so the
     # real failure is never masked by "empty output file".
@@ -669,7 +854,8 @@ def main():
 
     usage = env.get("usage") or {}
     print(
-        f"model={model} conversation={env.get('conversation_id')} "
+        f"model={model} effort={tried[-1]} attempts={len(tried)} "
+        f"conversation={env.get('conversation_id')} "
         f"tokens={usage.get('total_tokens')} turns={env.get('num_turns')}",
         file=sys.stderr,
     )

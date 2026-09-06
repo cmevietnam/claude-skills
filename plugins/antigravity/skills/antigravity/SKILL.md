@@ -63,6 +63,7 @@ print anything unless the envelope proves a review actually happened:
 ```bash
 agy-review [--model M] [--effort E] [--out DIR] PROMPT_FILE   # run, validate, print
 agy-review --refresh-models [...] PROMPT_FILE                  # re-ask which Flash is newest
+agy-review --no-retry [...] PROMPT_FILE                        # never step the effort down
 agy-review --check out.json                                    # validate an existing run
 ```
 
@@ -279,14 +280,22 @@ like any other denied run; `--check` is what catches it.
 
 - **`Please sign in`** — headless cannot authenticate. The user runs `agy` in a **real
   terminal** (not `!` in Claude Code, which has no TTY: `bubbletea: could not open TTY`).
-- **`exceeded the output token limit`** — `status: ERROR` with an empty response.
-  **Thinking tokens count against that budget**, and they dominate: a successful 92 KB
-  review reported `output_tokens: 55850` of which `thinking_tokens: 54977`. Two levers,
-  in this order:
-  1. **Lower the effort.** On a 92 KB bundle, `--effort high` failed twice and
-     `--effort medium` succeeded on the same prompt. Big input wants less effort, not more.
-  2. Bound the answer in the prompt: "at most 6 findings, each at most 6 lines, quote only
-     the line you object to".
+- **`exceeded the output token limit`** — `status: ERROR` with an empty response, and it
+  arrives **after** the model has run, so the attempt is already spent. **Thinking tokens
+  count against that budget and dominate it**: a successful 92 KB review reported
+  `output_tokens: 55850` of which `thinking_tokens: 54977`. `agy --help` offers no flag
+  for the budget — only `--model` and `--effort` move it.
+
+  `agy-review` **retries one effort rung lower** (high → medium → low), keeps each
+  attempt's raw report (`out.json`, `out-2.json`, …), and prints
+  `effort=… attempts=…` — the effort on that line is the one the findings are attributed
+  to, not the one you asked for.
+
+  **To keep the effort, shrink the input.** The budget is per run, so half the diff is
+  half the thinking: `references/review-prompts.md` has the split-and-merge recipe, and
+  `--no-retry` turns the ladder off so a run either answers at the effort you asked for
+  or fails. A different model has a different budget, also at full effort. Bounding the
+  answer in the prompt buys little — the visible answer was ~2% of that budget.
 
   Invisible to anything that reads `.response` without checking `.error`; `agy-review`
   catches it.

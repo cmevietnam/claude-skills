@@ -116,6 +116,11 @@ comfortably as an argument.
 Subcommands: `models`, `agents`, `mcp`, `plugin`, `install`, `update`, `changelog`,
 `remote-control`, `mic-serve`.
 
+**There is no flag for the output or thinking budget.** The full `agy --help` flag list is
+the table above; nothing in it raises the limit that produces
+`exceeded the output token limit`. Only `--model` and `--effort` move that budget, which
+is why the remaining lever is to shrink the input.
+
 `agy models` prints the listing on **stdout**, one `<id>\t<label>` per line, and its
 `Fetching available models...` progress note on **stderr** — so the listing can be parsed
 without filtering. It needs auth and a network round-trip (~3s measured); `agy-review`

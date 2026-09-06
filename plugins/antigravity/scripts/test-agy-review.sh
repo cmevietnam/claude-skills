@@ -35,6 +35,13 @@ STUB_MODELS_CALLS="$TMP/models-calls.txt"
 export STUB_MODELS_CALLS
 : > "$STUB_MODELS_CALLS"
 
+# One line per review call, so a retry ladder can be counted. The stub also writes
+# "$STUB_ARGV.<n>" per attempt, which is what ARGV_FILE_OVERRIDE points the argv
+# assertions at when a case cares about an attempt other than the last.
+STUB_CALLS="$TMP/review-calls.txt"
+export STUB_CALLS
+: > "$STUB_CALLS"
+
 # The default model is discovered and cached. Pin the cache inside the suite's own
 # directory so no case can read, write or invalidate the real user's cache.
 export XDG_CACHE_HOME="$TMP/cache"
@@ -50,7 +57,7 @@ note_fail() { echo "FAIL  $1"; fail=$((fail + 1)); }
 run_bin() {
   # Drop any previous argv capture so a stale one cannot satisfy this run's assertions.
   case "$STUB_ARGV" in
-    "$TMP"/*) rm -f "$STUB_ARGV" ;;
+    "$TMP"/*) rm -f "$STUB_ARGV" "$STUB_ARGV".[0-9] ;;
     *) echo "FATAL: refusing to delete $STUB_ARGV, outside $TMP"; exit 1 ;;
   esac
   python3 "$BIN" "$@" >"$TMP/.stdout" 2>"$TMP/.stderr"
@@ -94,10 +101,14 @@ expect_fail() {
 # An argv assertion is only meaningful if the capture exists. Without this guard, a
 # missing capture makes every match fail, which argv_lacks would read as "absent" — the
 # same silence-passes bug this suite exists to prevent.
+# Which capture the argv assertions read: the last review call by default, or one
+# attempt of a retry ladder when ARGV_FILE_OVERRIDE names it.
+argv_file() { printf '%s' "${ARGV_FILE_OVERRIDE:-$STUB_ARGV}"; }
+
 argv_capture_ok() {
   local name="$1"
-  if [ ! -s "$STUB_ARGV" ]; then
-    note_fail "$name: no argv capture at $STUB_ARGV — the stub never ran"
+  if [ ! -s "$(argv_file)" ]; then
+    note_fail "$name: no argv capture at $(argv_file) — the stub never ran that far"
     return 1
   fi
   return 0
@@ -110,7 +121,7 @@ argv_capture_ok() {
 argv_equals() {
   local name="$1"; shift
   argv_capture_ok "$name" || return
-  if ARGV_FILE="$STUB_ARGV" python3 - "$@" <<'PY'
+  if ARGV_FILE="$(argv_file)" python3 - "$@" <<'PY'
 import os, sys
 want = sys.argv[1:]
 got = open(os.environ["ARGV_FILE"], "rb").read().split(b"\0")
@@ -136,7 +147,7 @@ argv_has() {
   argv_capture_ok "$name" || return
   local missing=""
   for want in "$@"; do
-    ARGV_FILE="$STUB_ARGV" python3 -c '
+    ARGV_FILE="$(argv_file)" python3 -c '
 import os, sys
 got = open(os.environ["ARGV_FILE"], "rb").read().split(b"\0")
 sys.exit(0 if sys.argv[1].encode() in got else 1)' "$want" || missing="$missing $want"
@@ -154,7 +165,7 @@ argv_lacks() {
   argv_capture_ok "$name" || return
   local present=""
   for bad in "$@"; do
-    ARGV_FILE="$STUB_ARGV" python3 -c '
+    ARGV_FILE="$(argv_file)" python3 -c '
 import os, sys
 got = open(os.environ["ARGV_FILE"], "rb").read().split(b"\0")
 sys.exit(0 if sys.argv[1].encode() in got else 1)' "$bad" && present="$present $bad"
@@ -196,6 +207,32 @@ expect_stderr() {
     note_pass "$name"
   else
     note_fail "$name: stderr lacked '$want' — got: ${STDERR:0:200}"
+  fi
+}
+
+# expect_stderr_absent NAME PATTERN -- the last run's stderr must NOT contain PATTERN.
+# Only ever used where a companion case proves the same message CAN appear, since an
+# absence on its own cannot tell a working check from one that never ran.
+expect_stderr_absent() {
+  local name="$1" unwanted="$2"
+  if printf '%s' "$STDERR" | grep -q -- "$unwanted"; then
+    note_fail "$name: stderr unexpectedly contained '$unwanted'"
+  else
+    note_pass "$name"
+  fi
+}
+
+# expect_calls NAME COUNT -- how many review calls the stub answered.
+# Reset the counter with `: > "$STUB_CALLS"` before the run being measured.
+expect_calls() {
+  local name="$1" want="$2" got=0
+  if [ -f "$STUB_CALLS" ]; then
+    got="$(wc -l < "$STUB_CALLS" | tr -d ' ')"
+  fi
+  if [ "$got" = "$want" ]; then
+    note_pass "$name"
+  else
+    note_fail "$name: agy ran $got times, expected $want"
   fi
 }
 
@@ -378,11 +415,18 @@ if [ "${1:-}" = "models" ]; then
   exit "${STUB_MODELS_RC:-0}"
 fi
 # Records its argv NUL-delimited so arguments containing newlines keep their boundaries,
-# then emits whatever the fixture files dictate.
+# then emits whatever the fixture files dictate. The attempt number picks the fixture, so
+# a retry ladder can be driven: STUB_STDOUT_2 answers the second attempt, STUB_STDOUT the
+# rest; STUB_RC_<n> does the same for the exit code.
+echo "review" >> "$STUB_CALLS"
+N="$(wc -l < "$STUB_CALLS" | tr -d ' ')"
 printf '%s\0' "$@" > "$STUB_ARGV"
-cat "$STUB_STDOUT"
+printf '%s\0' "$@" > "$STUB_ARGV.$N"
+OUT_VAR="STUB_STDOUT_$N"
+RC_VAR="STUB_RC_$N"
+cat "${!OUT_VAR:-$STUB_STDOUT}"
 [ -n "${STUB_STDERR:-}" ] && cat "$STUB_STDERR" >&2
-exit "${STUB_RC:-0}"
+exit "${!RC_VAR:-${STUB_RC:-0}}"
 EOF
 chmod +x "$STUB"
 
@@ -890,6 +934,140 @@ XDG_CACHE_HOME="$TMP/c-ro" expect_pass "an unwritable cache does not fail the ru
 argv_has "an unwritable cache still resolves a model" "--model" "gemini-3.8-flash"
 expect_stderr "an unwritable cache is warned about" "could not write the model cache"
 
+# --- the output token limit: retried a rung lower, or explained ----------------------
+# This failure arrives AFTER the model has run and been paid for, with either exit code,
+# so the run is already spent — reporting it without retrying wastes the whole attempt.
+# `$TMP/token-limit.json` is the envelope a real limit failure produced.
+
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" STUB_STDOUT="$TMP/token-limit.json" \
+  STUB_STDOUT_2="$TMP/good.json" \
+  expect_pass "a limit failure is retried a rung lower" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-retry1" "$TMP/prompt.txt"
+expect_calls "the retry costs exactly one more run" 2
+expect_stderr "the retry is announced with both efforts" \
+  "exceeded the output token limit; retrying at --effort medium"
+expect_stderr "the summary names the effort that produced the review" \
+  "effort=medium attempts=2"
+ARGV_FILE_OVERRIDE="$STUB_ARGV.1" argv_equals "attempt 1 runs at the default effort" \
+  "-p" "$PROMPT_ARG" "--model" "gemini-3.8-flash" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
+  "--effort" "high"
+ARGV_FILE_OVERRIDE="$STUB_ARGV.2" argv_equals "attempt 2 differs only in the effort" \
+  "-p" "$PROMPT_ARG" "--model" "gemini-3.8-flash" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
+  "--effort" "medium"
+
+# The failed attempt is the evidence that the retry was warranted, so it is kept.
+if [ -f "$TMP/run-retry1/out.json" ] && [ -f "$TMP/run-retry1/out-2.json" ]; then
+  note_pass "both attempts keep their raw report"
+  if grep -q "output token limit" "$TMP/run-retry1/out.json"; then
+    note_pass "the first report still holds the limit failure"
+  else
+    note_fail "the first report was overwritten by the retry"
+  fi
+  rmode="$(stat -f '%Lp' "$TMP/run-retry1/out-2.json" 2>/dev/null || stat -c '%a' "$TMP/run-retry1/out-2.json")"
+  if [ "$rmode" = "600" ]; then
+    note_pass "the retry's report is 0600 like the first"
+  else
+    note_fail "the retry's report is $rmode, expected 600"
+  fi
+else
+  note_fail "the retry did not keep one report per attempt"
+fi
+
+# The ladder is finite: high, medium, low, then stop.
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" STUB_STDOUT="$TMP/token-limit.json" \
+  expect_fail "an exhausted ladder fails rather than looping" 1 \
+  "effort tried: high, medium, low" \
+  --agy "$STUB" --out "$TMP/run-retry2" "$TMP/prompt.txt"
+expect_calls "the ladder stops at low" 3
+expect_stderr "the exhausted ladder leads with the keep-the-effort lever" \
+  "split the bundle and review it in parts"
+expect_stderr "the exhausted ladder says agy has no budget flag" \
+  "agy has no budget flag"
+expect_stderr "the exhausted ladder puts the thinking numbers on the record" \
+  "54977 of its 55850"
+
+# --no-retry is for a caller who wants the effort they asked for, or nothing.
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" STUB_STDOUT="$TMP/token-limit.json" \
+  expect_fail "--no-retry keeps the effort and fails" 1 "drop --no-retry" \
+  --agy "$STUB" --no-retry --out "$TMP/run-retry3" "$TMP/prompt.txt"
+expect_calls "--no-retry runs exactly once" 1
+expect_stderr "--no-retry still names the keep-the-effort route" "split the bundle"
+
+# A suffixed id carries its effort in the id, and the sibling id need not exist —
+# gemini-3.1-pro has no -medium — so the step down is handed back, never invented.
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" STUB_STDOUT="$TMP/token-limit.json" \
+  expect_fail "a suffixed id is not stepped down" 1 \
+  "re-run as --model gemini-3.8-flash --effort medium" \
+  --agy "$STUB" --model gemini-3.8-flash-high --out "$TMP/run-retry4" "$TMP/prompt.txt"
+expect_calls "a suffixed id runs once" 1
+argv_lacks "no sibling id is invented" "gemini-3.8-flash-medium" "--effort"
+
+# A model with no effort control at all.
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" STUB_STDOUT="$TMP/token-limit.json" \
+  expect_fail "a model without an effort setting says so" 1 "takes no effort setting" \
+  --agy "$STUB" --model claude-opus-4-6-thinking --out "$TMP/run-retry5" "$TMP/prompt.txt"
+expect_calls "a model without an effort setting runs once" 1
+
+# Only THIS error is retried. Anything else means a second run buys the same answer
+# twice — the exact waste this whole branch exists to avoid.
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" STUB_STDOUT="$TMP/error-status.json" \
+  expect_fail "a different error is not retried" 1 "invalid model selection" \
+  --agy "$STUB" --out "$TMP/run-retry6" "$TMP/prompt.txt"
+expect_calls "a non-limit error runs once" 1
+
+# The limit failure has been seen with a non-zero exit too, and the exit-code branch
+# used to run first — a retryable failure must not be reported as a dead end.
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" STUB_RC_1=1 STUB_STDOUT="$TMP/token-limit.json" \
+  STUB_STDOUT_2="$TMP/good.json" \
+  expect_pass "a limit failure on a non-zero exit is still retried" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-retry7" "$TMP/prompt.txt"
+expect_calls "the non-zero-exit limit failure is retried once" 2
+
+# An explicitly requested effort is stepped down too — a review at medium beats none —
+# but only where the effort travels in the flag.
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" STUB_STDOUT="$TMP/token-limit.json" \
+  STUB_STDOUT_2="$TMP/good.json" \
+  expect_pass "an explicit --effort is stepped down as well" "$GOOD_STDOUT" \
+  --agy "$STUB" --model gemini-3.8-flash --effort high --out "$TMP/run-retry8" \
+  "$TMP/prompt.txt"
+ARGV_FILE_OVERRIDE="$STUB_ARGV.2" argv_has "the retry lowered the explicit effort" \
+  "--effort" "medium"
+
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" STUB_STDOUT="$TMP/token-limit.json" \
+  expect_fail "the bottom rung has nothing below it" 1 "effort tried: low" \
+  --agy "$STUB" --model gemini-3.8-flash --effort low --out "$TMP/run-retry9" \
+  "$TMP/prompt.txt"
+expect_calls "the bottom rung runs once" 1
+
+# A big prompt at high effort is where this failure lives, so say so before the run
+# rather than after the bill.
+python3 -c 'import sys; open(sys.argv[1], "w").write("Review this:\n" + "x\n" * 30000)' \
+  "$TMP/big-prompt.txt"
+: > "$STUB_CALLS"
+XDG_CACHE_HOME="$TMP/c-retry" expect_pass "a large prompt still runs" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-big" "$TMP/big-prompt.txt"
+expect_stderr "a large prompt at high effort is flagged before the run" \
+  "KB of prompt at --effort high"
+XDG_CACHE_HOME="$TMP/c-retry" expect_pass "an ordinary prompt runs unremarked" \
+  "$GOOD_STDOUT" --agy "$STUB" --out "$TMP/run-small" "$TMP/prompt.txt"
+expect_stderr_absent "an ordinary prompt is not flagged" "KB of prompt at --effort high"
+
+# --check validates an envelope, so the run options the retry added are rejected there
+# too rather than silently ignored.
+expect_fail "--check with --no-retry" 2 "takes no run options" \
+  --check "$TMP/good.json" --no-retry
+
 # --- meta-tests: prove each helper can actually go red -------------------------------
 # Without these, a crashing binary or a mis-wired assertion would make cases pass by
 # accident — which is exactly the defect this suite exists to catch in agy itself.
@@ -959,6 +1137,23 @@ meta_expect_red "expect_stderr notices a message that is absent" \
 : > "$STUB_MODELS_CALLS"
 meta_expect_red "expect_models_calls notices the wrong count" \
   expect_models_calls "META" 7
+
+: > "$STUB_CALLS"
+meta_expect_red "expect_calls notices the wrong count" \
+  expect_calls "META" 7
+
+# The per-attempt captures are a new way for an assertion to pass on nothing: a case
+# that names an attempt the ladder never reached must fail, not read as "absent".
+seed_argv
+ARGV_FILE_OVERRIDE="$TMP/no-such-attempt.bin" meta_expect_red \
+  "argv_equals fails when the named attempt never ran" \
+  argv_equals "META" "--model" "gemini-3.8-flash"
+
+# Needs a run that DOES print to stderr: a --check success prints nothing, so the
+# absence would hold for the wrong reason and the meta-test could never go red.
+run_bin --agy "$STUB" --out "$TMP/run-meta-absent" "$TMP/prompt.txt"
+meta_expect_red "expect_stderr_absent notices a message that IS present" \
+  expect_stderr_absent "META" "raw output"
 
 echo
 echo "passed=$pass failed=$fail"
