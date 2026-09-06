@@ -24,6 +24,12 @@ spec:
           image: redis:7-alpine
           # The fallback keeps a fresh scaffold runnable before any secret hook
           # exists; once the Secret carries REDIS_PASSWORD it is used instead.
+          #
+          # `--requirepass <value>` puts the password in the container's argv,
+          # where `ps` inside the container shows it. Accepted here: this is a
+          # throwaway local cache whose default password is the literal
+          # local_dev_only. Do not copy this shape into a production manifest —
+          # there, load the password from a mounted file instead.
           command: ["sh", "-c"]
           args:
             [

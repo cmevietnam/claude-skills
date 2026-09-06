@@ -88,11 +88,30 @@ controller at all. Install one, or use `kubectl port-forward`.
 
 ## Adding an engine to the guard
 
-`klocal` refuses any context not on its whitelist. To add one, put its exact
-name in `kl_context_is_local` in `scripts/lib/cluster.sh` and add a case to the
+`klocal` refuses any context not on its whitelist. To add one, put its exact name
+in `kl_context_name_is_local` in `scripts/lib/cluster.sh` and add a case to the
 test suite. Do not relax the pattern into a substring match: `*local*` would
 accept a production cluster named `localstack-prod`, which is precisely the
 accident the guard exists to prevent.
+
+The name must also contain no glob characters (`*`, `?`, `[`, `]`). `KL_KUBECTL`
+is exported to the secret hook as a command string and has to be expanded
+unquoted there to split into arguments, so a context named `kind-?` would have
+globbed against the project directory and rewritten its own `--context`.
+
+## Two engines installed at once
+
+Rancher Desktop on containerd and Docker Desktop can both be running, and then
+both `nerdctl --namespace k8s.io info` and `docker info` succeed. The socket that
+answers says nothing about which store the **selected cluster** reads. Decide by
+the context first:
+
+| Context                        | Reads                               |
+| ------------------------------ | ----------------------------------- |
+| `rancher-desktop` (moby)       | docker                              |
+| `rancher-desktop` (containerd) | containerd `k8s.io`                 |
+| `docker-desktop`               | docker                              |
+| `kind-*`, `k3d-*`, `minikube`  | its own store, imported from docker |
 
 ## Hostnames, on every engine
 

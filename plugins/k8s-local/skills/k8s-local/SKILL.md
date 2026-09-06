@@ -24,14 +24,22 @@ enough alone:
 1. **The name** must be `rancher-desktop`, `docker-desktop`, `minikube`,
    `colima`, `kind-*` or `k3d-*`. A whitelist, not a heuristic — "contains the
    word local" would accept a production cluster called `localstack-prod`.
-2. **The API server address** must be loopback or RFC1918. Names are chosen by
-   whoever created the cluster, so a remote cluster can be called `kind-prod`;
-   the address is the part that naming cannot fake.
+2. **The API server address** must be loopback or RFC1918, and the URL is
+   _parsed_, not string-matched. Names are chosen by whoever created the cluster,
+   so a remote cluster can be called `kind-prod`; the address is the part that
+   naming cannot fake — provided you strip the userinfo first, since
+   `https://127.0.0.1:x@prod.example.com:6443` is a legal URL whose host is
+   `prod.example.com`.
 
 No context at all is refused the same way a remote one is. Every command that
 reaches the cluster is guarded — including `logs` and `psql`, which read and
 write through a pod — and the verified context is pinned with `--context` on
 every call, so switching the kubeconfig mid-build cannot redirect the rest.
+
+Pinning carries the **name** forward, not the cluster it named, so every write
+path (`up`, `rebuild`, `down`) re-reads the server URL immediately before it
+writes. The windows are real: a build takes minutes, and `down` waits at its
+confirmation prompt for as long as you take to answer.
 
 If a legitimate local context is refused, add its exact name to
 `kl_context_name_is_local` and a case to the test suite; never loosen the pattern.
@@ -48,7 +56,13 @@ If a legitimate local context is refused, add its exact name to
   node's own store, or the pod keeps running the previous image.
 - Pick the build engine by which binary exists. Rancher Desktop ships `nerdctl`
   even when the engine is moby, where it cannot reach the k3s containerd socket.
-  Probe the socket: `nerdctl --namespace k8s.io info`, then `docker info`.
+  Probe the socket: `nerdctl --namespace k8s.io info`, then `docker info`. And
+  do not stop at the socket either — with Rancher Desktop on containerd _and_
+  Docker Desktop installed, both probes answer. Decide by the **context**: a
+  `docker-desktop` cluster reads the docker store no matter what else replies.
+- Report a read you could not do as a finding. "Not set on that Deployment" and
+  "I was not allowed to look" are different answers, and only the first is about
+  the manifest. `klocal status` says which one it has.
 - Let the app connect to Postgres as the container's superuser. It bypasses
   every `FORCE ROW LEVEL SECURITY` policy, so tenant isolation is silently off
   while all tests still pass. Create a `NOSUPERUSER NOBYPASSRLS` role, and assert

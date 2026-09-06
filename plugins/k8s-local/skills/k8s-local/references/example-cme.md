@@ -93,7 +93,8 @@ Local dev runs the web outside the cluster, so both are passed by hand:
 
 ```bash
 cd web && env \
-  INTERNAL_SIGNING_KEY="$(kubectl get secret cme-api-secrets -n cme-local \
+  INTERNAL_SIGNING_KEY="$(kubectl --context rancher-desktop get secret \
+      cme-api-secrets -n cme-local \
       -o jsonpath={.data.INTERNAL_SIGNING_KEY} | base64 -d)" \
   NODE_EXTRA_CA_CERTS="$HOME/.cme-local-tls/cert.pem" \
   NEXT_PUBLIC_API_URL=https://api.lvh.me:8443 \
@@ -112,7 +113,8 @@ and render as a server exception.
 entries by name, so one silently won:
 
 ```
-$ kubectl get deploy cme-api -n cme-local -o jsonpath='{...PUBLIC_BASE_URL...}'
+$ kubectl --context rancher-desktop get deploy cme-api -n cme-local \
+    -o jsonpath='{...PUBLIC_BASE_URL...}'
 PUBLIC_BASE_URL=http://localhost:3000
 ```
 

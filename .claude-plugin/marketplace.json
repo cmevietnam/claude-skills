@@ -113,7 +113,7 @@
       "source": "./plugins/k8s-local",
       "displayName": "Local Kubernetes stack",
       "description": "Run a project's whole stack on a local Kubernetes cluster: build straight into the cluster's image store, refuse any context whose name and API server address are not local, and keep the datastores throwaway.",
-      "version": "0.1.2",
+      "version": "0.1.3",
       "author": {
         "name": "hieuvo"
       },

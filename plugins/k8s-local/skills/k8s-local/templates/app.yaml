@@ -37,6 +37,19 @@ spec:
             limits:
               memory: "512Mi"
               cpu: "1000m"
+          # Without this, a pod counts as Ready the moment the process starts, so
+          # `klocal up` prints "Stack is up" while the app is still booting and
+          # the Service sends it traffic it cannot answer yet. postgres.yaml has
+          # always had a probe; the app not having one was the inconsistency.
+          # Point it at whatever your app actually serves cheaply — a route that
+          # touches the database turns a slow query into a restart loop.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 6
 ---
 apiVersion: v1
 kind: Service

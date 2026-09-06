@@ -17,7 +17,12 @@
  *
  * Node built-ins only — this has to run with nothing installed.
  *
- * Usage: node deploy/local/https-proxy.mjs [--port 8443] [--cert DIR]
+ * Binds 127.0.0.1 only. Both upstreams are loopback-bound, so listening on the
+ * wildcard address would have turned two local-only services into LAN-reachable
+ * ones: any machine on the network could send Host: api.<root> to this port and
+ * reach the cluster. Pass --host 0.0.0.0 to opt in deliberately.
+ *
+ * Usage: node deploy/local/https-proxy.mjs [--port 8443] [--cert DIR] [--host H]
  *
  * Generate the certificate first (SAN goes through a config file because macOS
  * LibreSSL has no -addext):
@@ -43,6 +48,7 @@ const arg = (name, fallback) => {
 };
 
 const PORT = Number(arg("port", 8443));
+const HOST = arg("host", "127.0.0.1");
 const CERT_DIR = arg("cert", path.join(process.env.HOME ?? ".", ".local-tls"));
 const INGRESS = { host: "127.0.0.1", port: Number(arg("ingress-port", 80)) };
 const WEB = { host: "127.0.0.1", port: Number(arg("web-port", 3000)) };
@@ -73,12 +79,32 @@ const server = https.createServer(creds, (req, res) => {
     },
     (r) => {
       res.writeHead(r.statusCode, r.headers);
+      // If the upstream dies mid-body, `pipe` does NOT forward the error, and
+      // nothing ends the downstream response: the browser sat waiting on a
+      // request that would never complete. Headers are already sent by then, so
+      // there is no status left to change — destroying the socket is what tells
+      // the client the response was truncated.
+      r.on("error", () => res.destroy());
       r.pipe(res);
     },
   );
   up.on("error", (e) => {
-    if (!res.headersSent) res.writeHead(502, { "content-type": "text/plain" });
+    // Once the status line is out, there is no 502 left to send, and `res.end()`
+    // cannot honour the Content-Length already promised to the browser — it
+    // finishes short, and the client waits for the rest of a body that will
+    // never arrive. Destroying the socket is what makes it read as truncated.
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    res.writeHead(502, { "content-type": "text/plain" });
     res.end(`local proxy: ${e.message}\n`);
+  });
+  // A client that disconnects mid-request leaves the upstream request open and
+  // its socket held until the upstream times out.
+  req.on("error", () => up.destroy());
+  res.on("close", () => {
+    if (!res.writableEnded) up.destroy();
   });
   req.pipe(up);
 });
@@ -100,8 +126,8 @@ server.on("upgrade", (req, socket, head) => {
   socket.on("error", () => up.destroy());
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, HOST, () => {
   console.log(
-    `https://<host>.lvh.me:${PORT}  ->  api.* to ingress:${INGRESS.port}, rest to web:${WEB.port}`,
+    `https://<host>.lvh.me:${PORT} (bound ${HOST})  ->  api.* to ingress:${INGRESS.port}, rest to web:${WEB.port}`,
   );
 });

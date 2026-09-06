@@ -15,7 +15,21 @@
 # Claude Code. Symlink it onto PATH and use it like any other tool.
 set -euo pipefail
 
-here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+# Resolve the script through any symlinks before locating its libraries. The
+# README tells you to symlink this onto PATH, and `pwd -P` resolves the symlink's
+# DIRECTORY, not the link itself — so ~/bin/klocal looked for ~/scripts/lib and
+# every command died at the source line before dispatching. macOS readlink has no
+# -f, hence the loop.
+kl_self=${BASH_SOURCE[0]}
+while [ -L "$kl_self" ]; do
+  kl_link=$(readlink -- "$kl_self")
+  case "$kl_link" in
+    /*) kl_self=$kl_link ;;
+    *) kl_self=$(dirname -- "$kl_self")/$kl_link ;;
+  esac
+done
+here=$(cd -- "$(dirname -- "$kl_self")" && pwd -P)
+unset kl_self kl_link
 # shellcheck source=../scripts/lib/common.sh
 . "$here/../scripts/lib/common.sh"
 # shellcheck source=../scripts/lib/cluster.sh
@@ -48,8 +62,9 @@ EOF
 require_cluster() {
   command -v kubectl >/dev/null 2>&1 || kl_die "kubectl not found"
   KL_CONTEXT=$(kl_require_local_context)
-  # Remembered so it can be re-checked after the build; see kl_assert_context_unchanged.
-  KL_SERVER_HOST=$(kl_context_server_host "$KL_CONTEXT" || true)
+  # The WHOLE server URL is remembered, not just the host: two local clusters
+  # routinely differ only by port. See kl_assert_context_unchanged.
+  KL_SERVER_URL=$(kl_context_server_url "$KL_CONTEXT" || true)
 }
 
 preflight() {
@@ -68,17 +83,70 @@ preflight() {
 check_namespace_agreement() {
   local kf declared
   kf=$(kustomization_file) || return 0
-  # Accept the spellings kustomize itself accepts: an optionally quoted key, and
-  # space before the colon. Matching only `^namespace:` missed `"namespace":`,
-  # which kustomize honours — so resources went to one namespace while klocal
-  # waited in, and later deleted, another.
-  declared=$(sed -n -E 's/^[[:space:]]*["'\'']?namespace["'\'']?[[:space:]]*:[[:space:]]*//p' "$kf" |
-    head -1 | tr -d '"'\''' | tr -d '[:space:]')
+  declared=$(kustomization_namespace "$kf") || kl_die \
+    "cannot read the namespace from ${kf#"$KL_ROOT"/}: it names a 'namespace' key
+       but this reader could not extract its value. Refusing rather than assuming
+       agreement — resources would be applied to one namespace and waited on (and
+       later deleted) in another. Put it on its own line as: namespace: $KL_NAMESPACE"
   [ -n "$declared" ] || return 0
   [ "$declared" = "$KL_NAMESPACE" ] || kl_die \
     "namespace mismatch: project.json says '$KL_NAMESPACE' but
        ${kf#"$KL_ROOT"/} says '$declared'. Resources would be applied to one and
        waited on (and later deleted) in the other. Make them agree."
+}
+
+# The namespace a kustomization declares, or empty when it declares none.
+# Exits non-zero when the file clearly HAS one and this reader cannot extract it,
+# because silence here is a false all-clear on the check that keeps `down` from
+# deleting the wrong namespace.
+#
+# Handles three spellings kustomize accepts and this previously did not:
+#   namespace: demo-local            plain YAML
+#   "namespace": "demo-local"        quoted key
+#   {"namespace":"demo-local", ...}  JSON — a kustomization may be JSON, and the
+#                                    line-anchored reader saw nothing at all, so
+#                                    the guard silently passed
+# and strips a trailing `# comment`, which used to end up inside the compared
+# name and fail a perfectly correct config.
+#
+# `sed ... q` rather than `sed | head -1`: with enough matching lines, head exits
+# first, sed dies of SIGPIPE, and under `set -o pipefail` that killed klocal with
+# no message at all.
+kustomization_namespace() { # <file>
+  local raw
+  raw=$(sed -n -E '
+      s/^[[:space:]]*["'\'']?namespace["'\'']?[[:space:]]*:[[:space:]]*(.*)$/\1/p
+    ' "$1" | sed -n '1{p;q;}')
+  if [ -z "$raw" ]; then
+    # JSON form, or the key inline in a flow mapping: look anywhere on the line.
+    raw=$(sed -n -E 's/.*["'\'']namespace["'\''][[:space:]]*:[[:space:]]*(.*)$/\1/p' "$1" |
+      sed -n '1{p;q;}')
+  fi
+  [ -n "$raw" ] || {
+    # No key at all is the ordinary "declares no namespace" case. Comments are
+    # removed before deciding: the shipped kustomization.yaml explains this very
+    # check in prose, and matching the word inside that sentence would refuse
+    # every scaffolded project.
+    sed -e 's/^[[:space:]]*#.*$//' -e 's/[[:space:]]#.*$//' "$1" |
+      grep -qE '(^|[^[:alnum:]_-])["'\'']?namespace["'\'']?[[:space:]]*:' || {
+      printf '\n'
+      return 0
+    }
+    return 1
+  }
+  # Unquote, then cut at the first structural or comment character.
+  case "$raw" in
+    \"*) raw=${raw#\"}; raw=${raw%%\"*} ;;
+    \'*) raw=${raw#\'}; raw=${raw%%\'*} ;;
+    *)
+      raw=${raw%%,*}
+      raw=${raw%%\}*}
+      case "$raw" in *[[:space:]]\#*) raw=${raw%%[[:space:]]\#*} ;; esac
+      ;;
+  esac
+  raw=$(printf '%s' "$raw" | tr -d '[:space:]')
+  [ -n "$raw" ] || return 1
+  printf '%s\n' "$raw"
 }
 
 # kustomize accepts three filenames, in this precedence order.
@@ -112,7 +180,7 @@ cmd_up() {
   # A build takes minutes. Re-check before the first write that the context still
   # exists, still resolves to the same API server, and has gained no proxy-url:
   # pinning --context carries the NAME forward, not the cluster it named.
-  kl_assert_context_unchanged "$KL_CONTEXT" "$KL_SERVER_HOST"
+  kl_assert_context_unchanged "$KL_CONTEXT" "$KL_SERVER_URL" "the build"
 
   kl_info "namespace"
   kl_kubectl create namespace "$KL_NAMESPACE" --dry-run=client -o yaml |
@@ -156,16 +224,27 @@ cmd_up() {
 next_steps() {
   # Read the hostnames off the live Ingress objects rather than assuming a
   # convention like api.<domain> — the cluster is the authority on what it serves.
-  local hosts reach
+  local hosts reach h
   hosts=$(kl_ingress_hosts "$KL_NAMESPACE")
   if [ -n "$hosts" ]; then
-    # With a TLS front door the reachable URL is https on the proxy port; the
-    # Ingress itself is behind it and is not what a browser should be given.
-    if [ -n "$KL_TLS_PORT" ]; then
-      reach=$(printf '%s' "$hosts" | sed "s|^|https://|;s|\$|:$KL_TLS_PORT|" | paste -sd' ' -)
-    else
-      reach=$(printf '%s' "$hosts" | sed "s|^|http://|" | paste -sd' ' -)
-    fi
+    # Built by concatenation, not by interpolating a config value into a `sed`
+    # program. tls.port is validated as a port now, but the URL never needed a
+    # regex engine in the first place, and a substitution whose replacement text
+    # comes from a config file is a whole class of bug not worth keeping.
+    reach=""
+    while IFS= read -r h; do
+      [ -n "$h" ] || continue
+      # With a TLS front door the reachable URL is https on the proxy port; the
+      # Ingress itself is behind it and is not what a browser should be given.
+      if [ -n "$KL_TLS_PORT" ]; then
+        reach="$reach https://$h:$KL_TLS_PORT"
+      else
+        reach="$reach http://$h"
+      fi
+    done <<EOF
+$hosts
+EOF
+    reach=${reach# }
   else
     reach="no Ingress in this namespace — use: kubectl port-forward -n $KL_NAMESPACE svc/$KL_APP 8080:80"
   fi
@@ -240,7 +319,7 @@ cmd_status() {
   fi
 
   local found=0 unreadable=0 f kind workload ckind container name count
-  local live n effective source
+  local live n effective source envrc
   while read -r f; do
     [ -n "$f" ] || continue
     while read -r kind workload ckind container name count; do
@@ -261,7 +340,19 @@ cmd_status() {
       # Query the workload the manifest actually defines, not always the app:
       # a duplicate in the Postgres manifest was previously looked up on the API
       # Deployment and reported as "not set".
-      live=$(kl_env_of "$KL_NAMESPACE" "$workload" "$ckind" "$container" "$name" | grep . || true)
+      # A failed read is NOT an absence. kl_env_of returns 2 when it could not
+      # look, and saying "not present on deploy/x" for that is a confident claim
+      # about something never observed — the thing this drift check exists to
+      # stop anyone doing.
+      live=$(kl_env_of "$KL_NAMESPACE" "$workload" "$ckind" "$container" "$name") &&
+        envrc=0 || envrc=$?
+      if [ "$envrc" -ne 0 ]; then
+        printf '    could NOT read %s/%s from the cluster — this variable was not checked\n' \
+          "$ckind" "$workload"
+        printf '    (denied read, API error, or no jq/python3 available)\n'
+        continue
+      fi
+      live=$(printf '%s' "$live" | grep . || true)
       n=$(printf '%s' "$live" | grep -c . || true)
       if [ "${n:-0}" -gt 1 ]; then
         # Both survived into the live spec: the kubelet builds env in order, so
@@ -309,6 +400,11 @@ cmd_down() {
     read -r reply
     case "$reply" in [yY] | [yY][eE][sS]) ;; *) kl_die "aborted" ;; esac
   fi
+  # The prompt above waits as long as the operator takes to answer, which is
+  # exactly the window in which another terminal can remap this context name onto
+  # a different cluster. Verifying before the prompt and deleting after it was a
+  # race with a destructive loser, so re-verify here.
+  kl_assert_context_unchanged "$KL_CONTEXT" "$KL_SERVER_URL" "the confirmation"
   # `--` stops kubectl reading a namespace that begins with a dash as a flag.
   # kl_require_dns_label already rejects those, so this is the second lock.
   kl_kubectl delete namespace --wait=false -- "$KL_NAMESPACE"
@@ -331,6 +427,10 @@ cmd_rebuild() {
   preflight
   kl_info "build $KL_IMAGE"
   kl_build_image "$KL_IMAGE" "$KL_ROOT/$KL_IMAGE_CONTEXT"
+  # Same re-check `up` does, for the same reason: this build also takes minutes,
+  # and a rollout restart against a remapped context is a write to someone else's
+  # cluster. Omitting it here made `rebuild` the one write path with no recheck.
+  kl_assert_context_unchanged "$KL_CONTEXT" "$KL_SERVER_URL" "the build"
   # The tag has not changed, so the Deployment spec has not changed either and
   # `apply` would be a no-op. A restart is what makes the kubelet pick up the
   # new image under the same tag.
@@ -357,16 +457,47 @@ cmd_psql() {
   # psql lets a later option win, and a connection URI overrides -U outright, so
   # a trailing `-U postgres` or `postgresql://...` would quietly undo the role
   # this command just selected. Refuse rather than appear to have honoured it.
-  local a
+  #
+  # Three spellings, all of which psql accepts and the first version of this
+  # guard let through:
+  #   -U postgres      detached  — was caught
+  #   -Upostgres       attached  — was NOT; `--app -Udemo` silently reconnected
+  #                                as the superuser, defeating the RLS check that
+  #                                is the entire point of --app
+  #   psql mydb bob    positional — psql reads [dbname [username]] with no flag
+  #                                at all, overriding both -d and -U
+  # So: reject the -U/-d/-h families by PREFIX, and reject any bare argument that
+  # is not the value of an option known to take one.
+  local a prev="" expect_value=0
   for a in "$@"; do
+    if [ "$expect_value" = 1 ]; then
+      expect_value=0
+      prev=$a
+      continue
+    fi
     case "$a" in
-      -U | --username | --username=* | -d | --dbname | --dbname=* | -h | --host | --host=* | \
+      -U* | --username* | -d* | --dbname* | -h* | --host* | \
         postgres://* | postgresql://*)
         kl_die "refusing: '$a' would override the connection klocal selected.
        Change \"database\" in $KL_CONFIG instead, or run psql yourself."
         ;;
+      # Options that take a SEPARATE value; the next argument belongs to them and
+      # is not a positional dbname.
+      -c | -f | -p | -v | -o | -F | -R | -L | -P | \
+        --command | --file | --port | --set | --variable | --output | \
+        --field-separator | --record-separator | --log-file | --pset)
+        expect_value=1
+        ;;
+      -*) : ;; # any other flag, including --opt=value forms
+      *)
+        kl_die "refusing: '$a' is a bare argument, which psql reads as
+       [dbname [username]] and which would override the connection klocal
+       selected. Change \"database\" in $KL_CONFIG, or run psql yourself."
+        ;;
     esac
+    prev=$a
   done
+  [ "$expect_value" = 0 ] || kl_die "refusing: '$prev' expects a value, none given"
   # -t only when stdin really is a terminal: kubectl warns and degrades when it
   # is not, which turns every scripted `klocal psql -c ...` into noise.
   local tty=""

@@ -135,17 +135,40 @@ kl_require_safe_arg() { # <config-key> <value>
   esac
 }
 
+# A TCP port. This one is not decoration: the value is interpolated into a `sed`
+# program that builds the reachable URL, so a `|` closed the substitution and the
+# rest became further sed commands — `w /path` writes a file anywhere the user
+# can write. Even without malice, `&` is sed's whole-match replacement, so a port
+# of "80&81" silently rendered as ":8081".
+kl_require_port() { # <config-key> <value>
+  case "$2" in
+    "" | *[!0-9]*) kl_die "$KL_CONFIG: \"$1\" must be a number, got: '$2'" ;;
+  esac
+  [ "${#2}" -le 5 ] && [ "$2" -ge 1 ] && [ "$2" -le 65535 ] 2>/dev/null || kl_die \
+    "$KL_CONFIG: \"$1\" must be a port between 1 and 65535, got: '$2'"
+}
+
 # --- config ----------------------------------------------------------------
 # Walk up from $PWD looking for .k8s-local/project.json, the way git finds its
 # root. Lets klocal run from any subdirectory of the project.
+# Terminates on "the parent stopped changing", not on "we reached /". dirname
+# is a fixed point at BOTH "/" and ".", so a relative starting directory spun
+# forever: dirname "." is ".". Making the path absolute first is the real fix;
+# the fixed-point test is the floor under it, so no future caller can reintroduce
+# a loop with no exit.
 kl_find_config() {
-  local dir=${1:-$PWD}
-  while [ "$dir" != "/" ]; do
+  local dir=${1:-$PWD} prev=""
+  case "$dir" in
+    /*) ;;
+    *) dir=$(cd -- "$dir" 2>/dev/null && pwd -P) || return 1 ;;
+  esac
+  while [ -n "$dir" ] && [ "$dir" != "$prev" ]; do
     if [ -f "$dir/.k8s-local/project.json" ]; then
       printf '%s\n' "$dir/.k8s-local/project.json"
       return 0
     fi
-    dir=$(dirname "$dir")
+    prev=$dir
+    dir=$(dirname -- "$dir")
   done
   return 1
 }
@@ -204,6 +227,7 @@ kl_load_config() {
   [ -z "$KL_DB_APP_ROLE" ] || kl_require_pg_ident database.appRole "$KL_DB_APP_ROLE"
 
   KL_TLS_PORT=$(kl_json_get "$KL_CONFIG" tls.port)
+  [ -z "$KL_TLS_PORT" ] || kl_require_port tls.port "$KL_TLS_PORT"
   KL_TLS_CERT_DIR=$(kl_json_get "$KL_CONFIG" tls.certDir)
   # A leading ~ in JSON is literal; expand it here or every path breaks.
   case "$KL_TLS_CERT_DIR" in "~"/*) KL_TLS_CERT_DIR="$HOME/${KL_TLS_CERT_DIR#\~/}" ;; esac
