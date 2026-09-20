@@ -46,7 +46,7 @@ masks values in its output — is the primary primitive.
 ## Install
 
 ```bash
-claude plugin marketplace add hieuvo/claude-skills
+claude plugin marketplace add cmevietnam/claude-skills
 claude plugin install onepassword@hieuvo-skills
 ```
 

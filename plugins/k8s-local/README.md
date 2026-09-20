@@ -13,7 +13,7 @@ and a login that fails only over plain http.
 ## Install
 
 ```bash
-claude plugin marketplace add hieuvo/claude-skills
+claude plugin marketplace add cmevietnam/claude-skills
 claude plugin install k8s-local@hieuvo-skills
 ```
 

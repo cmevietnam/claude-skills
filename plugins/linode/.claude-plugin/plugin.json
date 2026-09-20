@@ -3,8 +3,8 @@
   "description": "Work with Linode inside the project's tag boundary: resources are created with the project tag, and writes to another project's resources are refused.",
   "version": "0.1.0",
   "author": { "name": "hieuvo" },
-  "homepage": "https://github.com/hieuvo/claude-skills",
-  "repository": "https://github.com/hieuvo/claude-skills",
+  "homepage": "https://github.com/cmevietnam/claude-skills",
+  "repository": "https://github.com/cmevietnam/claude-skills",
   "license": "MIT",
   "keywords": [
     "linode",
