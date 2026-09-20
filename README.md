@@ -6,7 +6,7 @@ lần ở user scope.
 ## Cài
 
 ```bash
-claude plugin marketplace add hieuvo/claude-skills
+claude plugin marketplace add cmevietnam/claude-skills
 claude plugin install onepassword@hieuvo-skills
 ```
 
