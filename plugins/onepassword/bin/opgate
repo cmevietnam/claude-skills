@@ -408,24 +408,50 @@ cmd_put() {
   local value
   if [[ ! -t 0 ]]; then
     # Piped input is taken whole: a PEM key or JSON blob must not be truncated at
-    # the first newline. Only one trailing newline is stripped.
-    value=$(cat; printf x); value="${value%x}"; value="${value%$'\n'}"
+    # the first newline.
+    value=$(cat; printf x); value="${value%x}"
   elif (( multiline )); then
     printf 'Paste the value for %s/%s, then Ctrl-D:\n' "$item" "$field" >&2
-    value=$(cat; printf x); value="${value%x}"; value="${value%$'\n'}"
+    value=$(cat; printf x); value="${value%x}"
   else
     printf 'Value for %s/%s (hidden, single line; use --multiline for more): ' "$item" "$field" >&2
     IFS= read -rs value; printf '\n' >&2
   fi
+  # Strip the trailing newline ONLY from a single-line value, where it is just
+  # the Enter that ended `echo token |`. A multi-line value keeps it: OpenSSH
+  # private keys and PEM blocks require a final newline, and removing it stores
+  # a key that reads back as "invalid format" -- a backup that looks fine in the
+  # vault and cannot be used when it is actually needed.
+  local body="${value%$'\n'}"
+  if [[ "$body" != *$'\n'* ]]; then
+    value="$body"
+  fi
+
   [[ -n "$value" ]] || die "empty value, nothing written"
 
   # Does the item exist, and is it ours? `op item list` returns title, category
   # and tags only — no field values — so this check reads no secrets. Editing a
   # foreign item with a JSON template would drop its category, sections, URLs
   # and, as op's own help warns, any passkey.
-  local exists=0 meta
-  meta=$(op item list --vault "$OPGATE_VAULT" --format json </dev/null 2>/dev/null \
-         | jq -c --arg t "$item" '[.[] | select(.title == $t)] | .[0] // empty') || meta=""
+  local exists=0 meta listing
+  # Fail CLOSED on a lookup error. This used to be `2>/dev/null || meta=""`,
+  # which turned "could not reach 1Password" into "the item does not exist" --
+  # so a transient `authorization timeout` silently created a SECOND item with
+  # the same title, splitting the project's secrets across two items and making
+  # every op:// reference to that title ambiguous.
+  if ! listing=$(op item list --vault "$OPGATE_VAULT" --format json </dev/null 2>&1); then
+    die "could not list items in vault $OPGATE_VAULT: ${listing%%$'\n'*}
+       Nothing was written. Unlock 1Password and try again."
+  fi
+  local matches; matches=$(printf '%s' "$listing" \
+    | jq --arg t "$item" '[.[] | select(.title == $t)] | length')
+  if (( matches > 1 )); then
+    die "vault $OPGATE_VAULT holds $matches items titled \"$item\".
+       op://$OPGATE_VAULT/$item/<FIELD> cannot name one of them unambiguously.
+       Delete the duplicates in the 1Password app, keeping the one with the fields you want."
+  fi
+  meta=$(printf '%s' "$listing" \
+    | jq -c --arg t "$item" '[.[] | select(.title == $t)] | .[0] // empty')
   if [[ -n "$meta" ]]; then
     exists=1
     local owned; owned=$(printf '%s' "$meta" \
@@ -458,9 +484,14 @@ cmd_put() {
     # Fields must be top level (no section) so the reference stays
     # op://<vault>/<item>/<VAR>. notesPlain is part of the stock Secure Note
     # template; omitting it makes `op` reject the template.
+    # Tag on creation, exactly as cmd_import does. Without this the item is born
+    # untagged, and the ownership check above then rejects it on the very next
+    # put -- so an item created here could never gain a second field.
     op item create --vault "$OPGATE_VAULT" --template <(
-      jq -n --rawfile v <(printf '%s' "$value") --arg t "$item" --arg f "$field" '
+      jq -n --rawfile v <(printf '%s' "$value") --arg t "$item" --arg f "$field" \
+            --arg p "project:$(project_name)" '
         { title: $t, category: "SECURE_NOTE",
+          tags: ["opgate", $p],
           fields: [ { id: "notesPlain", type: "STRING", purpose: "NOTES", label: "notesPlain", value: "" },
                     { id: $f, type: "CONCEALED", label: $f, value: $v } ] }'
     ) </dev/null >/dev/null
