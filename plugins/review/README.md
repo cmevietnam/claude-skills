@@ -1,50 +1,53 @@
 # review
 
-Quy trình soát code bằng nhiều model Claude độc lập, cho những thứ mà sai một lần là
-đắt: xử lý secret, parser, guardrail.
+A process for reviewing code with several independent Claude models, for things where
+one mistake is expensive: secret handling, parsers, guardrails.
 
-## Nó không tự chạy gì cả
+## It never runs anything on its own
 
-Skill này **hỏi trước mỗi lần** chạy reviewer, kèm ước lượng thời gian và chi phí.
-Nó không tự spawn agent chỉ vì thấy code đáng soát. Một vòng `xhigh` trên ~1500 dòng
-tốn khoảng 30 phút.
+This skill **asks before every** reviewer run, with an estimate of time and cost. It
+does not spawn agents just because the code looks worth reviewing. One `xhigh` round over
+~1500 lines takes about 30 minutes.
 
-Chỉ dùng model Claude — không phụ thuộc CLI bên ngoài.
+Claude models only: no dependency on an external CLI.
 
-## Vì sao hai reviewer
+## Why two reviewers
 
-Không phải để chắc chắn hơn, mà vì **điểm mù của reviewer này thường là phát hiện
-chính của reviewer kia**. Trong lần chạy sinh ra plugin này, hai model độc lập soát
-cùng một đoạn code: một bên tìm ra biến môi trường khiến scanner in credential ra
-stdout, bên kia kết luận chính đường đó không thể lộ nội dung. Bên kia tìm ra lệnh
-build tự khoá chết cơ chế xác thực ở lần chạy thứ hai — bên đầu không thấy.
+Not for more certainty, but because **one reviewer's blind spot is often the other's
+headline finding**. In the run that produced this plugin, two independent models
+reviewed the same code: one found an environment variable that made a scanner print
+credentials to stdout, while the other concluded that the same path could not emit
+content. The other found a build command that locked its own verification mechanism on
+its second run, which the first missed.
 
-## Dùng
+## Usage
 
 ```bash
-# chẩn đoán một sub-agent im lặng
+# diagnose a quiet sub-agent
 scripts/agent-health.sh <task-id>
 scripts/agent-health.sh --list
 
-# theo dõi liên tục, dùng chung với Monitor
+# watch continuously, for use with Monitor
 scripts/agent-health.sh --watch <task-id>
 ```
 
-`agent-health.sh` phân loại `WORKING` / `STALLED` / `DEAD` và nói nên làm gì. Nó
-**không bao giờ in nội dung transcript** — với local agent, file `.output` là
-symlink tới transcript JSONL đầy đủ, đọc vào là tràn context. Script chỉ in kích
-thước, số bản ghi, loại bản ghi cuối. Có test khẳng định tính chất đó.
+`agent-health.sh` classifies a task as `WORKING` / `STALLED` / `DEAD` and says what to
+do. It **never prints transcript content**: for a local agent the `.output` file is a
+symlink to the full JSONL transcript, and reading it floods the context. The script
+prints only the size, the number of records and the type of the last record. A test
+asserts that property.
 
-## Test
+## Tests
 
 ```bash
 bash scripts/test-agent-health.sh
 ```
 
-Không cần agent, không cần mạng.
+No agents and no network needed.
 
-## Đọc thêm
+## Further reading
 
-- `skills/review/SKILL.md` — vòng lặp review và những việc không được làm
-- `skills/review/references/running-reviewers.md` — mẫu prompt, chọn reviewer, khi bị treo
-- `skills/review/references/findings-to-tests.md` — biến input tấn công thành test
+- `skills/review/SKILL.md`: the review loop and what not to do
+- `skills/review/references/running-reviewers.md`: prompt template, choosing reviewers,
+  what to do when one hangs
+- `skills/review/references/findings-to-tests.md`: turning attack inputs into tests

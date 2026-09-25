@@ -52,9 +52,9 @@
     {
       "name": "review",
       "source": "./plugins/review",
-      "displayName": "Review đối kháng",
-      "description": "Quy trình review bằng nhiều model Claude độc lập, tái hiện từng finding trước khi tin, biến input tấn công thành test. Kèm script chẩn đoán sub-agent im lặng hay treo.",
-      "version": "0.1.0",
+      "displayName": "Adversarial review",
+      "description": "Adversarial review with several independent Claude models: run the reviewers, reproduce every finding before trusting it, and turn attack inputs into tests. Includes a script that tells a quiet sub-agent from a hung one.",
+      "version": "0.1.1",
       "author": {
         "name": "hieuvo"
       },

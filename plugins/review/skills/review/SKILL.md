@@ -1,92 +1,96 @@
 ---
 name: review
-description: Chạy review đối kháng bằng nhiều model Claude độc lập, tái hiện từng finding trước khi tin, và biến input tấn công của reviewer thành test case. Dùng khi cần soát kỹ code quan trọng (bảo mật, xử lý secret, parser, guardrail), khi một reviewer vừa trả kết quả, hoặc khi một sub-agent im lặng và cần biết nó còn sống không.
+description: Run adversarial review with several independent Claude models, reproduce every finding before trusting it, and turn the reviewer's attack inputs into test cases. Use when code that matters needs a hard look (security, secret handling, parsers, guardrails), when a reviewer has just returned results, or when a sub-agent has gone quiet and you need to know whether it is still alive.
 ---
 
-# Review đối kháng
+# Adversarial review
 
-Quy trình soát code bằng model khác, cho những thứ mà sai một lần là đắt: xử lý
-secret, parser, guardrail, bất cứ thứ gì có thể im lặng làm sai việc.
+A process for having another model check code where one mistake is expensive: secret
+handling, parsers, guardrails, anything that can silently do the wrong thing.
 
-## Luật cứng: không tự ý chạy reviewer
+## Hard rule: never start a reviewer on your own
 
-Một vòng review `xhigh` trên ~1500 dòng tốn khoảng 30 phút và một phần đáng kể
-quota. **Luôn hỏi trước khi spawn**, và hỏi cả effort lẫn phạm vi. Không bao giờ
-khởi chạy reviewer chỉ vì thấy code có vẻ đáng soát.
+One `xhigh` review round over ~1500 lines takes about 30 minutes and a noticeable share
+of quota. **Always ask before spawning**, and ask about both effort and scope. Never
+launch a reviewer just because the code looks like it deserves one.
 
-Khi hỏi, đưa ước lượng thật: thời gian, số reviewer, và việc nó tiêu quota theo
-*kích thước context nhân số vòng lặp*, không theo độ dài báo cáo.
+When you ask, give a real estimate: time, number of reviewers, and the fact that quota
+is spent by _context size times number of turns_, not by the length of the report.
 
-## Vòng lặp
+## The loop
 
-1. **Chốt phạm vi với người dùng.** Hẹp hơn bạn nghĩ. Ba agent 8 phút cho kết quả
-   sớm hơn và giới hạn thiệt hại tốt hơn một agent 28 phút.
-2. **Chạy hai reviewer độc lập** — khác model, hoặc khác effort. Không chia sẻ
-   context, không cho bên này thấy kết quả bên kia. Xem `references/running-reviewers.md`.
-3. **Tái hiện từng finding trước khi tin.** Đây là bước không được bỏ. Reviewer tự
-   tin vẫn có thể sai.
-4. **Trình bày nguyên văn**, rồi mới tới đánh giá của bạn ở mục tách riêng. Nén
-   phán quyết của reviewer vào tóm tắt của mình là phá huỷ lý do đi hỏi.
-5. **Người dùng quyết sửa gì.** Kể cả khi họ đã nói "review rồi sửa luôn" — một
-   review làm lộ vấn đề mới thì lời cho phép cũ không còn phủ hết.
-6. **Viết test từ chính input tấn công**, xem nó fail, rồi mới sửa. Xem
+1. **Agree the scope with the user.** Narrower than you think. Three 8-minute agents
+   return results sooner and bound the damage better than one 28-minute agent.
+2. **Run two independent reviewers**: different models, or different efforts. No shared
+   context, and neither sees the other's results. See `references/running-reviewers.md`.
+3. **Reproduce every finding before trusting it.** This step is never skipped. A
+   confident reviewer can still be wrong.
+4. **Present the findings verbatim**, and only then your assessment, in a separate
+   section. Compressing the reviewer's verdict into your own summary destroys the reason
+   for asking.
+5. **The user decides what to fix.** Even if they said "review and then fix it": a review
+   that surfaces new problems is no longer covered by the earlier permission.
+6. **Write tests from the attack inputs themselves**, watch them fail, then fix. See
    `references/findings-to-tests.md`.
-7. **Review lại** nếu đã sửa nhiều. Mỗi vòng ở đây đều tìm ra thứ vòng trước bỏ sót.
+7. **Review again** after substantial fixes. Every round here found something the
+   previous round missed.
 
-## Vì sao phải hai reviewer
+## Why two reviewers
 
-Không phải để chắc chắn hơn. Là vì **điểm mù của reviewer này thường là phát hiện
-chính của reviewer kia**. Trong lần chạy sinh ra skill này: một bên tìm ra biến môi
-trường `GREP_OPTIONS=-h` khiến scanner in credential ra stdout, trong khi bên kia
-kết luận chính đường đó "không thể lộ nội dung". Bên kia tìm ra lệnh build tự khoá
-chết cơ chế xác thực của nó ở lần chạy thứ hai — bên đầu không thấy.
+Not for more certainty. Because **one reviewer's blind spot is often the other's
+headline finding**. In the run that produced this skill, one reviewer found that the
+environment variable `GREP_OPTIONS=-h` made a scanner print credentials to stdout, while
+the other concluded that the same path "cannot emit content". The other found that a
+build command locked its own verification mechanism on its second run, which the first
+missed.
 
-Nếu chỉ chạy được một, hãy nói rõ với người dùng rằng đó là một góc nhìn, không phải
-một kết luận.
+If only one can be run, tell the user plainly that it is one perspective, not a verdict.
 
-## Việc không được làm
+## What not to do
 
-- **Đừng tin finding chưa tái hiện.** Chạy lại. Ghi rõ cái nào tái hiện được, cái nào
-  không — trong lần chạy nói trên có một finding về ký tự Unicode không tái hiện được.
-- **Đừng nén báo cáo của reviewer** thành tóm tắt của mình rồi bắt tay sửa.
-- **Đừng báo con số token mà agent tự trả về** như là chi phí — đó là kích thước
-  context ở lượt cuối, không phải tổng tiêu thụ. Sai hai bậc độ lớn.
-- **Đừng `Read` file `.output` của local agent** — nó là transcript JSONL đầy đủ,
-  đọc vào là tràn context. Dùng `scripts/agent-health.sh`.
+- **Don't trust an unreproduced finding.** Run it again. Record which findings reproduced
+  and which did not; in the run above, one finding about a Unicode character did not
+  reproduce.
+- **Don't compress a reviewer's report** into your own summary and start fixing.
+- **Don't report the token count an agent returns** as its cost: that is the context
+  size of its final turn, not total consumption. It is off by two orders of magnitude.
+- **Don't `Read` a local agent's `.output` file**: it is the full JSONL transcript, and
+  reading it floods the context. Use `scripts/agent-health.sh`.
 
-## Khi sub-agent im lặng
+## When a sub-agent goes quiet
 
-Im lặng có ba nghĩa, cần ba cách xử lý ngược nhau. Đừng chờ thêm — chẩn đoán:
+Silence means one of three things, and they need opposite responses. Don't wait longer;
+diagnose:
 
 ```bash
 scripts/agent-health.sh <task-id>
 ```
 
-| Kết quả | Nghĩa | Làm gì |
-|---|---|---|
-| `WORKING` | File vẫn lớn lên | Chờ |
-| `STALLED?` | Đứng yên vài phút, còn tiến trình claude | `SendMessage` giục — thường xong việc rồi mà kẹt ở tin nhắn cuối |
-| `DEAD` | Không còn tiến trình nào | `TaskStop` rồi chạy lại |
-| `DONE` | Có dòng exit trong output | Đọc kết quả, đừng giục |
-| `IDLE` | Im lặng rất lâu (mặc định >30 phút) | Gần như chắc đã xong — xem kết quả agent trước, đừng giục |
+| Result     | Meaning                                                        | What to do                                                                      |
+| ---------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `WORKING`  | The file is still growing                                      | Wait                                                                            |
+| `STALLED?` | Unchanged for a few minutes, a claude process is still running | `SendMessage` a nudge; it has usually finished and is stuck on its last message |
+| `DEAD`     | No process left                                                | `TaskStop`, then rerun                                                          |
+| `DONE`     | The output has an exit line                                    | Read the result; don't nudge                                                    |
+| `IDLE`     | Silent for a very long time (default >30 minutes)              | Almost certainly finished: check the agent's result before nudging              |
 
-Dấu `?` trong `STALLED?` là cố ý: không map được task id sang pid, nên "còn tiến
-trình claude" chỉ nói *có thứ gì đó* đang chạy, không nói task này còn sống. Quá
-ngưỡng `IDLE` thì tín hiệu đó vô nghĩa và script ngừng dựa vào nó.
+The `?` in `STALLED?` is deliberate: a task id cannot be mapped to a pid, so "a claude
+process is still running" only says _something_ is running, not that this task is alive.
+Past the `IDLE` threshold that signal means nothing and the script stops relying on it.
 
-Harness tự báo khi task **xong**, nên đừng poll bằng vòng `sleep`. Nó **không** báo
-khi task *im lặng* — đó là khoảng trống, lấp bằng `Monitor` phát sự kiện khi
-transcript ngừng lớn.
+The harness notifies you when a task **finishes**, so don't poll with a `sleep` loop. It
+does **not** notify you when a task goes _quiet_. That gap is covered by a `Monitor` that
+emits an event when the transcript stops growing.
 
-## Viết prompt cho reviewer
+## Writing the reviewer prompt
 
-Mỗi prompt bắt buộc có ba thứ, nếu không nó sẽ chạy tới khi bạn phải giục:
+Every prompt needs three things, or it runs until you have to nudge it:
 
-- **Điều kiện dừng**: "sau tối đa N tool call, dừng và báo cáo những gì đã có; vùng
-  nào chưa tới thì ghi một dòng".
-- **Ghi kết quả dần ra file**, không dồn hết vào tin nhắn cuối. Mất một tin nhắn
-  không được làm mất 30 phút công.
-- **Danh sách lệnh cấm chạy**, kèm lý do — bất cứ thứ gì chờ prompt UI (Touch ID,
-  sudo, xác nhận tương tác) sẽ treo vô hạn.
+- **A stopping rule**: "after at most N tool calls, stop and report what you have; for
+  areas you did not reach, write one line".
+- **Write findings to a file as you go**, not all in the final message. Losing one
+  message must not lose 30 minutes of work.
+- **A list of commands it must not run**, with the reason: anything that waits on a UI
+  prompt (Touch ID, sudo, an interactive confirmation) hangs forever.
 
-Mẫu đầy đủ trong `references/running-reviewers.md`.
+The full template is in `references/running-reviewers.md`.

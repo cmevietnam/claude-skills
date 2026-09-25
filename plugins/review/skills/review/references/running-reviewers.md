@@ -1,92 +1,96 @@
-# Chạy reviewer
+# Running reviewers
 
-## Trước tiên: hỏi
+## First: ask
 
-Không spawn reviewer mà chưa hỏi. Đưa ước lượng thật, không nói chung chung:
+Don't spawn a reviewer without asking. Give a real estimate, not a vague one:
 
-> Review `plugins/foo` (~1500 dòng) bằng hai model độc lập. Mức `xhigh` mất khoảng
-> 30 phút mỗi bên. Chi phí đi theo kích thước context nhân số vòng lặp — reviewer
-> đọc lại toàn bộ ngữ cảnh ở mỗi tool call, nên phạm vi hẹp rẻ hơn nhiều so với
-> báo cáo ngắn. Chạy chứ?
+> Review `plugins/foo` (~1500 lines) with two independent models. At `xhigh` that takes
+> about 30 minutes each. Cost follows context size times number of turns: the reviewer
+> re-reads the whole context on every tool call, so a narrow scope is much cheaper than
+> a short report. Go ahead?
 
-Hỏi cả **effort** và **phạm vi**. Người dùng thường muốn hẹp hơn bạn định.
+Ask about both **effort** and **scope**. The user usually wants it narrower than you
+planned.
 
-## Chọn hai reviewer
+## Choosing two reviewers
 
-Mục tiêu là hai **góc nhìn khác nhau**, không phải hai lần cùng một góc nhìn:
+The goal is two **different perspectives**, not the same perspective twice:
 
-| Cách tách | Khi nào |
-|---|---|
-| Khác model (`fable` vs mặc định) | Tốt nhất — điểm mù khác nhau thật sự |
-| Cùng model, khác effort | Khi chỉ có một model; `max` vs `high` |
-| Cùng model, khác trọng tâm prompt | Yếu nhất; chỉ dùng khi không còn cách nào |
+| How to split                          | When                                              |
+| ------------------------------------- | ------------------------------------------------- |
+| Different models (`fable` vs default) | Best: the blind spots genuinely differ            |
+| Same model, different effort          | When only one model is available; `max` vs `high` |
+| Same model, different prompt emphasis | Weakest; use only when nothing else is left       |
 
-Chạy **tuần tự**, không song song. Chạy song song thì bạn không thấy chi phí vòng
-một trước khi mở vòng hai — và nếu vòng một đã đủ, vòng hai là lãng phí.
+Run them **sequentially**, not in parallel. In parallel you don't see the cost of round
+one before starting round two, and if round one was enough, round two is waste.
 
-Không cho reviewer thứ hai xem kết quả của reviewer thứ nhất. Cả giá trị nằm ở chỗ
-nó đi tới kết luận độc lập.
+Don't show the second reviewer the first one's results. Its whole value is reaching a
+conclusion independently.
 
-## Mẫu prompt
+## Prompt template
 
-Ba phần in đậm là bắt buộc; thiếu chúng là lý do agent chạy tới khi bạn phải giục.
+The three bold parts are mandatory; leaving them out is why agents run until you have to
+nudge them.
 
 ```
-Review <phạm vi cụ thể> tại <commit>. Bỏ qua <những gì không thuộc phạm vi>.
-Không sửa file nào.
+Review <specific scope> at <commit>. Ignore <what is out of scope>.
+Do not modify any file.
 
-<Mô tả hệ thống làm gì và hai ba mục tiêu thiết kế, kèm câu "hãy đánh giá phê phán
-chứ đừng mặc nhiên chấp nhận">
+<Describe what the system does and its two or three design goals, with the sentence
+"evaluate these critically rather than accepting them as given">
 
-<Nếu đã có vòng review trước: liệt kê những gì bên kia tìm ra và nói rõ "đừng cho
-rằng các bản vá đó đúng — hãy kiểm chứng, và tìm xem chính chúng làm hỏng gì">
+<If there was an earlier review round: list what it found and say plainly "do not assume
+those fixes are correct — verify them, and look for what they themselves break">
 
-Ưu tiên theo thứ tự:
-A. <vùng rủi ro cao nhất, thường là code mới nhất>
+Priorities, in order:
+A. <the highest-risk area, usually the newest code>
 B. ...
 
-**Điều kiện dừng: sau tối đa N tool call, dừng điều tra và viết báo cáo với những
-gì đã có. Vùng nào chưa tới thì ghi một dòng, đừng đào tiếp.**
+**Stopping rule: after at most N tool calls, stop investigating and write the report
+with what you have. For areas you did not reach, write one line; do not keep digging.**
 
-**Ghi phát hiện dần vào <file> ngay khi tìm ra, đừng dồn hết vào tin nhắn cuối.**
+**Write each finding to <file> as soon as you find it; do not save everything for the
+final message.**
 
-**Không chạy: <các lệnh chờ prompt UI — Touch ID, sudo, xác nhận tương tác>.
-Chúng treo vô hạn.**
+**Do not run: <commands that wait on a UI prompt — Touch ID, sudo, interactive
+confirmation>. They hang forever.**
 
-Với mỗi finding: file:dòng, cái gì hỏng, input tái hiện cụ thể, và **đã tái hiện
-thật hay chỉ suy luận**. Xếp theo mức nghiêm trọng. Cái gì ổn thì nói ngắn gọn là
-ổn — đừng độn.
+For each finding: file:line, what breaks, a concrete reproducing input, and **whether it
+was actually reproduced or only inferred**. Order by severity. Where something is fine,
+say so briefly; don't pad.
 ```
 
-Yêu cầu "đã tái hiện thật hay chỉ suy luận" đáng giá hơn vẻ ngoài: nó tách phát
-hiện chắc chắn khỏi phỏng đoán, và cho bạn biết cái nào cần kiểm lại trước.
+The "actually reproduced or only inferred" requirement is worth more than it looks: it
+separates certain findings from guesses, and tells you which to re-check first.
 
-## Trong lúc chạy
+## While it runs
 
-Đừng poll bằng vòng `sleep` — harness tự báo khi xong. Nó không báo khi agent *im
-lặng*; dùng `scripts/agent-health.sh` khi bạn nghi ngờ, hoặc `Monitor` với
-`agent-health.sh --watch <id>` để được báo khi trạng thái đổi.
+Don't poll with a `sleep` loop: the harness notifies you when it finishes. It does not
+notify you when an agent goes _quiet_; use `scripts/agent-health.sh` when you suspect
+that, or `Monitor` with `agent-health.sh --watch <id>` to be told when the state changes.
 
-Nếu phải giục: một `SendMessage` yêu cầu "dừng điều tra và viết báo cáo ngay bây
-giờ với những gì đã có". Biết rằng việc này có thể khiến nó **viết lại toàn bộ báo
-cáo** — trong lần chạy sinh ra skill này, một cú giục làm reviewer chạy lại gần như
-gấp đôi số request.
+If you have to nudge: one `SendMessage` asking it to "stop investigating and write the
+report now with what you have". Know that this can make it **rewrite the entire report**:
+in the run that produced this skill, one nudge made a reviewer run nearly twice as many
+requests.
 
-## Sau khi có kết quả
+## After the results arrive
 
-1. **Tái hiện từng finding.** Chạy đúng input reviewer đưa. Ghi lại cái nào đúng,
-   cái nào không.
-2. **Trình bày nguyên văn** — kể cả finding bạn không đồng ý, coi là ngoài phạm vi,
-   hay đã biết. Chỉnh sửa duy nhất được phép: rút gọn đường dẫn tuyệt đối thành
-   `file:dòng`, và sửa xuống dòng. Nói rõ là đã chỉnh.
-3. **Ý kiến của bạn ở mục riêng**, sau đó, có nhãn rõ ràng.
-4. **Dừng lại chờ người dùng quyết.** Kể cả khi trước đó họ đã nói "review xong thì
-   sửa luôn" — họ cho phép sửa những vấn đề họ đã biết, không phải những vấn đề
-   reviewer vừa tìm ra.
+1. **Reproduce every finding.** Run exactly the input the reviewer gave. Record which
+   are right and which are not.
+2. **Present them verbatim**, including findings you disagree with, consider out of
+   scope, or already knew. The only edits allowed: shortening absolute paths to
+   `file:line`, and fixing line breaks. Say that you made them.
+3. **Your opinion goes in a separate section**, afterwards, clearly labelled.
+4. **Stop and wait for the user to decide.** Even if they said earlier "fix it once the
+   review is done": they authorised fixing the problems they knew about, not the ones the
+   reviewer has just found.
 
-## Khi báo cáo cuối bị mất
+## When the final report is lost
 
-Nếu reviewer chạy xong mà không phát ra gì: đừng chạy lại từ đầu. Với sub-agent,
-`SendMessage` yêu cầu nó viết lại báo cáo — transcript vẫn còn, nó không phải điều
-tra lại. Đó cũng là lý do phần "ghi dần ra file" nằm trong prompt: nó biến việc mất
-tin nhắn cuối từ mất-30-phút thành bất tiện.
+If a reviewer finishes without emitting anything, don't rerun it from scratch. For a
+sub-agent, `SendMessage` asking it to write the report again: the transcript is still
+there, so it does not have to investigate again. That is also why "write to a file as
+you go" is in the prompt: it turns losing the final message from losing 30 minutes into
+an inconvenience.
