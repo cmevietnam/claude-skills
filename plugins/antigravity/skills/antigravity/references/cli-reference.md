@@ -180,7 +180,7 @@ discards the explanation of any failure.
 
 ## Models
 
-`agy models` prints `id<TAB>label`. Live list on 2026-09-07, unchanged from
+`agy models` prints `id<TAB>label`. Live list on 2026-09-25 (agy 1.2.11), unchanged from
 2026-09-05:
 
 ```
@@ -189,8 +189,8 @@ gemini-3.8-flash-medium    Gemini 3.8 Flash (Medium)
 gemini-3.8-flash-low       Gemini 3.8 Flash (Low)
 gemini-3.7-flash-high/medium/low
 gemini-3.6-flash-high/medium/low
-gemini-3.1-pro-high        Gemini 3.1 Pro (High)
-gemini-3.1-pro-low         Gemini 3.1 Pro (Low)
+gemini-3.1-pro-high        Gemini 3.1 Pro (High)   <- banned, agy-review refuses it
+gemini-3.1-pro-low         Gemini 3.1 Pro (Low)    <- banned, agy-review refuses it
 claude-sonnet-4-6          Claude Sonnet 4.6 (Thinking)
 claude-opus-4-6-thinking   Claude Opus 4.6 (Thinking)
 gpt-oss-120b-medium        GPT-OSS 120B (Medium)
@@ -223,8 +223,8 @@ So the rule is narrower than "unsuffixed ids take `--effort`": only **unsuffixed
 **explicit** `--effort` unconditionally, including to models that will reject it, so
 `agy`'s own error reaches you instead of being silently dropped.
 
-It is also why its default model is the **unsuffixed** newest Flash: every id the listing
-offers carries a suffix, and resolving to `gemini-3.8-flash-high` would turn the default
+It is also why its pinned default is the **unsuffixed** `gemini-3.8-flash`: every id the
+listing offers carries a suffix, and pinning `gemini-3.8-flash-high` would turn the default
 `--effort high` into the conflict above.
 
 A long prompt that invites a long answer can also fail after the model has run:

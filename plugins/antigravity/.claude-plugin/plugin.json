@@ -1,7 +1,7 @@
 {
   "name": "antigravity",
   "description": "Run Google's Antigravity CLI (agy) headless as a second-opinion code reviewer, refuse to trust its exit code, and report every finding to the user verbatim before touching any code.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": {
     "name": "hieuvo"
   },
