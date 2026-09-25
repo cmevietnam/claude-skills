@@ -22,51 +22,52 @@ mk(){ # <id> <age-seconds>
   printf '%s' "$f"
 }
 
-echo "phân loại trạng thái"
+echo "state classification"
 f=$(mk fresh 5)
 out=$(STALL_AFTER=180 IDLE_AFTER=1800 bash "$S" fresh)
-case "$out" in WORKING*) ok "file vừa ghi -> WORKING" ;; *) bad "fresh -> $out" ;; esac
+case "$out" in WORKING*) ok "freshly written file -> WORKING" ;; *) bad "fresh -> $out" ;; esac
 
 f=$(mk stale 600)
 out=$(STALL_AFTER=180 IDLE_AFTER=1800 bash "$S" stale)
-case "$out" in "STALLED?"*|DEAD*) ok "im lặng vừa phải -> STALLED?/DEAD" ;; *) bad "stale -> $out" ;; esac
+case "$out" in "STALLED?"*|DEAD*) ok "moderately quiet -> STALLED?/DEAD" ;; *) bad "stale -> $out" ;; esac
 
-# Quá ngưỡng IDLE thì "còn tiến trình claude" không còn nói lên gì — đó là agent
-# khác. Harness đã báo khi task xong, nên im lặng lâu gần như chắc chắn là đã kết
-# thúc, và khuyên "giục nó" ở đây là khuyên sai.
+# Past the IDLE threshold "a claude process is alive" says nothing: it is another
+# agent. The harness already notified when the task finished, so a long silence almost
+# certainly means it has ended, and advising "nudge it" here would be wrong advice.
 f=$(mk ancient 7200)
 out=$(STALL_AFTER=180 IDLE_AFTER=1800 bash "$S" ancient)
-case "$out" in IDLE*) ok "im lặng rất lâu -> IDLE, không khuyên giục" ;; *) bad "ancient -> $out" ;; esac
+case "$out" in IDLE*) ok "very long silence -> IDLE, no nudge advised" ;; *) bad "ancient -> $out" ;; esac
 
-# Lệnh nền đã xong để lại dòng exit; dấu hiệu dương này thắng mọi suy đoán từ mtime.
+# A finished background command leaves an exit line; that positive signal beats any
+# inference from mtime.
 fd="$tmp/tasks/finished.output"
 printf 'output\n\n[exited with code 0]\n' > "$fd"
 touch -t "$(date -v-9000S +%Y%m%d%H%M.%S 2>/dev/null || date +%Y%m%d%H%M.%S)" "$fd"
 out=$(STALL_AFTER=180 IDLE_AFTER=1800 bash "$S" finished)
-case "$out" in DONE*) ok "có dòng exit -> DONE dù file rất cũ" ;; *) bad "finished -> $out" ;; esac
+case "$out" in DONE*) ok "exit line present -> DONE even though the file is old" ;; *) bad "finished -> $out" ;; esac
 
-echo "số bản ghi không được đếm hai lần"
-# `grep -c` in ra 0 VÀ thoát 1 khi không khớp, nên `|| echo 0` từng in số đếm hai lần.
-n=$(printf '%s' "$out" | grep -oE '[0-9]+ bản ghi' | wc -l | tr -d ' ')
-[[ "$n" == 1 ]] && ok "đúng một trường 'bản ghi'" || bad "có $n trường 'bản ghi'"
+echo "the record count must not be printed twice"
+# `grep -c` prints 0 AND exits 1 on no match, so `|| echo 0` used to print the count twice.
+n=$(printf '%s' "$out" | grep -oE '[0-9]+ records' | wc -l | tr -d ' ')
+[[ "$n" == 1 ]] && ok "exactly one 'records' field" || bad "$n 'records' fields"
 lines=$(printf '%s' "$out" | wc -l | tr -d ' ')
-[[ "$lines" == 0 ]] && ok "kết quả gọn trên một dòng" || bad "kết quả tràn $((lines+1)) dòng"
+[[ "$lines" == 0 ]] && ok "the verdict fits on one line" || bad "the verdict spilled over $((lines+1)) lines"
 
-echo "nhận task qua id và qua đường dẫn"
+echo "a task is accepted by id and by path"
 out=$(STALL_AFTER=180 IDLE_AFTER=1800 bash "$S" "$tmp/tasks/fresh.output")
-case "$out" in WORKING*) ok "đường dẫn đầy đủ" ;; *) bad "đường dẫn -> $out" ;; esac
-bash "$S" khong-ton-tai >/dev/null 2>&1 && bad "id sai phải lỗi" || ok "id sai -> lỗi"
+case "$out" in WORKING*) ok "full path" ;; *) bad "path -> $out" ;; esac
+bash "$S" does-not-exist >/dev/null 2>&1 && bad "an unknown id must fail" || ok "unknown id -> error"
 
-echo "--list liệt kê mọi task"
+echo "--list lists every task"
 out=$(STALL_AFTER=180 IDLE_AFTER=1800 bash "$S" --list)
 n=$(printf '%s' "$out" | grep -cE 'WORKING|STALLED|DEAD|IDLE|DONE')
-[[ "$n" == 4 ]] && ok "liệt kê đủ 4 task" || bad "--list thấy $n task (muốn 4)"
+[[ "$n" == 4 ]] && ok "all 4 tasks listed" || bad "--list saw $n tasks (want 4)"
 
-echo "KHÔNG được in nội dung transcript"
+echo "transcript content must NEVER be printed"
 all=$( { STALL_AFTER=180 IDLE_AFTER=1800 bash "$S" --list; STALL_AFTER=180 bash "$S" fresh; } 2>&1 )
 case "$all" in
-  *"$SECRET"*) bad "làm lộ nội dung transcript" ;;
-  *) ok "chỉ in số liệu và loại bản ghi" ;;
+  *"$SECRET"*) bad "leaked transcript content" ;;
+  *) ok "prints only numbers and record types" ;;
 esac
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

@@ -1,66 +1,71 @@
-# Biến finding thành test
+# Turning findings into tests
 
-## Nguyên tắc
+## Principle
 
-Bộ test xanh chỉ chứng minh những gì nó có kiểm tra. Kích thước bộ test không nói
-lên điều gì; độ phủ của **chế độ hỏng** mới nói.
+A green test suite proves only what it checks. The size of the suite says nothing;
+coverage of the **failure mode** is what counts.
 
-Thứ tự bắt buộc: **viết test trước, xem nó fail, rồi mới sửa.** Sửa trước rồi viết
-test sau thì bạn chỉ chứng minh được là code hiện tại làm điều code hiện tại làm.
+Mandatory order: **write the test first, watch it fail, then fix.** Fix first and write
+the test afterwards, and all you prove is that the current code does what the current
+code does.
 
-## Vì sao input của reviewer là nguồn tốt nhất
+## Why the reviewer's input is the best source
 
-Bạn viết test từ những hình dạng bạn nghĩ ra khi viết code — đó chính là tập hợp đã
-bỏ sót con bug. Reviewer nghĩ ra hình dạng khác. Input tấn công của nó là thứ duy
-nhất bạn có mà chắc chắn nằm ngoài trí tưởng tượng của mình.
+You write tests from the shapes you thought of while writing the code, which is exactly
+the set that missed the bug. A reviewer thinks of different shapes. Its attack input is
+the one thing you have that is guaranteed to lie outside your own imagination.
 
-Trong lần chạy sinh ra skill này: 38 test phân loại secret đều xanh, trong khi
-`DB_PASS=hunter2` bị xếp là "config" và ghi thẳng vào file mà tài liệu bảo là commit
-được — vì mọi test đều dùng giá trị mà tác giả đã nghĩ tới. Reviewer đưa `hunter2`
-trong ba giây.
+In the run that produced this skill, 38 secret-classification tests were green while
+`DB_PASS=hunter2` was classified as "config" and written straight into a file the docs
+said was safe to commit, because every test used values the author had already thought
+of. The reviewer came up with `hunter2` in three seconds.
 
-## Cách làm
+## How
 
-Với mỗi finding đã tái hiện được:
+For each finding that reproduced:
 
-1. Thêm case với **đúng input reviewer đưa**, không phải phiên bản đã dọn dẹp.
-2. Chạy — phải fail. Nếu nó pass, bạn chưa hiểu bug.
-3. Sửa.
-4. Chạy lại — phải pass, và **mọi case cũ vẫn phải pass**.
+1. Add a case with **exactly the input the reviewer gave**, not a tidied-up version.
+2. Run it: it must fail. If it passes, you have not understood the bug.
+3. Fix.
+4. Run again: it must pass, and **every earlier case must still pass**.
 
-Đặt các case này thành một nhóm có nhãn theo vòng review, để lần sau đọc lại biết
-chúng từ đâu ra:
+Put these cases in a group labelled by review round, so that a later reader knows where
+they came from:
 
 ```bash
-echo "VÒNG 3: wildcard allowlist đã bỏ — chỉ tên khớp chính xác mới thành config"
+echo "ROUND 3: wildcard allowlist removed — only exact name matches become config"
 t PUBLIC_PASSCODE     '1234'   secret
 t NEXT_PUBLIC_PINCODE '1234'   secret
 ```
 
-## Chạy test đúng môi trường production
+## Run tests in the production environment
 
-Test chạy trong shell khác với lúc chạy thật thì nó kiểm tra một chương trình khác.
-Cụ thể với bash: một hàm chạy ngon lúc test nhưng chết dưới `set -euo pipefail` là
-chuyện thường — `grep` không khớp trả về 1, và dưới `set -e` nó giết cả hàm. Trong
-lần chạy nói trên, đúng lỗi đó khiến một scanner âm thầm chỉ thử một pattern trong
-mười một, mà test vẫn xanh vì test không bật `set -e`.
+A test that runs under a different shell from the real thing is testing a different
+program. With bash specifically, a function that works under test but dies under
+`set -euo pipefail` is common: a `grep` with no match returns 1, and under `set -e` that
+kills the whole function. In the run above, exactly that bug made a scanner silently try
+only one pattern out of eleven, and the tests stayed green because they did not enable
+`set -e`.
 
-Cũng chú ý phiên bản: macOS ship bash 3.2, không có `${v,,}` hay associative array.
-Test dưới `/bin/bash`, đừng dưới bash 5 của Homebrew.
+Watch the version too: macOS ships bash 3.2, which has no `${v,,}` and no associative
+arrays. Test under `/bin/bash`, not Homebrew's bash 5.
 
-## Ba lớp bug hay lọt qua test tự viết
+## Three classes of bug that slip past self-written tests
 
-Đáng thêm case riêng cho từng lớp, vì chúng đều thuộc dạng "chạy được, làm sai việc":
+Each deserves its own case, because they are all of the "runs fine, does the wrong
+thing" kind:
 
-**Phần tử cuối bị mất.** `printf '%s'` không có newline cuối → vòng `while read` bỏ
-token cuối, mà token cuối thường là thứ quan trọng nhất (tên file, biến cuối). Luôn
-có một case đặt thứ cần bắt ở vị trí **cuối cùng**.
+**The last element is dropped.** `printf '%s'` without a trailing newline makes a
+`while read` loop skip the last token, and the last token is often the one that matters
+most (a filename, the final variable). Always have a case that puts the thing to catch in
+the **last** position.
 
-**Trường rỗng làm lệch cột.** Tab là ký tự whitespace của IFS, nên `read` gộp hai tab
-liền nhau — một trường rỗng ở giữa đẩy mọi trường sau sang trái. Dùng ký tự thay thế
-(`-`) cho trường rỗng, và test số lượng bản ghi parse được.
+**An empty field shifts the columns.** Tab is an IFS whitespace character, so `read`
+merges two adjacent tabs: one empty field in the middle shifts every later field to the
+left. Use a placeholder character (`-`) for empty fields, and test the number of records
+parsed.
 
-**Biến môi trường đổi hành vi công cụ.** `GREP_OPTIONS`, `LC_ALL`, `IFS`, `PATH` đều
-có thể làm một pipeline đúng thành sai. Nếu code phụ thuộc định dạng output của một
-công cụ, hãy ép cờ tường minh (`grep -H`) **và** test dưới biến môi trường đối
-nghịch.
+**Environment variables change a tool's behaviour.** `GREP_OPTIONS`, `LC_ALL`, `IFS` and
+`PATH` can each turn a correct pipeline into a wrong one. If the code depends on a tool's
+output format, force the flag explicitly (`grep -H`) **and** test under a hostile
+environment.

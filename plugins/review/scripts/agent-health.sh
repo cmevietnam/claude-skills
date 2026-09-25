@@ -13,10 +13,10 @@ set -uo pipefail
 usage() {
   cat >&2 <<'USAGE'
 agent-health.sh [task-id | path/to/<task-id>.output]
-agent-health.sh --list            liệt kê mọi task của session hiện tại
-agent-health.sh --watch <id>      in một dòng mỗi khi trạng thái đổi (dùng với Monitor)
+agent-health.sh --list            list every task of the current session
+agent-health.sh --watch <id>      print one line whenever the state changes (use with Monitor)
 
-Kết quả: WORKING (chờ) · STALLED (SendMessage giục) · DEAD (TaskStop rồi chạy lại)
+Verdicts: WORKING (wait) · STALLED (nudge with SendMessage) · DEAD (TaskStop, then rerun)
 USAGE
 }
 
@@ -30,8 +30,8 @@ find_tasks_dir() {
   printf '%s' "$d"
 }
 
-STALL_AFTER="${STALL_AFTER:-180}"     # giây im lặng trước khi coi là đáng ngờ
-IDLE_AFTER="${IDLE_AFTER:-1800}"      # im lặng quá lâu -> gần như chắc chắn đã kết thúc
+STALL_AFTER="${STALL_AFTER:-180}"     # seconds of silence before it counts as suspicious
+IDLE_AFTER="${IDLE_AFTER:-1800}"      # silent this long -> almost certainly finished
 
 resolve() { # <arg> -> path
   local a="$1" dir
@@ -59,26 +59,26 @@ report() { # <file>
   # A finished background command leaves its exit line in the file. That is a
   # positive signal and outranks anything inferred from mtime.
   if tail -c 400 "$f" 2>/dev/null | grep -q '\[exited with code'; then
-    printf '%-9s im lặng %6ds  %9s bytes  %4s bản ghi  cuối: %-12s %s\n' \
-      DONE "$age" "$size" "$recs" "${last:-exit}" "đã kết thúc — đọc kết quả, không cần giục"
+    printf '%-9s quiet %6ds  %9s bytes  %4s records  last: %-12s %s\n' \
+      DONE "$age" "$size" "$recs" "${last:-exit}" "finished — read the result, no need to nudge"
     return
   fi
 
   local alive; alive=$(agents_alive)
   if (( age < STALL_AFTER )); then
-    verdict=WORKING;  action="đang chạy, chờ tiếp"
+    verdict=WORKING;  action="running, keep waiting"
   elif (( age > IDLE_AFTER )); then
     # Past this point "process alive" means nothing: some other agent is running.
     # The harness notifies on completion, so a task this quiet has almost
     # certainly already ended and its result is waiting.
-    verdict=IDLE;     action="im lặng quá lâu — nhiều khả năng đã xong; xem kết quả agent / notification trước khi giục"
+    verdict=IDLE;     action="quiet for very long — most likely finished; check the agent result / notification before nudging"
   elif (( alive > 0 )); then
-    verdict="STALLED?"; action="còn tiến trình claude (không chắc là task này) — SendMessage giục nó báo cáo"
+    verdict="STALLED?"; action="a claude process is alive (not necessarily this task) — SendMessage to nudge it to report"
   else
-    verdict=DEAD;     action="không còn tiến trình nào — TaskStop rồi chạy lại"
+    verdict=DEAD;     action="no process left — TaskStop, then rerun"
   fi
 
-  printf '%-9s im lặng %6ds  %9s bytes  %4s bản ghi  cuối: %-12s %s\n' \
+  printf '%-9s quiet %6ds  %9s bytes  %4s records  last: %-12s %s\n' \
     "$verdict" "$age" "$size" "$recs" "${last:-?}" "$action"
 }
 
@@ -86,14 +86,14 @@ case "${1:-}" in
   -h|--help|"") usage; exit 0 ;;
   --list)
     dir=$(find_tasks_dir)
-    [[ -n "$dir" ]] || { echo "không tìm thấy thư mục tasks" >&2; exit 1; }
+    [[ -n "$dir" ]] || { echo "tasks directory not found" >&2; exit 1; }
     echo "$dir"
     for f in "$dir"/*.output; do
       [[ -f "$f" ]] || continue
       printf '%-20s ' "$(basename "$f" .output)"; report "$f"
     done ;;
   --watch)
-    f=$(resolve "${2:-}") || { echo "không tìm thấy task ${2:-}" >&2; exit 1; }
+    f=$(resolve "${2:-}") || { echo "task not found: ${2:-}" >&2; exit 1; }
     prev=""
     while true; do
       cur=$(report "$f" | awk '{print $1}')
@@ -103,6 +103,6 @@ case "${1:-}" in
       sleep "${WATCH_INTERVAL:-60}"
     done ;;
   *)
-    f=$(resolve "$1") || { echo "không tìm thấy task '$1' (thử --list)" >&2; exit 1; }
+    f=$(resolve "$1") || { echo "task '$1' not found (try --list)" >&2; exit 1; }
     report "$f" ;;
 esac

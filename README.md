@@ -1,50 +1,50 @@
 # claude-skills
 
-Claude Code plugin marketplace cá nhân — skills dùng chung cho mọi project, cài một
-lần ở user scope.
+A personal Claude Code plugin marketplace: skills shared across every project, installed
+once at user scope.
 
-## Cài
+## Install
 
 ```bash
 claude plugin marketplace add cmevietnam/claude-skills
 claude plugin install onepassword@hieuvo-skills
 ```
 
-Phát triển tại chỗ, không qua marketplace:
+Local development, without going through the marketplace:
 
 ```bash
 claude --plugin-dir ./plugins/onepassword
-# sau khi sửa: /reload-plugins
+# after editing: /reload-plugins
 ```
 
 ## Plugins
 
-| Plugin                               | Làm gì                                                                                                                                                                                                           |
+| Plugin                               | What it does                                                                                                                                                                                                     |
 | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`onepassword`](plugins/onepassword) | Truy cập secrets từ 1Password với Touch ID gate mỗi lần dùng, và giữ giá trị secret không lọt vào transcript của model.                                                                                          |
+| [`onepassword`](plugins/onepassword) | Reach secrets in 1Password behind a Touch ID gate on every use, and keep secret values out of the model's transcript.                                                                                            |
 | [`linode`](plugins/linode)           | Work with Linode inside the project's tag boundary: resources are created with the project tag, and writes to another project's resources are refused.                                                           |
-| [`review`](plugins/review)           | Quy trình review đối kháng bằng nhiều model Claude độc lập, và script chẩn đoán sub-agent im lặng hay treo thật.                                                                                                 |
+| [`review`](plugins/review)           | Adversarial review with several independent Claude models, plus a script that tells a quiet sub-agent from a hung one.                                                                                           |
 | [`codex`](plugins/codex)             | Run OpenAI's Codex CLI as a second opinion, and require every finding to reach the user verbatim before any code is changed.                                                                                     |
 | [`antigravity`](plugins/antigravity) | Run Google's Antigravity CLI (`agy`) headless as a second-opinion reviewer — and refuse to trust its exit code, which reports SUCCESS on runs whose every tool was denied and whose output is empty.             |
 | [`k8s-local`](plugins/k8s-local)     | Run a project's whole stack on a local Kubernetes cluster: build straight into the cluster's image store, refuse any context whose name and API server address are not local, and keep the datastores throwaway. |
 
-## Thêm một skill mới
+## Adding a new skill
 
 ```
-plugins/<tên>/
+plugins/<name>/
 ├── .claude-plugin/plugin.json     # name, description, version
-├── skills/<tên>/SKILL.md          # frontmatter: name + description
-│   └── references/*.md            # chi tiết dài, load khi cần
-├── hooks/hooks.json               # tuỳ chọn
-├── bin/                           # tuỳ chọn; vào PATH của Bash tool khi plugin bật
-└── scripts/                       # tuỳ chọn
+├── skills/<name>/SKILL.md         # frontmatter: name + description
+│   └── references/*.md            # long details, loaded on demand
+├── hooks/hooks.json               # optional
+├── bin/                           # optional; on the Bash tool PATH while the plugin is on
+└── scripts/                       # optional
 ```
 
-Rồi thêm một entry vào `.claude-plugin/marketplace.json` và kiểm tra:
+Then add an entry to `.claude-plugin/marketplace.json` and validate:
 
 ```bash
-claude plugin validate ./plugins/<tên>
+claude plugin validate ./plugins/<name>
 ```
 
-Giữ `SKILL.md` ngắn — nó nằm trong context mọi session. Chi tiết đẩy sang
-`references/`, Claude tự đọc khi cần.
+Keep `SKILL.md` short: it sits in the context of every session. Push details into
+`references/`, which Claude reads when it needs them.

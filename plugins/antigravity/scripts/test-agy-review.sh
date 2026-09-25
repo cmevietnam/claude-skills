@@ -313,7 +313,7 @@ EOF
 
 # Non-ASCII must survive a C locale: agy writes UTF-8 regardless of the environment.
 cat > "$TMP/utf8.json" <<'EOF'
-{"conversation_id":"x","status":"SUCCESS","response":"Finding 1 — cấu hình → hỏng\n",
+{"conversation_id":"x","status":"SUCCESS","response":"Finding 1 — café → ошибка → 設定\n",
  "duration_seconds":1.0,"num_turns":1,"usage":{"total_tokens":10}}
 EOF
 
@@ -370,7 +370,7 @@ expect_fail "deeply nested JSON"       1 "nested too deeply"       --check "$TMP
 
 expect_pass "real review"              "$GOOD_STDOUT"            --check "$TMP/good.json"
 expect_pass "NO FINDINGS is a result"  "NO FINDINGS$NL"          --check "$TMP/good-no-findings.json"
-expect_pass "non-ASCII response"       "Finding 1 — cấu hình → hỏng$NL" --check "$TMP/utf8.json"
+expect_pass "non-ASCII response"       "Finding 1 — café → ошибка → 設定$NL" --check "$TMP/utf8.json"
 expect_pass "denied_actions null is a success shape"  "NO FINDINGS$NL" --check "$TMP/denied-null.json"
 expect_pass "denied_actions [] is a success shape"    "NO FINDINGS$NL" --check "$TMP/denied-empty.json"
 expect_pass "leading whitespace is preserved verbatim" "    indented finding$NL" \
@@ -392,7 +392,7 @@ expect_pass "interior and trailing blank lines survive" "line one$NL$NL" \
 
 # The response must survive an ASCII locale — agy's output is UTF-8 either way.
 LC_ALL=C PYTHONUTF8=0 expect_pass "non-ASCII response under LC_ALL=C" \
-  "Finding 1 — cấu hình → hỏng$NL" --check "$TMP/utf8.json"
+  "Finding 1 — café → ошибка → 設定$NL" --check "$TMP/utf8.json"
 
 # --- run-path cases, driven by a stub agy --------------------------------------------
 
