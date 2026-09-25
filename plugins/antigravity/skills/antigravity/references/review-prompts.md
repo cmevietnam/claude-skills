@@ -114,13 +114,12 @@ git diff main...HEAD > "$S/diff.txt"     # committed only — omits uncommitted 
 
 cat "$S/preamble.txt" "$S/instructions.txt" "$S/diff.txt" > "$S/prompt.txt"
 
-agy-review --out "$S/flash" "$S/prompt.txt"        # newest Flash, effort high
+agy-review --out "$S/flash" "$S/prompt.txt"        # gemini-3.8-flash, effort high
 ```
 
-With no `--model`, `agy-review` asks `agy models` for the newest Flash generation and
-prints which id it picked. Pass `--model <id>` when the run has to be reproducible — a
-re-run weeks later would otherwise silently use a newer model than the one the findings
-were attributed to.
+With no `--model`, `agy-review` uses the pinned default, `gemini-3.8-flash` at
+`--effort high`, and prints it on its `model:` line. The effort on the summary line can be
+lower if the retry ladder stepped it down; attribute the findings to that one.
 
 Without `set -e` and the emptiness check, a missing base branch leaves `diff.txt` empty,
 the model reviews the instructions alone, and a confident `NO FINDINGS` comes back on a
@@ -182,8 +181,9 @@ What this costs, and it is not nothing:
 - Report the findings **per part**, naming the part in the heading — merging them silently
   hides that no reviewer saw the whole change.
 
-The other way to keep the effort is a model with a different budget:
-`--model gemini-3.1-pro-high`, or a Claude id. That changes the reviewer, so it is a
+The other way to keep the effort is a model with a different budget: a Claude id such as
+`claude-opus-4-6-thinking`. Never `gemini-3.1-pro`, which is banned and which
+`agy-review` refuses. That changes the reviewer, so it is a
 second opinion rather than the same review — which on security-sensitive code you wanted
 anyway.
 
@@ -205,9 +205,10 @@ and exits 0, so a failed run is indistinguishable from a quiet one.
 
 ## Choosing the model
 
-Start with the default — the newest Flash, at `--effort high`. Escalate to
-`gemini-3.1-pro-high` for subtle concurrency, cross-module invariants, or cryptographic
-logic.
+Start with the default: `gemini-3.8-flash` at `--effort high`. **Never use
+`gemini-3.1-pro`**, not even for subtle concurrency, cross-module invariants or
+cryptographic logic. It is banned, and `agy-review` refuses it. For those, add a Claude
+reviewer (below) instead.
 
 For a genuine second opinion — a different training run, different blind spots — use
 `claude-opus-4-6-thinking`. On security-sensitive code run both and diff the findings
