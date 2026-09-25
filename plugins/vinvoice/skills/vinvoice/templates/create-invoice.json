@@ -1,0 +1,104 @@
+{
+  "//": "POST {base}/InvoiceWS/createInvoice/{supplierTaxCode} — one VAT invoice, one line, VND, paid by transfer. Strip every // key before sending; JSON has no comments. Field notes: ../references/api-contract.md",
+
+  "generalInvoiceInfo": {
+    "//invoiceType": "TT78 code. \"1\" = hóa đơn GTGT. The TT32 vocabulary (01GTKT…) is the other era.",
+    "invoiceType": "1",
+    "//templateCode": "mẫu số, from the portal or `vinvoice templates`",
+    "templateCode": "1/001",
+    "//invoiceSeries": "ký hiệu. NOT invoiceSeri — that is a search field. Max 25, ^[a-zA-Z0-9/]*$",
+    "invoiceSeries": "C26TAA",
+    "currencyCode": "VND",
+    "exchangeRate": 1,
+    "//adjustmentType": "1 gốc · 3 thay thế · 5 điều chỉnh thông tin · 7 xóa bỏ · 9 điều chỉnh tiền · 11 chiết khấu TM",
+    "adjustmentType": "1",
+    "paymentStatus": true,
+    "cusGetInvoiceRight": true,
+    "//invoiceIssuedDate": "epoch MILLISECONDS. Seconds date the invoice to 1970.",
+    "invoiceIssuedDate": 1788000000000,
+    "//transactionUuid": "derive it from your own invoice row id — never a clock, never random, or a retry looks like a second sale",
+    "transactionUuid": "0198f0d4-0000-7000-8000-000000000000"
+  },
+
+  "buyerInfo": {
+    "buyerName": "Nguyễn Văn A",
+    "//buyerLegalName": "tên đơn vị, when the buyer is an organisation",
+    "buyerLegalName": null,
+    "//buyerTaxCode": "omit for a retail individual, and set buyerNotGetInvoice instead",
+    "buyerTaxCode": null,
+    "//buyerAddressLine": "NOT buyerAddress — that name belongs to the search response",
+    "buyerAddressLine": "123 Đường ABC, Quận 1, TP. Hồ Chí Minh",
+    "buyerPhoneNumber": null,
+    "//buyerEmail": "Viettel sends the invoice here; the platform needs no mail path of its own",
+    "buyerEmail": "buyer@example.com",
+    "//buyerNotGetInvoice": "Integer. 0 = người mua CÓ lấy hóa đơn (default), 1 = KHÔNG lấy. The correct marker for a retail individual with no MST; the sale is still declared.",
+    "buyerNotGetInvoice": 0
+  },
+
+  "//payments": "paymentMethodName is REQUIRED; paymentMethod defaults to 5 (KHAC) when omitted, which mislabels every transfer. Send both. Legacy codes 1 TM · 2 CK · 3 TM/CK · 4 DTCN · 5 KHAC; later ones 6 Tiền mặt · 7 Chuyển khoản · 8 Tiền mặt/Chuyển khoản · 9 Thẻ quốc tế.",
+  "payments": [
+    {
+      "paymentMethod": "2",
+      "paymentMethodName": "CK"
+    }
+  ],
+
+  "itemInfo": [
+    {
+      "lineNumber": 1,
+      "//selection": "line KIND, not a tax character: 1 hàng hóa · 2 ghi chú · 3 chiết khấu · 4 phí khác · 5 khuyến mại · 6 hàng hóa đặc trưng",
+      "selection": 1,
+      "itemCode": null,
+      "itemName": "Khóa học ABC",
+      "unitName": "Lần",
+      "quantity": 1,
+      "//unitPrice": "tax-EXCLUSIVE, as are the WithoutTax totals",
+      "unitPrice": 909091,
+      "itemTotalAmountWithoutTax": 909091,
+      "itemTotalAmountAfterDiscount": 909091,
+      "itemTotalAmountWithTax": 1000000,
+      "//taxPercentage": "10 · 8 · 5 · 0, or -1 KCT / -2 KKKNT. The negatives are codes, not rates.",
+      "taxPercentage": 10,
+      "//taxAmount": "the REMAINDER: gross - net. Never a second rounding.",
+      "taxAmount": 90909,
+      "discount": null,
+      "itemDiscount": null,
+      "itemNote": null,
+      "//isIncreaseItem": "direction on an adjustment line: true tăng, false giảm",
+      "isIncreaseItem": null
+    }
+  ],
+
+  "//taxBreakdowns": "one entry per distinct rate on the invoice",
+  "taxBreakdowns": [
+    {
+      "taxPercentage": 10,
+      "taxableAmount": 909091,
+      "taxAmount": 90909
+    }
+  ],
+
+  "summarizeInfo": {
+    "sumOfTotalLineAmountWithoutTax": 909091,
+    "totalAmountAfterDiscount": 909091,
+    "totalAmountWithoutTax": 909091,
+    "totalTaxAmount": 90909,
+    "totalAmountWithTax": 1000000,
+    "totalAmountWithTaxInWords": null,
+    "discountAmount": 0
+  },
+
+  "//metadata": "an ARRAY of {keyTag, stringValue, valueType, keyLabel}",
+  "metadata": [
+    {
+      "keyTag": "invoiceNote",
+      "stringValue": "",
+      "valueType": "text",
+      "keyLabel": "Ghi chú"
+    }
+  ],
+
+  "//validation": "Do NOT send validation: 0. It makes Viettel accept these totals verbatim instead of recomputing them, discarding a free check that your arithmetic agrees with theirs.",
+
+  "//replacement-and-adjustment": "adjustmentType 3 (thay thế) and 5 (điều chỉnh) additionally carry originalInvoiceId, originalInvoiceIssueDate (ms), additionalReferenceDesc, additionalReferenceDate (ms) — and 5 also adjustmentInvoiceType, with isIncreaseItem on every line. adjustmentType 7 (xóa bỏ) is how an invoice is voided under TT78, since the cancel endpoint is retired; confirm its exact shape on the sandbox before writing it."
+}

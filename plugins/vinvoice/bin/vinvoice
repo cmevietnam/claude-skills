@@ -1,0 +1,469 @@
+#!/usr/bin/env bash
+# vinvoice - a READ-ONLY probe for the Viettel S-Invoice (vInvoice) API.
+#
+# What it is for: proving, before a line of integration code is written, that the
+# base URL, the credentials, the source IP whitelist and the registered
+# mẫu số / ký hiệu are all what you think they are. Every one of those has a
+# failure mode that arrives disguised as one of the others.
+#
+# What it deliberately cannot do: issue, replace, adjust or void an invoice.
+# Those are filings with the cơ quan thuế, they are the application's job, and
+# they must go out with the frozen snapshot and the deterministic transactionUuid
+# that only the application has. A CLI that could send one would eventually send
+# one by accident.
+#
+# Standalone: needs curl, and python3 for formatting. Nothing from Claude Code.
+# Symlink it onto PATH and use it like any other tool.
+set -euo pipefail
+
+# Resolve through any symlinks before locating the library: `pwd -P` resolves the
+# link's DIRECTORY, not the link, so ~/bin/vinvoice would look for ~/scripts/lib.
+# macOS readlink has no -f, hence the loop.
+vi_self=${BASH_SOURCE[0]}
+while [ -L "$vi_self" ]; do
+  vi_link=$(readlink -- "$vi_self")
+  case "$vi_link" in
+    /*) vi_self=$vi_link ;;
+    *) vi_self=$(dirname -- "$vi_self")/$vi_link ;;
+  esac
+done
+here=$(cd -- "$(dirname -- "$vi_self")" && pwd -P)
+unset vi_self vi_link
+# shellcheck source=../scripts/lib/common.sh
+. "$here/../scripts/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+vinvoice - read-only probe for the Viettel S-Invoice (vInvoice) API
+
+  vinvoice check                    validate the configuration and prove a call lands
+  vinvoice templates                mẫu số + ký hiệu registered for this tax code
+  vinvoice lookup <transactionUuid> find an invoice by the uuid we sent (7.21)
+  vinvoice search --from <d> --to <d> [--invoice-no N] [--page N] [--per N]
+  vinvoice file <invoiceNo> [--type PDF|ZIP] [--out FILE]
+  vinvoice login                    POST /auth/login; says whether a token came back
+  vinvoice egress-ip                the source IP the vendor sees (calls an external service)
+  vinvoice env                      the resolved configuration, password masked
+
+Options:
+  --env-file <file>   load KEY=VALUE lines before running (never executed)
+  --raw               print the vendor's bytes verbatim, no formatting (NOT redacted)
+  -h, --help
+
+Configuration (environment, or --env-file):
+  VIETTEL_INVOICE_BASE_URL           …/api/InvoiceAPI  (must end there)
+  VIETTEL_INVOICE_USERNAME           the supplier tax code, branch suffix included
+  VIETTEL_INVOICE_PASSWORD
+  VIETTEL_INVOICE_SUPPLIER_TAX_CODE  path/form parameter on most endpoints
+  VIETTEL_INVOICE_TEMPLATE_CODE      mẫu số   — `check` and `file` use it
+  VIETTEL_INVOICE_SERIAL             ký hiệu  — `check` confirms it is registered
+  VINVOICE_TIMEOUT                   seconds, default 20
+                                     (VIETTEL_INVOICE_TIMEOUT_SECONDS is accepted too)
+
+Issuing an invoice is NOT available here, by design. See `vinvoice create`.
+EOF
+}
+
+# --- shared plumbing --------------------------------------------------------
+
+VI_RAW=0
+VI_TMPDIR=""
+cleanup() { [ -n "$VI_TMPDIR" ] && rm -rf "$VI_TMPDIR"; return 0; }
+trap cleanup EXIT
+
+# Sets the global rather than echoing a path: a `dir=$(ensure_tmp)` would create
+# the directory inside a subshell, leaving the parent's variable empty and the
+# EXIT trap with nothing to remove — a credential-adjacent temp directory left
+# behind on every run.
+ensure_tmp() {
+  [ -n "$VI_TMPDIR" ] || VI_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/vinvoice.XXXXXX")
+}
+
+# call POSTs <body> to <path> under the configured base URL and reports.
+#
+# The base URL is validated on every call rather than once at startup, because
+# --env-file can supply it after the arguments were parsed.
+call() { # <path> <content_type> <body> [report_key]...
+  local path=$1 ct=$2 body=$3
+  shift 3
+  vi_require_env $VI_ENV_VARS || exit 1
+  vi_validate_base_url "$VIETTEL_INVOICE_BASE_URL" || exit 1
+
+  local out bodyfile code rc
+  ensure_tmp
+  out="$VI_TMPDIR/response"
+  bodyfile="$VI_TMPDIR/request"
+  printf '%s' "$body" >"$bodyfile"
+
+  rc=0
+  code=$(vi_post "${VIETTEL_INVOICE_BASE_URL%/}$path" "$ct" "$bodyfile" "$out") || rc=$?
+  vi_step "POST $path -> ${code:-no status}"
+  vi_classify "$rc" "${code:-000}" "$out" || exit 1
+
+  if [ "$VI_RAW" = 1 ]; then
+    cat "$out"
+    return 0
+  fi
+  vi_json_report "$out" "$@"
+}
+
+# --- subcommands ------------------------------------------------------------
+
+cmd_check() {
+  local ok=1
+  vi_info "configuration"
+  if vi_require_env $VI_ENV_VARS; then
+    vi_step "all required variables are set"
+  else
+    ok=0
+  fi
+  if [ -n "${VIETTEL_INVOICE_BASE_URL:-}" ]; then
+    if vi_validate_base_url "$VIETTEL_INVOICE_BASE_URL"; then
+      vi_step "base URL accepted: $VIETTEL_INVOICE_BASE_URL"
+    else
+      ok=0
+    fi
+  fi
+  [ "$ok" = 1 ] || exit 1
+
+  if [ "${VIETTEL_INVOICE_USERNAME}" != "${VIETTEL_INVOICE_SUPPLIER_TAX_CODE}" ]; then
+    # Not fatal — a per-user account is possible — but on every sample account the
+    # vendor ships, the username IS the tax code, so a mismatch is worth a look
+    # before it is diagnosed as a wrong password.
+    vi_warn "username and supplier tax code differ ($VIETTEL_INVOICE_USERNAME vs $VIETTEL_INVOICE_SUPPLIER_TAX_CODE) — on the vendor's own accounts they are the same value"
+  fi
+
+  vi_info "calling getAllInvoiceTemplates (read-only)"
+  # Create the temp directory HERE, in this shell. `report=$(cmd_templates)` runs
+  # the call inside a command substitution, so an ensure_tmp down there would set
+  # VI_TMPDIR in the subshell and leave this one empty — and the identity check
+  # below, which re-reads the raw response file, would have no path to read.
+  ensure_tmp
+  local report rc=0
+  report=$(cmd_templates) || rc=$?
+  # Print it BEFORE deciding. Capturing the report and then exiting on failure
+  # threw away the only explanation the operator had — including the
+  # "response is NOT JSON" line that says why the call is not proven.
+  [ -n "$report" ] && printf '%s\n' "$report"
+  if [ "$rc" != 0 ]; then
+    exit "$rc"
+  fi
+
+  vi_info "PROVEN by that one call: the base URL resolves, TLS verifies against the"
+  vi_step "public trust store, the credentials are accepted, and this machine's"
+  vi_step "source IP is whitelisted on the account. Nothing was created."
+
+  # A call that lands proves the ACCOUNT. It says nothing about whether the
+  # mẫu số and ký hiệu this project is configured with are among the ones the
+  # account actually holds — and a wrong pair is rejected on every single
+  # invoice, one invoice at a time, in production.
+  local want_tpl=${VIETTEL_INVOICE_TEMPLATE_CODE:-} want_ser=${VIETTEL_INVOICE_SERIAL:-}
+  if [ -z "$want_tpl" ] || [ -z "$want_ser" ]; then
+    [ -n "$want_tpl" ] || vi_warn "VIETTEL_INVOICE_TEMPLATE_CODE is unset — nothing to check the mẫu số against"
+    [ -n "$want_ser" ] || vi_warn "VIETTEL_INVOICE_SERIAL is unset — nothing to check the ký hiệu against"
+    vi_warn "the account is reachable, but the configured invoice identity is UNCONFIRMED"
+    exit 1
+  fi
+
+  # Without a JSON reader this check cannot be made at all — and saying "not
+  # registered" would be a lie about the account rather than a fact about this
+  # machine. An earlier revision did exactly that: the raw-JSON fallback never
+  # emits the lines the comparison matches, so a correctly configured account was
+  # reported as not holding its own mẫu số.
+  if ! vi_have_json; then
+    vi_warn "python3 is not installed, so the mẫu số / ký hiệu cannot be read out of the response"
+    vi_warn "the account is reachable, but the configured invoice identity is UNCONFIRMED"
+    exit 1
+  fi
+
+  # THE PAIR IS THE QUESTION, not the two values separately. An account holding
+  # (1/001, C26TAA) and (2/002, C26TBB) answers yes to "is 1/001 registered?" and
+  # yes to "is C26TBB registered?", while the combination this project is
+  # configured with does not exist and fails on every invoice.
+  local pairs prc=0
+  pairs=$(vi_json_pairs "$VI_TMPDIR/response" templateCode invoiceSeries) || prc=$?
+  if [ "$prc" = 0 ]; then
+    case "$pairs" in
+      *"$want_tpl|$want_ser"*)
+        vi_step "mẫu số $want_tpl and ký hiệu $want_ser are registered TOGETHER on this account"
+        return 0
+        ;;
+      *)
+        vi_warn "the PAIR mẫu số $want_tpl + ký hiệu $want_ser is not registered on this account"
+        vi_warn "the account returned these pairs:"
+        printf '%s\n' "$pairs" | while IFS='|' read -r t v; do
+          vi_step "  $t   $v"
+        done
+        vi_warn "the account is reachable, but the configured invoice identity is UNCONFIRMED"
+        exit 1
+        ;;
+    esac
+  fi
+
+  # No object in the response carried both keys, so the pairing cannot be read
+  # from this shape. Fall back to checking each value on its own, and say plainly
+  # that the combination is the part still unverified.
+  local missing=0
+  case "$report" in
+    *"templateCode: $want_tpl"*) vi_step "mẫu số $want_tpl appears in this account's list" ;;
+    *) vi_warn "mẫu số $want_tpl is NOT in the list this account returned"; missing=1 ;;
+  esac
+  case "$report" in
+    *"invoiceSeries: $want_ser"*) vi_step "ký hiệu $want_ser appears in this account's list" ;;
+    *) vi_warn "ký hiệu $want_ser is NOT in the list this account returned"; missing=1 ;;
+  esac
+  if [ "$missing" = 1 ]; then
+    vi_warn "the account is reachable, but the configured invoice identity is UNCONFIRMED"
+    exit 1
+  fi
+  vi_warn "both values exist on this account, but the response did not pair them, so"
+  vi_warn "THE COMBINATION mẫu số + ký hiệu IS STILL UNVERIFIED — confirm it on the portal"
+}
+
+cmd_templates() {
+  call "/InvoiceUtilsWS/getAllInvoiceTemplates" "application/json" \
+    "$(printf '{"taxCode":"%s","invoiceType":"all"}' "${VIETTEL_INVOICE_SUPPLIER_TAX_CODE:-}")" \
+    errorCode description templateCode invoiceSeries
+}
+
+cmd_lookup() {
+  local uuid=${1:-}
+  [ -n "$uuid" ] || vi_die "lookup needs a transactionUuid: vinvoice lookup <uuid>"
+  # form-urlencoded, not JSON — this endpoint is one of the several that are.
+  call "/InvoiceWS/searchInvoiceByTransactionUuid" "application/x-www-form-urlencoded" \
+    "transactionUuid=$(urlenc "$uuid")&supplierTaxCode=$(urlenc "${VIETTEL_INVOICE_SUPPLIER_TAX_CODE:-}")" \
+    errorCode description invoiceNo reservationCode transactionID invoiceIssuedDate
+}
+
+cmd_search() {
+  local from="" to="" invoice_no="" page=1 per=20
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from) need_value "$1" "${2:-}"; from=$2; shift; shift ;;
+      --to) need_value "$1" "${2:-}"; to=$2; shift; shift ;;
+      --invoice-no) need_value "$1" "${2:-}"; invoice_no=$2; shift; shift ;;
+      --page) need_value "$1" "${2:-}"; page=$2; shift; shift ;;
+      --per) need_value "$1" "${2:-}"; per=$2; shift; shift ;;
+      *) vi_die "search: unknown argument $1" ;;
+    esac
+  done
+  [ -n "$from" ] && [ -n "$to" ] || vi_die "search needs --from and --to (yyyy-MM-dd)"
+  local body
+  body=$(printf '{"supplierTaxCode":"%s","startDate":"%s","endDate":"%s","rowPerPage":%s,"pageNum":%s' \
+    "${VIETTEL_INVOICE_SUPPLIER_TAX_CODE:-}" "$from" "$to" "$per" "$page")
+  # `[ … ] && body=…` here would abort the whole run under `set -e` whenever no
+  # invoice number was given, which is the common case.
+  if [ -n "$invoice_no" ]; then
+    body="$body$(printf ',"invoiceNo":"%s"' "$invoice_no")"
+  fi
+  body="$body}"
+  # getInvoicesAll is the UTC+7 variant. getAllInvoices is the same search in
+  # UTC+0, and picking the wrong one silently shifts a day boundary by 7 hours —
+  # which on a month-end reconciliation moves invoices between filing periods.
+  call "/InvoiceUtilsWS/getInvoicesAll/$(urlenc "${VIETTEL_INVOICE_SUPPLIER_TAX_CODE:-}")" \
+    "application/json" "$body" errorCode description invoiceNo reservationCode
+}
+
+cmd_file() {
+  local no=${1:-} type=PDF out=""
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --type) need_value "$1" "${2:-}"; type=$2; shift; shift ;;
+      --out) need_value "$1" "${2:-}"; out=$2; shift; shift ;;
+      *) vi_die "file: unknown argument $1" ;;
+    esac
+  done
+  [ -n "$no" ] || vi_die "file needs an invoice number: vinvoice file <invoiceNo>"
+  [ -n "${VIETTEL_INVOICE_TEMPLATE_CODE:-}" ] || vi_die "file needs VIETTEL_INVOICE_TEMPLATE_CODE (mẫu số)"
+  local body
+  body=$(printf '{"supplierTaxCode":"%s","invoiceNo":"%s","templateCode":"%s","fileType":"%s"}' \
+    "${VIETTEL_INVOICE_SUPPLIER_TAX_CODE:-}" "$no" "$VIETTEL_INVOICE_TEMPLATE_CODE" "$type")
+  if [ -n "$out" ]; then
+    # Write to a temp file and move it into place only on success. A plain
+    # `> "$out"` truncates the destination the moment the redirection is set up,
+    # so a missing credential, a timeout or a 500 left an existing file at zero
+    # bytes — the call destroyed a document it never managed to fetch.
+    ensure_tmp
+    VI_RAW=1
+    call "/InvoiceUtilsWS/getInvoiceRepresentationFile" "application/json" "$body" \
+      >"$VI_TMPDIR/download"
+    mv -f "$VI_TMPDIR/download" "$out"
+    vi_info "written to $out — the RAW response. This endpoint answers with JSON, not"
+    vi_step "with a binary file, so inspect it and decode the document field before"
+    vi_step "renaming anything .pdf."
+    return 0
+  fi
+  call "/InvoiceUtilsWS/getInvoiceRepresentationFile" "application/json" "$body" \
+    errorCode description fileName fileType
+}
+
+cmd_login() {
+  vi_require_env VIETTEL_INVOICE_BASE_URL VIETTEL_INVOICE_USERNAME VIETTEL_INVOICE_PASSWORD || exit 1
+  vi_validate_base_url "$VIETTEL_INVOICE_BASE_URL" || exit 1
+  # /auth/login sits at the HOST root, not under the API base — the base URL ends
+  # at /InvoiceAPI, which is several path segments deeper.
+  local root=${VIETTEL_INVOICE_BASE_URL#*://}
+  root="${VIETTEL_INVOICE_BASE_URL%%://*}://${root%%/*}"
+
+  local out body code rc
+  ensure_tmp
+  out="$VI_TMPDIR/login"
+  # The body IS the credential, so it travels inside curl's config on stdin and
+  # never reaches the filesystem. A temp file was safe on a normal exit and not
+  # safe on SIGKILL, a panic, or a power cut.
+  body=$(printf '{"username":%s,"password":%s}' \
+    "$(json_str "$VIETTEL_INVOICE_USERNAME")" "$(json_str "$VIETTEL_INVOICE_PASSWORD")")
+  rc=0
+  code=$(vi_post_secret "$root/auth/login" "application/json" "$body" "$out") || rc=$?
+  vi_step "POST /auth/login -> ${code:-no status}"
+  vi_classify "$rc" "${code:-000}" "$out" || exit 1
+  # The token is a bearer credential: report its presence and length, never its
+  # value. Anything printed here ends up in a terminal transcript.
+  if grep -q 'access_token\|token' "$out" 2>/dev/null; then
+    vi_info "a token came back ($(wc -c <"$out" | tr -d ' ') bytes) — NOT printed"
+  else
+    vi_warn "200, but nothing token-shaped in the response"
+    # Redacted even under --raw: this is the one endpoint whose request body is
+    # the password, and a service that echoes it back would otherwise print it.
+    if [ "$VI_RAW" = 1 ]; then vi_redact "$(cat "$out")"; printf '\n'; fi
+  fi
+  vi_info "note: the invoice endpoints use HTTP Basic. This endpoint exists, and the"
+  vi_step "spec accepts a Cookie: access_token as an alternative, but the vendor's own"
+  vi_step "collection authenticates every invoice call with Basic."
+}
+
+cmd_egress_ip() {
+  # Contacts an external service. It sends nothing but the request itself, and it
+  # is the fastest answer to the question every first integration asks: which
+  # address does Viettel have to whitelist?
+  local ip
+  ip=$(curl --disable --silent --show-error --max-time 10 https://api.ipify.org || true)
+  [ -n "$ip" ] || vi_die "could not determine the egress IP (api.ipify.org unreachable)"
+  printf '%s\n' "$ip"
+  vi_info "this is the address seen by whatever this machine talks to directly."
+  vi_step "If the application egresses through a proxy or a NAT gateway, THAT address"
+  vi_step "is the one to register with Viettel — not this one."
+}
+
+cmd_env() {
+  local var value
+  for var in $VI_ENV_VARS VIETTEL_INVOICE_TEMPLATE_CODE VIETTEL_INVOICE_SERIAL \
+    VINVOICE_TIMEOUT VIETTEL_INVOICE_TIMEOUT_SECONDS; do
+    value=${!var:-}
+    case "$var" in
+      *PASSWORD*)
+        if [ -n "$value" ]; then
+          value="set (${#value} chars)"
+        else
+          value="(unset)"
+        fi
+        ;;
+      *) [ -n "$value" ] || value="(unset)" ;;
+    esac
+    printf '%-36s %s\n' "$var" "$value"
+  done
+  printf '%-36s %s\n' "(timeout in force)" "$(vi_timeout)s"
+}
+
+cmd_refuse() { # <verb>
+  cat >&2 <<EOF
+vinvoice: "$1" is not available, and that is deliberate.
+
+Issuing, replacing, adjusting or voiding an invoice files a document with the
+cơ quan thuế. It has to go out from the application, because only the
+application holds the two things that make it safe:
+
+  * the FROZEN snapshot of money, tax rate and buyer identity taken when the
+    payment settled — not whatever those values are now;
+  * a DETERMINISTIC transactionUuid derived from the invoice row, so a retry is
+    recognisable to the vendor as the same request rather than a second sale.
+
+A shell invocation has neither. Use \`vinvoice lookup <uuid>\` to find out what
+the vendor already holds, and issue from the pipeline.
+EOF
+  exit 3
+}
+
+# --- small helpers ----------------------------------------------------------
+
+# need_value dies unless a flag was given a value.
+#
+# The obvious `x=${2:-}; shift 2` aborts the whole run when the flag is the last
+# argument: `shift 2` with one positional left fails, and `set -e` turns that
+# into a silent exit 1 with NO OUTPUT AT ALL — exactly the failure mode this
+# plugin's own guidance calls out. Seven flags had it.
+#
+# Called as a statement rather than through a command substitution, so its
+# `exit` ends the program directly instead of ending a subshell and relying on
+# `set -e` to notice.
+need_value() { # <flag> <value-or-empty>
+  [ -n "${2:-}" ] || vi_die "$1 needs a value"
+}
+
+
+urlenc() { # minimal application/x-www-form-urlencoded escaping
+  local s=$1 out="" c i
+  # Byte semantics, not character semantics: percent-encoding is defined over
+  # bytes, and a UTF-8 buyer name iterated as characters would emit one escape
+  # per rune with a value above 255.
+  local LC_ALL=C
+  for ((i = 0; i < ${#s}; i++)); do
+    c=${s:i:1}
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out="$out$c" ;;
+      *) out="$out$(printf '%%%02X' "'$c")" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+json_str() { # quote a value as a JSON string
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '"%s"' "$s"
+}
+
+# --- dispatch ---------------------------------------------------------------
+
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --env-file)
+      [ -n "${2:-}" ] || vi_die "--env-file needs a path"
+      vi_load_env_file "$2"
+      shift 2
+      ;;
+    --raw) VI_RAW=1; shift ;;
+    -h | --help) usage; exit 0 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+set -- ${args+"${args[@]}"}
+
+# An `[ … ] && cmd` at the top level would ABORT the script under `set -e` every
+# time the condition is false, which here is the ordinary case.
+if [ -n "${VINVOICE_ENV_FILE:-}" ]; then
+  vi_load_env_file "$VINVOICE_ENV_FILE"
+fi
+
+cmd=${1:-}
+shift || true
+case "$cmd" in
+  check) cmd_check "$@" ;;
+  templates) cmd_templates "$@" ;;
+  lookup) cmd_lookup "$@" ;;
+  search) cmd_search "$@" ;;
+  file) cmd_file "$@" ;;
+  login) cmd_login "$@" ;;
+  egress-ip) cmd_egress_ip "$@" ;;
+  env) cmd_env "$@" ;;
+  create | issue | cancel | void | adjust | replace | delete) cmd_refuse "$cmd" ;;
+  '' | help) usage; exit 2 ;;
+  *)
+    printf 'vinvoice: unknown command %s\n\n' "$cmd" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
