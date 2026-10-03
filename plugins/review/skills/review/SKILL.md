@@ -1,6 +1,6 @@
 ---
 name: review
-description: Run adversarial review with several independent Claude models, reproduce every finding before trusting it, and turn the reviewer's attack inputs into test cases. Use when code that matters needs a hard look (security, secret handling, parsers, guardrails), when a reviewer has just returned results, or when a sub-agent has gone quiet and you need to know whether it is still alive.
+description: Run adversarial review with two independent Claude reviewers, Opus 5.5 and Sonnet 5.5, reproduce every finding before trusting it, and turn the reviewer's attack inputs into test cases. Use when code that matters needs a hard look (security, secret handling, parsers, guardrails), when a reviewer has just returned results, or when a sub-agent has gone quiet and you need to know whether it is still alive.
 ---
 
 # Adversarial review
@@ -14,25 +14,33 @@ One `xhigh` review round over ~1500 lines takes about 30 minutes and a noticeabl
 of quota. **Always ask before spawning**, and ask about both effort and scope. Never
 launch a reviewer just because the code looks like it deserves one.
 
-When you ask, give a real estimate: time, number of reviewers, and the fact that quota
-is spent by _context size times number of turns_, not by the length of the report.
+When you ask, give a real estimate: time, the two reviewers (Opus 5.5, then Sonnet 5.5),
+and the fact that quota is spent by _context size times number of turns_, not by the
+length of the report.
 
 ## The loop
 
 1. **Agree the scope with the user.** Narrower than you think. Three 8-minute agents
    return results sooner and bound the damage better than one 28-minute agent.
-2. **Run two independent reviewers**: different models, or different efforts. No shared
-   context, and neither sees the other's results. See `references/running-reviewers.md`.
-3. **Reproduce every finding before trusting it.** This step is never skipped. A
+2. **Run two independent reviewers: Opus 5.5, then Sonnet 5.5.** Two fresh agents
+   (`model: "opus"`, then `model: "sonnet"`) given the same prompt word for word. No
+   shared context, and neither sees the other's results. Never a `fork`: it inherits
+   your conversation and ignores the model override. See
+   `references/running-reviewers.md`.
+3. **Confirm each reviewer ran on its model** before you cite it as that model:
+   `scripts/agent-health.sh --model <task-id> claude-sonnet-5-5` must print `MATCH`
+   (`claude-opus-5-5` for the Opus reviewer). A reviewer on the wrong model still
+   returns a normal-looking report.
+4. **Reproduce every finding before trusting it.** This step is never skipped. A
    confident reviewer can still be wrong.
-4. **Present the findings verbatim**, and only then your assessment, in a separate
+5. **Present the findings verbatim**, and only then your assessment, in a separate
    section. Compressing the reviewer's verdict into your own summary destroys the reason
    for asking.
-5. **The user decides what to fix.** Even if they said "review and then fix it": a review
+6. **The user decides what to fix.** Even if they said "review and then fix it": a review
    that surfaces new problems is no longer covered by the earlier permission.
-6. **Write tests from the attack inputs themselves**, watch them fail, then fix. See
+7. **Write tests from the attack inputs themselves**, watch them fail, then fix. See
    `references/findings-to-tests.md`.
-7. **Review again** after substantial fixes. Every round here found something the
+8. **Review again** after substantial fixes. Every round here found something the
    previous round missed.
 
 ## Why two reviewers
@@ -44,7 +52,12 @@ the other concluded that the same path "cannot emit content". The other found th
 build command locked its own verification mechanism on its second run, which the first
 missed.
 
-If only one can be run, tell the user plainly that it is one perspective, not a verdict.
+The default pair is Opus 5.5 and Sonnet 5.5 because they are two different models, so
+their blind spots differ. When the code was written in an Opus session, the Sonnet
+reviewer is also the only one that does not share the author's model.
+
+If only one can be run, tell the user plainly which one ran and that it is one
+perspective, not a verdict.
 
 ## What not to do
 

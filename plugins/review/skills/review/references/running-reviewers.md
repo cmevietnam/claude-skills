@@ -4,26 +4,55 @@
 
 Don't spawn a reviewer without asking. Give a real estimate, not a vague one:
 
-> Review `plugins/foo` (~1500 lines) with two independent models. At `xhigh` that takes
-> about 30 minutes each. Cost follows context size times number of turns: the reviewer
+> Review `plugins/foo` (~1500 lines) with two independent reviewers, Opus 5.5 and then
+> Sonnet 5.5. At `xhigh` that takes about 30 minutes each. Cost follows context size times number of turns: the reviewer
 > re-reads the whole context on every tool call, so a narrow scope is much cheaper than
 > a short report. Go ahead?
 
 Ask about both **effort** and **scope**. The user usually wants it narrower than you
 planned.
 
-## Choosing two reviewers
+## The two reviewers: Opus 5.5 and Sonnet 5.5
 
-The goal is two **different perspectives**, not the same perspective twice:
+The goal is two **different perspectives**, not the same perspective twice. The default
+pair is two different models:
 
-| How to split                          | When                                              |
+| Reviewer | Model      | Agent tool call                                       | `--model` must show |
+| -------- | ---------- | ----------------------------------------------------- | ------------------- |
+| A        | Opus 5.5   | `subagent_type: "general-purpose"`, `model: "opus"`   | `claude-opus-5-5`   |
+| B        | Sonnet 5.5 | `subagent_type: "general-purpose"`, `model: "sonnet"` | `claude-sonnet-5-5` |
+
+- **Fresh agents, never `subagent_type: "fork"`.** A fork inherits your whole
+  conversation, so it is not independent, and it always runs on your model, ignoring
+  `model`. The "Sonnet" reviewer would silently be a second Opus that already knows your
+  reasoning.
+- **The same prompt, word for word, for both.** Only the model differs, so a difference
+  in findings comes from the model, not from the wording.
+- **Confirm the model from the transcript** once each reviewer finishes:
+
+  ```bash
+  scripts/agent-health.sh --model <task-id> claude-sonnet-5-5   # reviewer B
+  scripts/agent-health.sh --model <task-id> claude-opus-5-5     # reviewer A
+  ```
+
+  `MATCH` (exit 0) is the only pass. `MISMATCH` means the reviewer ran on another model;
+  `NONE` means the transcript holds no model id, which is no evidence either way. The
+  `opus` and `sonnet` aliases resolve to the current version (checked on 2026-10-03:
+  `claude-opus-5-5` and `claude-sonnet-5-5`). If a later run shows another version,
+  report the version that ran, not "Sonnet 5.5".
+
+If one of the two cannot run (quota exhausted, model unavailable), tell the user which
+one is missing and fall back, strongest first:
+
+| Instead of the missing reviewer       | When                                              |
 | ------------------------------------- | ------------------------------------------------- |
-| Different models (`fable` vs default) | Best: the blind spots genuinely differ            |
+| Another model (`fable`)               | The blind spots still genuinely differ            |
 | Same model, different effort          | When only one model is available; `max` vs `high` |
 | Same model, different prompt emphasis | Weakest; use only when nothing else is left       |
 
-Run them **sequentially**, not in parallel. In parallel you don't see the cost of round
-one before starting round two, and if round one was enough, round two is waste.
+Run them **sequentially**, A then B, not in parallel. In parallel you don't see the cost
+of round one before committing to round two; seeing it first lets the user narrow B's
+scope or effort. Running B is still the default: its value is the blind spot A has.
 
 Don't show the second reviewer the first one's results. Its whole value is reaching a
 conclusion independently.
@@ -77,13 +106,15 @@ requests.
 
 ## After the results arrive
 
-1. **Reproduce every finding.** Run exactly the input the reviewer gave. Record which
+1. **Confirm the model** with `scripts/agent-health.sh --model <task-id> <expected>`.
+   Label each report with the model that actually ran.
+2. **Reproduce every finding.** Run exactly the input the reviewer gave. Record which
    are right and which are not.
-2. **Present them verbatim**, including findings you disagree with, consider out of
+3. **Present them verbatim**, including findings you disagree with, consider out of
    scope, or already knew. The only edits allowed: shortening absolute paths to
    `file:line`, and fixing line breaks. Say that you made them.
-3. **Your opinion goes in a separate section**, afterwards, clearly labelled.
-4. **Stop and wait for the user to decide.** Even if they said earlier "fix it once the
+4. **Your opinion goes in a separate section**, afterwards, clearly labelled.
+5. **Stop and wait for the user to decide.** Even if they said earlier "fix it once the
    review is done": they authorised fixing the problems they knew about, not the ones the
    reviewer has just found.
 
