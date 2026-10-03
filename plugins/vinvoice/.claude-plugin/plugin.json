@@ -1,0 +1,20 @@
+{
+  "name": "vinvoice",
+  "description": "Issue Vietnamese e-invoices through Viettel S-Invoice (hóa đơn điện tử, TT78): the verified API contract, a pipeline that cannot file a sale twice, and a read-only probe CLI that refuses to create an invoice.",
+  "version": "0.1.0",
+  "author": { "name": "hieuvo" },
+  "homepage": "https://github.com/hieuvo/claude-skills",
+  "repository": "https://github.com/hieuvo/claude-skills",
+  "license": "MIT",
+  "keywords": [
+    "viettel",
+    "vinvoice",
+    "s-invoice",
+    "einvoice",
+    "hoa-don-dien-tu",
+    "vietnam",
+    "tax",
+    "vat",
+    "tt78"
+  ]
+}
