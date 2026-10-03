@@ -46,6 +46,21 @@ touch -t "$(date -v-9000S +%Y%m%d%H%M.%S 2>/dev/null || date +%Y%m%d%H%M.%S)" "$
 out=$(STALL_AFTER=180 IDLE_AFTER=1800 bash "$S" finished)
 case "$out" in DONE*) ok "exit line present -> DONE even though the file is old" ;; *) bad "finished -> $out" ;; esac
 
+echo "age is read from the transcript, not from the .output symlink"
+# A real .output is a symlink created when the task starts. Without stat -L its mtime
+# never moves, so a reviewer still writing would be called STALLED after 3 minutes,
+# and one that had stopped long ago could look fresh. Both directions are pinned.
+mkdir -p "$tmp/links"
+ago(){ date -v-"$1"S +%Y%m%d%H%M.%S; }
+lt="$tmp/links/live.jsonl"; printf '{"type":"assistant"}\n' > "$lt"
+ln -s "$lt" "$tmp/links/live.output"; touch -h -t "$(ago 600)" "$tmp/links/live.output"
+out=$(STALL_AFTER=180 IDLE_AFTER=1800 bash "$S" "$tmp/links/live.output")
+case "$out" in WORKING*) ok "old symlink, transcript still growing -> WORKING" ;; *) bad "live via symlink -> $out" ;; esac
+qt="$tmp/links/quiet.jsonl"; printf '{"type":"assistant"}\n' > "$qt"; touch -t "$(ago 600)" "$qt"
+ln -s "$qt" "$tmp/links/quiet.output"
+out=$(STALL_AFTER=180 IDLE_AFTER=1800 bash "$S" "$tmp/links/quiet.output")
+case "$out" in "STALLED?"*|DEAD*) ok "fresh symlink, transcript quiet 600s -> STALLED?/DEAD" ;; *) bad "quiet via symlink -> $out" ;; esac
+
 echo "the record count must not be printed twice"
 # `grep -c` prints 0 AND exits 1 on no match, so `|| echo 0` used to print the count twice.
 n=$(printf '%s' "$out" | grep -oE '[0-9]+ records' | wc -l | tr -d ' ')

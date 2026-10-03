@@ -52,7 +52,9 @@ agents_alive() { pgrep -f '[c]laude' 2>/dev/null | grep -c . || true; }
 report() { # <file>
   local f="$1" now age size recs last verdict action
   now=$(date +%s)
-  age=$(( now - $(stat -f %m "$f" 2>/dev/null || echo "$now") ))
+  # -L: a task's .output is a symlink made when the task starts. Its own mtime never
+  # moves, so without -L every long run reads as STALLED after STALL_AFTER seconds.
+  age=$(( now - $(stat -L -f %m "$f" 2>/dev/null || echo "$now") ))
   size=$(wc -c <"$f" | tr -d ' ')
   # `grep -c` prints 0 AND exits 1 when nothing matches, so `|| echo 0` used to
   # print the count twice. Swallow the status instead of adding a second number.
