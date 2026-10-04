@@ -1,7 +1,7 @@
 {
   "name": "github-project",
   "description": "Build a roadmap board in GitHub Projects from a repo's plans (one issue per planned PR, decision and gap, with Status, MVP and phase fields, plus views), keep it in sync without duplicates or reverting the board's own status moves, and report what is done and what blocks ready-to-run.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": { "name": "hieuvo" },
   "homepage": "https://github.com/cmevietnam/claude-skills",
   "repository": "https://github.com/cmevietnam/claude-skills",
