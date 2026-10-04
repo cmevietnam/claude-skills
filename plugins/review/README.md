@@ -1,7 +1,7 @@
 # review
 
 A process for reviewing code with two independent Claude reviewers, Opus 5.5 and
-Sonnet 5.5, for things where one mistake is expensive: secret handling, parsers,
+Sonnet 5.5 at effort high, for things where one mistake is expensive: secret handling, parsers,
 guardrails.
 
 ## It never runs anything on its own
@@ -21,11 +21,13 @@ credentials to stdout, while the other concluded that the same path could not em
 content. The other found a build command that locked its own verification mechanism on
 its second run, which the first missed.
 
-The default pair is Opus 5.5 (`model: "opus"`) and Sonnet 5.5 (`model: "sonnet"`), two
-fresh agents given the same prompt. Never a fork: a fork inherits the session's context
-and ignores the model override, so the "Sonnet" reviewer would quietly be Opus.
-`agent-health.sh --model` reads the model each reviewer actually ran on from its
-transcript.
+The default pair is Opus 5.5 (`general-purpose`, `model: "opus"`) and Sonnet 5.5 at
+effort high (`subagent_type: "review:sonnet-reviewer"`), two fresh agents given the same
+prompt. The Agent tool has no effort parameter, so `agents/sonnet-reviewer.md` pins
+`model: claude-sonnet-5-5` and `effort: high`; without it, Sonnet reviewers were seen
+running at `medium`. Never a fork: a fork inherits the session's context and ignores
+both, so the "Sonnet" reviewer would quietly be Opus. `agent-health.sh --model` and
+`--effort` read the model and effort each reviewer actually ran at from its transcript.
 
 ## Usage
 
@@ -40,13 +42,17 @@ scripts/agent-health.sh --watch <task-id>
 # confirm a reviewer ran on the model it was meant to: MATCH (exit 0), or
 # MISMATCH / NONE (exit 1)
 scripts/agent-health.sh --model <task-id> claude-sonnet-5-5
+
+# confirm it ran at the effort it was meant to, the same way
+scripts/agent-health.sh --effort <task-id> high
 ```
 
 `agent-health.sh` classifies a task as `WORKING` / `STALLED` / `DEAD` and says what to
 do. It **never prints transcript content**: for a local agent the `.output` file is a
 symlink to the full JSONL transcript, and reading it floods the context. The script
 prints only the size, the number of records and the type of the last record; `--model`
-prints only values shaped like a Claude model id. A test asserts that property.
+prints only values shaped like a Claude model id, and `--effort` only `low` to `max`. A
+test asserts that property.
 
 ## Tests
 
@@ -58,6 +64,7 @@ No agents and no network needed.
 
 ## Further reading
 
+- `agents/sonnet-reviewer.md`: reviewer B, pinned to Sonnet 5.5 at effort high
 - `skills/review/SKILL.md`: the review loop and what not to do
 - `skills/review/references/running-reviewers.md`: prompt template, choosing reviewers,
   what to do when one hangs

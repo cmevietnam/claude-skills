@@ -18,6 +18,9 @@ agent-health.sh --watch <id>      print one line whenever the state changes (use
 agent-health.sh --model <id> [expected-model]
                                   which model(s) answered; with expected-model, exit 0 only
                                   on MATCH (e.g. claude-sonnet-5-5)
+agent-health.sh --effort <id> [expected-effort]
+                                  which effort(s) it ran at; with expected-effort, exit 0
+                                  only on MATCH (low, medium, high, xhigh, max)
 
 Verdicts: WORKING (wait) · STALLED (nudge with SendMessage) · DEAD (TaskStop, then rerun)
 USAGE
@@ -87,25 +90,28 @@ report() { # <file>
     "$verdict" "$age" "$size" "$recs" "${last:-?}" "$action"
 }
 
-# Which model actually answered. A reviewer spawned as a fork, or without its model
-# override, runs on the parent's model and its report looks no different, so "the
-# second reviewer was Sonnet" has to be read off the transcript, never assumed.
-# Only values shaped like a Claude model id are printed; anything else is counted as
-# "(unrecognised)", so this mode cannot print transcript content either.
-models() { # <file> [expected-model] -> exit 0 only on a positive answer
-  local f="$1" want="${2:-}" counts real distinct
-  # Model ids quoted inside message text are JSON-escaped (\"model\":\"…\") and
-  # cannot match this pattern; only the record's own field does.
-  counts=$(grep -o '"model":"[^"\\]*"' "$f" 2>/dev/null | cut -d'"' -f4 \
-    | awk '$0 !~ /^(claude-[a-z0-9.-]+|<synthetic>)$/ { $0 = "(unrecognised)" }
+# Which model actually answered, and at what effort. A reviewer spawned as a fork, or
+# without its model override, runs on the parent's model; a reviewer spawned without
+# an agent definition that pins `effort` runs at whatever effort the harness picks
+# (Sonnet reviewers were seen at medium next to an Opus at xhigh). Either way the
+# report looks no different, so both have to be read off the transcript, never assumed.
+# Only values matching <valid> are printed; anything else is counted as
+# "(unrecognised)", so these modes cannot print transcript content either.
+tally() { # <field> <valid-regex> <verb> <file> [expected] -> exit 0 only on a positive answer
+  local field="$1" valid="$2" verb="$3" f="$4" want="${5:-}" counts real distinct
+  # Values quoted inside message text are JSON-escaped (\"model\":\"…\") and cannot
+  # match this pattern; only a record's own field does. A nested object that happens to
+  # use the same key adds a second value, which fails closed as MISMATCH.
+  counts=$(grep -o "\"$field\":\"[^\"\\\\]*\"" "$f" 2>/dev/null | cut -d'"' -f4 \
+    | awk -v ok="$valid" '$0 !~ ok { $0 = "(unrecognised)" }
            { n[$0]++ }
            END { for (m in n) printf "%6d  %s\n", n[m], m }' | sort -rn)
   # <synthetic> marks messages the harness injected; they prove nothing about the model.
   real=$(printf '%s\n' "$counts" | awk 'NF && $2 != "<synthetic>" { print $2 }')
   [[ -n "$counts" ]] && printf '%s\n' "$counts"
   if [[ -z "$real" ]]; then
-    # Silence is not a pass: no model id means no evidence, whatever was expected.
-    echo "NONE      no model recorded — not an agent transcript, or no reply yet"
+    # Silence is not a pass: nothing recorded means no evidence, whatever was expected.
+    echo "NONE      no $field recorded — not an agent transcript, or no reply yet"
     return 1
   fi
   [[ -z "$want" ]] && return 0
@@ -113,10 +119,13 @@ models() { # <file> [expected-model] -> exit 0 only on a positive answer
   if [[ "$distinct" == "$want" ]]; then
     printf 'MATCH     %s\n' "$want"
   else
-    printf 'MISMATCH  want %s, ran on: %s\n' "$want" "$distinct"
+    printf 'MISMATCH  want %s, %s: %s\n' "$want" "$verb" "$distinct"
     return 1
   fi
 }
+
+models()  { tally model  '^(claude-[a-z0-9.-]+|<synthetic>)$'    'ran on' "$@"; }
+efforts() { tally effort '^(low|medium|high|xhigh|max)$'          'ran at' "$@"; }
 
 case "${1:-}" in
   -h|--help|"") usage; exit 0 ;;
@@ -141,6 +150,9 @@ case "${1:-}" in
   --model)
     f=$(resolve "${2:-}") || { echo "task '${2:-}' not found (try --list)" >&2; exit 1; }
     models "$f" "${3:-}"; exit $? ;;
+  --effort)
+    f=$(resolve "${2:-}") || { echo "task '${2:-}' not found (try --list)" >&2; exit 1; }
+    efforts "$f" "${3:-}"; exit $? ;;
   *)
     f=$(resolve "$1") || { echo "task '$1' not found (try --list)" >&2; exit 1; }
     report "$f" ;;
