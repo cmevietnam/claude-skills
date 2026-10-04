@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""gh-roadmap: keep a GitHub Project (v2) in line with a JSON roadmap spec.
+
+  gh-roadmap sync   SPEC [--apply]   plan (default) or apply: fields, labels, issues, items,
+                                     views
+  gh-roadmap verify SPEC [--strict]  every spec item is on the board with the spec's values
+  gh-roadmap report OWNER NUMBER [--by FIELD] [--open]
+                                     status counts, optionally crossed with another field
+
+Dry run by default: without --apply, sync makes read calls only. Issues and draft items are
+matched by exact title, pull requests and existing issues by number, so a second run creates
+nothing. Fields in the spec's "board_owned" list (default: Status) are set only when an item is
+first added: after that, the project's built-in workflows and people move them (a linked PR sets
+In progress, a merge sets Done), and a re-sync must not drag them back. verify skips them on
+existing items unless --strict. Views are matched by name and created only when missing (name,
+layout, filter, visible fields); after that they belong to the people using them. The API cannot
+set a view's grouping or sort: a board view groups by Status, anything else is set by hand.
+Every check runs before the first write; a spec that cannot be applied is refused whole. Needs gh with the `project` scope (gh auth refresh -h github.com -s project).
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+from collections import Counter, defaultdict
+
+GH = os.environ.get("GH_ROADMAP_GH", "gh")
+RETRIES = int(os.environ.get("GH_ROADMAP_RETRIES", "4"))
+BACKOFF = float(os.environ.get("GH_ROADMAP_BACKOFF", "3"))
+
+# Project field names GitHub refuses for custom fields ("Name cannot have a reserved value").
+# "Type" is the one people reach for; it belongs to issue types.
+LAYOUTS = {"board": "BOARD_LAYOUT", "table": "TABLE_LAYOUT", "roadmap": "ROADMAP_LAYOUT"}
+RESERVED = {"title", "assignees", "status", "labels", "linked pull requests", "milestone",
+            "repository", "reviewers", "parent issue", "sub-issues progress", "type",
+            "tracks", "tracked by"}
+
+
+class Refused(Exception):
+    pass
+
+
+def gh(*args, parse=True):
+    last = ""
+    for attempt in range(RETRIES + 1):
+        r = subprocess.run([GH, *args], capture_output=True, text=True)
+        if r.returncode == 0:
+            out = r.stdout
+            return json.loads(out) if parse and out.strip() else out
+        last = (r.stderr or r.stdout).strip()
+        if "missing required scopes" in last:
+            raise Refused(f"gh token lacks a scope: {last.splitlines()[0]}\n"
+                          "  fix: gh auth refresh -h github.com -s project")
+        if attempt < RETRIES:
+            print(f"  retry {attempt + 1}/{RETRIES}: gh {' '.join(args[:2])}: {last[:160]}",
+                  file=sys.stderr)
+            time.sleep(BACKOFF * (attempt + 1))
+    raise Refused(f"gh {' '.join(args[:3])} failed after {RETRIES + 1} attempts: {last}")
+
+
+def item_key(name):
+    # `gh project item-list --format json` keys a field's value by its name with the first
+    # character lower-cased ("MVP" -> "mVP", "Depends on" -> "depends on").
+    return name[:1].lower() + name[1:]
+
+
+def field_value(item, name):
+    if item_key(name) in item:
+        return item[item_key(name)]
+    for k, v in item.items():
+        if k.lower() == name.lower():
+            return v
+    return None
+
+
+# ---- reading the board --------------------------------------------------------------------
+class Board:
+    def __init__(self, owner, number):
+        self.owner, self.number = owner, str(number)
+        proj = gh("project", "view", self.number, "--owner", owner, "--format", "json")
+        self.id, self.title, self.url = proj["id"], proj["title"], proj["url"]
+        self.reload_fields()
+        self.reload_items()
+
+    def reload_fields(self):
+        data = gh("project", "field-list", self.number, "--owner", self.owner, "--format",
+                  "json", "--limit", "200")
+        self.fields = {f["name"]: f for f in data["fields"]}
+
+    def reload_items(self):
+        data = gh("project", "item-list", self.number, "--owner", self.owner, "--format",
+                  "json", "--limit", "2000")
+        self.items = data["items"]
+
+    def views(self):
+        q = ("query($id:ID!){node(id:$id){... on ProjectV2{views(first:100){nodes"
+             "{id name layout filter}}}}}")
+        data = gh("api", "graphql", "-f", f"query={q}", "-f", f"id={self.id}")
+        return data["data"]["node"]["views"]["nodes"]
+
+    def create_view(self, v):
+        ids = [self.fields[f]["id"] for f in v.get("fields", [])]
+        q = ("mutation($p:ID!,$n:String!,$l:ProjectV2ViewLayout!,$f:[ID!]){createProjectV2View("
+             "input:{projectId:$p,name:$n,layout:$l,configuration:{visibleFieldIds:$f}})"
+             "{projectV2View{id}}}")
+        args = ["api", "graphql", "-f", f"query={q}", "-f", f"p={self.id}", "-f",
+                f"n={v['name']}", "-f", f"l={LAYOUTS[v.get('layout', 'table')]}"]
+        for i in ids:
+            args += ["-f", f"f[]={i}"]
+        view_id = gh(*args)["data"]["createProjectV2View"]["projectV2View"]["id"]
+        if v.get("filter"):
+            q = ("mutation($v:ID!,$f:String!){updateProjectV2View(input:{viewId:$v,filter:$f})"
+                 "{projectV2View{id}}}")
+            gh("api", "graphql", "-f", f"query={q}", "-f", f"v={view_id}", "-f",
+               f"f={v['filter']}")
+
+    def options(self, name):
+        f = self.fields.get(name)
+        return None if f is None or "options" not in f else [o["name"] for o in f["options"]]
+
+    def find(self, kind, key):
+        for it in self.items:
+            c = it.get("content") or {}
+            if kind in ("pr", "issue"):
+                want = "PullRequest" if kind == "pr" else "Issue"
+                if c.get("type") == want and c.get("url") == key:
+                    return it
+            elif kind == "draft" and c.get("type") == "DraftIssue" and it.get("title") == key:
+                return it
+        return None
+
+
+# ---- the spec ----------------------------------------------------------------------------
+def load_spec(path):
+    with open(path) as fh:
+        spec = json.load(fh)
+    errors = []
+    for k in ("owner", "number", "items"):
+        if k not in spec:
+            errors.append(f"spec: missing top-level key {k!r}")
+    fields = spec.setdefault("fields", {})
+    text_fields = spec.setdefault("text_fields", [])
+    spec.setdefault("labels", {})
+    spec.setdefault("board_owned", ["Status"])
+    names = set()
+    for v in spec.setdefault("views", []):
+        if not v.get("name"):
+            errors.append("view without a 'name'")
+        elif v["name"] in names:
+            errors.append(f"view {v['name']!r}: duplicate name")
+        names.add(v.get("name"))
+        if v.get("layout", "table") not in LAYOUTS:
+            errors.append(f"view {v.get('name')!r}: layout must be one of {sorted(LAYOUTS)}")
+    for name in list(fields) + list(text_fields):
+        if name.lower() in RESERVED and name != "Status":
+            errors.append(f"field {name!r}: the name is reserved by GitHub; pick another "
+                          f"(for example 'Kind' instead of 'Type')")
+    if "Status" in text_fields:
+        errors.append("field 'Status' is built in and single-select; do not list it as text")
+    seen = set()
+    for n, it in enumerate(spec.get("items", []), 1):
+        where = f"item {n} ({it.get('title') or it.get('pr') or it.get('issue')})"
+        refs = [k for k in ("pr", "issue") if k in it]
+        if len(refs) > 1 or (not refs and "title" not in it):
+            errors.append(f"{where}: give exactly one of 'pr', 'issue' or 'title'")
+            continue
+        if refs and it.get("draft"):
+            errors.append(f"{where}: 'draft' applies only to items given by 'title'")
+            continue
+        key = (refs[0], it[refs[0]]) if refs else ("draft" if it.get("draft") else "new",
+                                                   it["title"])
+        if key in seen:
+            errors.append(f"{where}: duplicate of an earlier item")
+        seen.add(key)
+        if (("pr" in it or "issue" in it) or not it.get("draft")) and not spec.get("repo"):
+            errors.append(f"{where}: needs top-level 'repo' (owner/name)")
+        for fname, val in (it.get("fields") or {}).items():
+            if fname in text_fields:
+                errors.append(f"{where}: {fname!r} is a text field; put it under 'text'")
+            elif fname in fields and val not in fields[fname]:
+                errors.append(f"{where}: {fname}={val!r} is not one of {fields[fname]}")
+        for fname in (it.get("text") or {}):
+            if fname not in text_fields:
+                errors.append(f"{where}: text field {fname!r} is not in 'text_fields'")
+        for label in it.get("labels", []):
+            if "pr" in it or "issue" in it or it.get("draft"):
+                errors.append(f"{where}: labels apply only to issues this spec creates")
+                break
+    if errors:
+        raise Refused("spec refused:\n  " + "\n  ".join(errors))
+    return spec
+
+
+def check_against_board(spec, board):
+    """Everything that would fail mid-run, found before the first write."""
+    errors = []
+    will_exist = set(board.fields) | set(spec["fields"]) | set(spec["text_fields"])
+    for v in spec["views"]:
+        for fname in v.get("fields", []):
+            if fname not in will_exist:
+                errors.append(f"view {v['name']!r}: field {fname!r} is neither on the board nor "
+                              "in the spec")
+    for name, opts in spec["fields"].items():
+        have = board.options(name)
+        if name in board.fields and have is None:
+            errors.append(f"field {name!r} exists on the board but is not single-select")
+        elif have is not None and not set(opts) <= set(have):
+            errors.append(f"field {name!r} exists without options {sorted(set(opts) - set(have))}"
+                          f" (has {have}); add them in the project settings, this tool never "
+                          "edits an existing field's options")
+    for name in spec["text_fields"]:
+        f = board.fields.get(name)
+        if f is not None and f.get("type") not in (None, "ProjectV2Field"):
+            errors.append(f"field {name!r} exists on the board but is not a text field")
+    for n, it in enumerate(spec["items"], 1):
+        for fname, val in (it.get("fields") or {}).items():
+            if fname in spec["fields"]:
+                continue
+            have = board.options(fname)
+            if have is None:
+                errors.append(f"item {n}: field {fname!r} is neither in the spec's 'fields' nor "
+                              "a single-select field on the board")
+            elif val not in have:
+                errors.append(f"item {n} ({it.get('title') or it.get('pr') or it.get('issue')}): "
+                              f"{fname}={val!r} is not an option on the board {have}")
+    if errors:
+        raise Refused("refused before any write:\n  " + "\n  ".join(errors))
+
+
+# ---- sync --------------------------------------------------------------------------------
+def sync(spec, apply):
+    board = Board(spec["owner"], spec["number"])
+    print(f"project: {board.title!r} {board.url} ({len(board.items)} items)")
+    check_against_board(spec, board)
+    repo = spec.get("repo")
+    issues = {}
+    if repo:
+        for i in gh("issue", "list", "-R", repo, "--state", "all", "--limit", "2000", "--json",
+                    "title,url,number"):
+            issues.setdefault(i["title"], i)
+    mode = "" if apply else "[dry run] "
+
+    for name, opts in spec["fields"].items():
+        if name not in board.fields:
+            print(f"{mode}create field {name}: {opts}")
+            if apply:
+                gh("project", "field-create", board.number, "--owner", board.owner, "--name",
+                   name, "--data-type", "SINGLE_SELECT", "--single-select-options",
+                   ",".join(opts), parse=False)
+    for name in spec["text_fields"]:
+        if name not in board.fields:
+            print(f"{mode}create field {name}: text")
+            if apply:
+                gh("project", "field-create", board.number, "--owner", board.owner, "--name",
+                   name, "--data-type", "TEXT", parse=False)
+    if apply:
+        board.reload_fields()
+
+    if spec["labels"]:
+        have = {l["name"] for l in gh("label", "list", "-R", repo, "--json", "name",
+                                       "--limit", "500")}
+        for name, meta in spec["labels"].items():
+            if name not in have:
+                print(f"{mode}create label {name}")
+                if apply:
+                    gh("label", "create", name, "-R", repo, "--color",
+                       meta.get("color", "ededed"), "--description",
+                       meta.get("description", ""), parse=False)
+
+    counts = Counter()
+    fresh = set()
+    for it in spec["items"]:
+        if "pr" in it or "issue" in it:
+            kind = "pr" if "pr" in it else "issue"
+            num = it[kind]
+            url = f"https://github.com/{repo}/{'pull' if kind == 'pr' else 'issues'}/{num}"
+            label = f"{kind} #{num}"
+            existing = board.find(kind, url)
+            action = "on board" if existing else "add"
+        elif it.get("draft"):
+            url, label = None, f"draft {it['title']!r}"
+            existing = board.find("draft", it["title"])
+            action = "on board" if existing else "create draft"
+        else:
+            known = issues.get(it["title"])
+            url = known["url"] if known else None
+            label = f"issue {it['title']!r}"
+            existing = board.find("issue", url) if url else None
+            action = "on board" if existing else ("add" if known else "create issue")
+        counts[action] += 1
+        changes = pending_changes(existing, it, spec["board_owned"])
+        if not existing:
+            fresh.add(item_label(it, repo))
+        print(f"{mode}{action}: {label}" + (f"  set {changes}" if changes else ""))
+        if not apply:
+            continue
+        if action == "create issue":
+            args = ["issue", "create", "-R", repo, "--title", it["title"], "--body",
+                    it.get("body", "")]
+            for lab in it.get("labels", []):
+                args += ["--label", lab]
+            url = gh(*args, parse=False).strip().splitlines()[-1]
+            issues[it["title"]] = {"url": url}
+            print(f"  -> {url}")
+        if existing:
+            item_id = existing["id"]
+        elif action == "create draft":
+            item_id = gh("project", "item-create", board.number, "--owner", board.owner,
+                         "--title", it["title"], "--body", it.get("body", ""),
+                         "--format", "json")["id"]
+        else:
+            item_id = gh("project", "item-add", board.number, "--owner", board.owner, "--url",
+                         url, "--format", "json")["id"]
+        for fname, val in changes.items():
+            f = board.fields[fname]
+            if fname in spec["text_fields"]:
+                gh("project", "item-edit", "--id", item_id, "--project-id", board.id,
+                   "--field-id", f["id"], "--text", val, parse=False)
+            else:
+                opt = next(o["id"] for o in f["options"] if o["name"] == val)
+                gh("project", "item-edit", "--id", item_id, "--project-id", board.id,
+                   "--field-id", f["id"], "--single-select-option-id", opt, parse=False)
+    if spec["views"]:
+        have = {v["name"]: v for v in board.views()}
+        for v in spec["views"]:
+            if v["name"] in have:
+                counts["view on board"] += 1
+                print(f"{mode}view on board: {v['name']!r}")
+                continue
+            counts["create view"] += 1
+            print(f"{mode}create view: {v['name']!r} ({v.get('layout', 'table')}"
+                  + (f", filter {v['filter']!r}" if v.get("filter") else "") + ")")
+            if apply:
+                board.create_view(v)
+    print(f"{mode}summary: " + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())))
+    if apply:
+        return verify(spec, fresh=fresh)
+    return 0
+
+
+def item_label(it, repo):
+    if "pr" in it or "issue" in it:
+        kind = "pr" if "pr" in it else "issue"
+        return f"{kind} #{it[kind]}"
+    return repr(it["title"])
+
+
+def pending_changes(existing, it, board_owned):
+    want = dict(it.get("fields") or {})
+    want.update(it.get("text") or {})
+    if not existing:
+        return want
+    return {k: v for k, v in want.items()
+            if k not in board_owned and field_value(existing, k) != v}
+
+
+# ---- verify ------------------------------------------------------------------------------
+def verify(spec, strict=False, fresh=frozenset()):
+    """Positive evidence: count every expected value found, and fail on an empty spec.
+
+    Board-owned fields are checked only with strict, or on items this run just added."""
+    board = Board(spec["owner"], spec["number"])
+    repo = spec.get("repo")
+    by_title = defaultdict(list)
+    for it in board.items:
+        by_title[(it.get("content") or {}).get("type"), it.get("title")].append(it)
+    problems, checked, skipped = [], 0, 0
+    for it in spec["items"]:
+        if "pr" in it or "issue" in it:
+            kind = "pr" if "pr" in it else "issue"
+            url = f"https://github.com/{repo}/{'pull' if kind == 'pr' else 'issues'}/{it[kind]}"
+            found = [board.find(kind, url)] if board.find(kind, url) else []
+        else:
+            t = "DraftIssue" if it.get("draft") else "Issue"
+            found = by_title[(t, it["title"])]
+        label = item_label(it, repo)
+        if len(found) != 1:
+            problems.append(f"{label}: expected 1 board item, found {len(found)}")
+            continue
+        want = dict(it.get("fields") or {})
+        want.update(it.get("text") or {})
+        for k, v in want.items():
+            if k in spec["board_owned"] and not strict and label not in fresh:
+                skipped += 1
+                continue
+            got = field_value(found[0], k)
+            if got != v:
+                problems.append(f"{label}: {k} is {got!r}, spec says {v!r}")
+            else:
+                checked += 1
+    if spec["views"]:
+        have = {v["name"]: v for v in board.views()}
+        for v in spec["views"]:
+            got = have.get(v["name"])
+            if got is None:
+                problems.append(f"view {v['name']!r}: not on the board")
+            elif got["layout"] != LAYOUTS[v.get("layout", "table")]:
+                problems.append(f"view {v['name']!r}: layout is {got['layout']}")
+            elif strict and (got.get("filter") or "") != v.get("filter", ""):
+                problems.append(f"view {v['name']!r}: filter is {got.get('filter')!r}, "
+                                f"spec says {v.get('filter', '')!r}")
+            else:
+                checked += 1
+    if not spec["items"]:
+        problems.append("the spec has no items: nothing was verified")
+    for p in problems:
+        print(f"VERIFY FAIL {p}")
+    if problems:
+        print(f"VERIFY FAILED: {len(problems)} problem(s)")
+        return 1
+    note = f" ({skipped} board-owned values not checked; --strict checks them)" if skipped else ""
+    views = f", {len(spec['views'])} views" if spec["views"] else ""
+    print(f"VERIFY OK: {len(spec['items'])} items{views}, {checked} values match{note}")
+    return 0
+
+
+# ---- report ------------------------------------------------------------------------------
+def report(owner, number, by=None, open_only=False):
+    board = Board(owner, number)
+    order = board.options("Status") or []
+    items = board.items
+    if open_only:
+        items = [i for i in items if field_value(i, "Status") != "Done"]
+    print(f"{board.title}: {len(items)} items  ({board.url})")
+    status = Counter(field_value(i, "Status") or "(no status)" for i in items)
+    print("by Status: " + ", ".join(f"{s} {status[s]}" for s in order + ["(no status)"]
+                                   if status[s]))
+    if by:
+        if by not in board.fields:
+            raise Refused(f"no field {by!r} on the board; fields: {sorted(board.fields)}")
+        groups = defaultdict(Counter)
+        for i in items:
+            groups[field_value(i, by) or f"(no {by})"][field_value(i, "Status") or "(none)"] += 1
+        for g in (board.options(by) or []) + sorted(k for k in groups
+                                                    if k not in (board.options(by) or [])):
+            if g in groups:
+                c = groups[g]
+                done = c.get("Done", 0)
+                print(f"  {by}={g}: {sum(c.values())} items, {done} done — " +
+                      ", ".join(f"{s} {c[s]}" for s in order if c[s] and s != "Done"))
+    active = [i for i in items if field_value(i, "Status") not in (None, "Done")
+              and field_value(i, "Status") != (order[0] if order else None)]
+    if active:
+        print("moving (not Done, not in the first column):")
+        for i in active:
+            num = (i.get("content") or {}).get("number")
+            print(f"  [{field_value(i, 'Status')}] {('#' + str(num) + ' ') if num else ''}"
+                  f"{i.get('title')}")
+    return 0
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help"):
+        print(__doc__)
+        return 0 if len(argv) >= 2 else 2
+    cmd, rest = argv[1], argv[2:]
+    try:
+        if cmd == "sync" and rest:
+            return sync(load_spec(rest[0]), "--apply" in rest[1:])
+        if cmd == "verify" and rest:
+            return verify(load_spec(rest[0]), strict="--strict" in rest[1:])
+        if cmd == "report" and len(rest) >= 2:
+            by = rest[rest.index("--by") + 1] if "--by" in rest else None
+            return report(rest[0], rest[1], by, "--open" in rest)
+    except Refused as e:
+        print(f"REFUSED: {e}", file=sys.stderr)
+        return 2
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

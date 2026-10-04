@@ -19,14 +19,15 @@ claude --plugin-dir ./plugins/onepassword
 
 ## Plugins
 
-| Plugin                               | What it does                                                                                                                                                                                                     |
-| ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`onepassword`](plugins/onepassword) | Reach secrets in 1Password behind a Touch ID gate on every use, and keep secret values out of the model's transcript.                                                                                            |
-| [`linode`](plugins/linode)           | Work with Linode inside the project's tag boundary: resources are created with the project tag, and writes to another project's resources are refused.                                                           |
-| [`review`](plugins/review)           | Adversarial review with two independent Claude reviewers, Opus 5.5 and Sonnet 5.5, plus a script that tells a quiet sub-agent from a hung one and confirms which model each reviewer ran on.                     |
-| [`codex`](plugins/codex)             | Run OpenAI's Codex CLI as a second opinion, and require every finding to reach the user verbatim before any code is changed.                                                                                     |
-| [`antigravity`](plugins/antigravity) | Run Google's Antigravity CLI (`agy`) headless as a second-opinion reviewer — and refuse to trust its exit code, which reports SUCCESS on runs whose every tool was denied and whose output is empty.             |
-| [`k8s-local`](plugins/k8s-local)     | Run a project's whole stack on a local Kubernetes cluster: build straight into the cluster's image store, refuse any context whose name and API server address are not local, and keep the datastores throwaway. |
+| Plugin                                     | What it does                                                                                                                                                                                                      |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`onepassword`](plugins/onepassword)       | Reach secrets in 1Password behind a Touch ID gate on every use, and keep secret values out of the model's transcript.                                                                                             |
+| [`linode`](plugins/linode)                 | Work with Linode inside the project's tag boundary: resources are created with the project tag, and writes to another project's resources are refused.                                                            |
+| [`review`](plugins/review)                 | Adversarial review with two independent Claude reviewers, Opus 5.5 and Sonnet 5.5, plus a script that tells a quiet sub-agent from a hung one and confirms which model each reviewer ran on.                      |
+| [`codex`](plugins/codex)                   | Run OpenAI's Codex CLI as a second opinion, and require every finding to reach the user verbatim before any code is changed.                                                                                      |
+| [`antigravity`](plugins/antigravity)       | Run Google's Antigravity CLI (`agy`) headless as a second-opinion reviewer — and refuse to trust its exit code, which reports SUCCESS on runs whose every tool was denied and whose output is empty.              |
+| [`k8s-local`](plugins/k8s-local)           | Run a project's whole stack on a local Kubernetes cluster: build straight into the cluster's image store, refuse any context whose name and API server address are not local, and keep the datastores throwaway.  |
+| [`github-project`](plugins/github-project) | Build a roadmap board in GitHub Projects from a repo's plans: one issue per planned PR, decision and gap, with Status and MVP fields and views; re-syncs without duplicates and reports what blocks ready-to-run. |
 
 ## Adding a new skill
 
