@@ -31,7 +31,8 @@ nothing, and verifies itself after applying. Spec format: `references/spec-forma
 7. **Views** go in the spec too (`views`: name, layout, filter, visible fields): a board
    filtered to `mvp:MVP` and a table with every field. The API cannot set grouping or sort,
    so tell the user which to set by hand (for example, group the table by phase).
-8. **Hand over:** PRs must say `Closes #n`; commit the spec (for example `docs/roadmap.json`)
+8. **Hand over:** only the PR that finishes an item says `Closes #n`; a PR that merely
+   mentions it (a plan or design change) says `Refs #n`. Commit the spec (for example `docs/roadmap.json`)
    so the next session can re-sync.
 
 ## Status questions

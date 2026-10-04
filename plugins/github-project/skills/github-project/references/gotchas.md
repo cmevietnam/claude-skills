@@ -31,6 +31,13 @@
 - The project's built-in workflows move cards by themselves. Observed: opening a PR whose body
   says `Closes #n` moved issue `#n` from `Backlog` to `In progress`; the default "Item closed"
   workflow sets `Done` when the issue closes on merge. A spec that re-asserts Status on every sync fights them; hence `board_owned`.
+- **`Closes #n` closes `#n` when the PR merges, whatever the PR is about.** A plan PR that
+  added a new work item and said `Closes #<that item>` closed an unbuilt feature on merge,
+  and the "Item closed" workflow moved its card to `Done`. Only the PR that finishes the
+  work says `Closes` (or `Fixes`, `Resolves`); a PR that only mentions an item (plan,
+  design, a partial step) says `Refs #n`. Before merging, read the PR body's closing
+  keywords and check each named issue is really done. If one slips through: reopen the
+  issue with a comment saying why, and set its Status back by hand (reopening does not).
 - The issue title is the only link between a spec item and its issue. Rename both together.
 - `body` and `labels` apply at creation only. To change an issue's text later, use
   `gh issue edit`.
