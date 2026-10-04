@@ -135,9 +135,44 @@ out=$(bash "$S" --model "$t"); rc=$?
 [[ "$out" == *"(unrecognised)"* ]] \
   && ok "a model value that is not a Claude id is shown as (unrecognised)" || bad "leak -> $out"
 
+echo "--effort reports the effort the reviewer actually ran at"
+# Each assistant record carries a top-level "effort". The failure this mode exists for
+# was real: Sonnet reviewers spawned as general-purpose with model "sonnet" ran at
+# medium while the Opus reviewer next to them ran at xhigh.
+ef(){ printf '{"type":"assistant","effort":"%s","perTurnEffort":"low","message":{"model":"claude-sonnet-5-5","content":"tok=%s"}}' "$1" "$SECRET"; }
+QEFF='{"type":"user","message":{"content":"set \"effort\":\"high\" in the frontmatter"}}'
+
+t=$(mt effhigh "$(ef high)" "$(ef high)" "$QEFF")
+out=$(bash "$S" --effort "$t" high); rc=$?
+[[ $rc == 0 && "$out" == *"MATCH     high"* ]] \
+  && ok "high transcript, high expected -> MATCH, exit 0" || bad "effhigh -> rc=$rc $out"
+[[ "$out" == *"2  high"* ]] \
+  && ok "counts the record's own field, not perTurnEffort or an escaped quote" || bad "effort count -> $out"
+
+t=$(mt effmed "$(ef medium)" "$(ef medium)")
+out=$(bash "$S" --effort "$t" high); rc=$?
+[[ $rc != 0 && "$out" == *"MISMATCH  want high, ran at: medium"* ]] \
+  && ok "medium transcript, high expected -> MISMATCH, non-zero exit" || bad "effmed -> rc=$rc $out"
+
+t=$(mt effmixed "$(ef high)" "$(ef xhigh)")
+out=$(bash "$S" --effort "$t" high); rc=$?
+[[ $rc != 0 && "$out" == *MISMATCH* ]] \
+  && ok "two efforts in one transcript -> MISMATCH, not a partial match" || bad "effmixed -> rc=$rc $out"
+
+t=$(mt effnone "$SON" '{"type":"user"}')
+out=$(bash "$S" --effort "$t" high); rc=$?
+[[ $rc != 0 && "$out" == *"NONE "* ]] \
+  && ok "no effort recorded -> NONE, non-zero exit" || bad "effnone -> rc=$rc $out"
+
+t=$(mt effleak "$(ef "$SECRET")" "$(ef high)")
+out=$(bash "$S" --effort "$t"); rc=$?
+[[ "$out" == *"(unrecognised)"* ]] \
+  && ok "an effort value outside low..max is shown as (unrecognised)" || bad "effleak -> $out"
+
 echo "transcript content must NEVER be printed"
 all=$( { STALL_AFTER=180 IDLE_AFTER=1800 bash "$S" --list; STALL_AFTER=180 bash "$S" fresh
-         for t in "$tmp"/transcripts/*.jsonl; do bash "$S" --model "$t" claude-sonnet-5-5; done; } 2>&1 )
+         for t in "$tmp"/transcripts/*.jsonl; do bash "$S" --model "$t" claude-sonnet-5-5
+           bash "$S" --effort "$t" high; done; } 2>&1 )
 case "$all" in
   *"$SECRET"*) bad "leaked transcript content" ;;
   *) ok "prints only numbers and record types" ;;

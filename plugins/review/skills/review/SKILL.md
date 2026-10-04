@@ -1,6 +1,6 @@
 ---
 name: review
-description: Run adversarial review with two independent Claude reviewers, Opus 5.5 and Sonnet 5.5, reproduce every finding before trusting it, and turn the reviewer's attack inputs into test cases. Use when code that matters needs a hard look (security, secret handling, parsers, guardrails), when a reviewer has just returned results, or when a sub-agent has gone quiet and you need to know whether it is still alive.
+description: Run adversarial review with two independent Claude reviewers, Opus 5.5 and Sonnet 5.5 at effort high, reproduce every finding before trusting it, and turn the reviewer's attack inputs into test cases. Use when code that matters needs a hard look (security, secret handling, parsers, guardrails), when a reviewer has just returned results, or when a sub-agent has gone quiet and you need to know whether it is still alive.
 ---
 
 # Adversarial review
@@ -14,7 +14,8 @@ One `xhigh` review round over ~1500 lines takes about 30 minutes and a noticeabl
 of quota. **Always ask before spawning**, and ask about both effort and scope. Never
 launch a reviewer just because the code looks like it deserves one.
 
-When you ask, give a real estimate: time, the two reviewers (Opus 5.5, then Sonnet 5.5),
+When you ask, give a real estimate: time, the two reviewers (Opus 5.5, then Sonnet 5.5 at
+effort high),
 and the fact that quota is spent by _context size times number of turns_, not by the
 length of the report.
 
@@ -22,15 +23,19 @@ length of the report.
 
 1. **Agree the scope with the user.** Narrower than you think. Three 8-minute agents
    return results sooner and bound the damage better than one 28-minute agent.
-2. **Run two independent reviewers: Opus 5.5, then Sonnet 5.5.** Two fresh agents
-   (`model: "opus"`, then `model: "sonnet"`) given the same prompt word for word. No
-   shared context, and neither sees the other's results. Never a `fork`: it inherits
-   your conversation and ignores the model override. See
+2. **Run two independent reviewers: Opus 5.5, then Sonnet 5.5 at effort high.** Two
+   fresh agents given the same prompt word for word: `subagent_type: "general-purpose"`
+   with `model: "opus"`, then `subagent_type: "review:sonnet-reviewer"` with **no**
+   `model` parameter (the agent definition pins `claude-sonnet-5-5` and `effort: high`;
+   the Agent tool has no effort parameter, and a per-call `model` would override the
+   pinned one). No shared context, and neither sees the other's results. Never a
+   `fork`: it inherits your conversation and ignores both. See
    `references/running-reviewers.md`.
-3. **Confirm each reviewer ran on its model** before you cite it as that model:
-   `scripts/agent-health.sh --model <task-id> claude-sonnet-5-5` must print `MATCH`
-   (`claude-opus-5-5` for the Opus reviewer). A reviewer on the wrong model still
-   returns a normal-looking report.
+3. **Confirm each reviewer ran on its model and effort** before you cite it as that:
+   `scripts/agent-health.sh --model <task-id> claude-sonnet-5-5` and
+   `scripts/agent-health.sh --effort <task-id> high` must both print `MATCH`
+   (`claude-opus-5-5` for the Opus reviewer). A reviewer on the wrong model or effort
+   still returns a normal-looking report.
 4. **Reproduce every finding before trusting it.** This step is never skipped. A
    confident reviewer can still be wrong.
 5. **Present the findings verbatim**, and only then your assessment, in a separate

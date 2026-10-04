@@ -5,9 +5,9 @@
 Don't spawn a reviewer without asking. Give a real estimate, not a vague one:
 
 > Review `plugins/foo` (~1500 lines) with two independent reviewers, Opus 5.5 and then
-> Sonnet 5.5. At `xhigh` that takes about 30 minutes each. Cost follows context size times number of turns: the reviewer
-> re-reads the whole context on every tool call, so a narrow scope is much cheaper than
-> a short report. Go ahead?
+> Sonnet 5.5 at effort high. At `xhigh` the Opus round takes about 30 minutes. Cost
+> follows context size times number of turns: the reviewer re-reads the whole context on
+> every tool call, so a narrow scope is much cheaper than a short report. Go ahead?
 
 Ask about both **effort** and **scope**. The user usually wants it narrower than you
 planned.
@@ -17,29 +17,40 @@ planned.
 The goal is two **different perspectives**, not the same perspective twice. The default
 pair is two different models:
 
-| Reviewer | Model      | Agent tool call                                       | `--model` must show |
-| -------- | ---------- | ----------------------------------------------------- | ------------------- |
-| A        | Opus 5.5   | `subagent_type: "general-purpose"`, `model: "opus"`   | `claude-opus-5-5`   |
-| B        | Sonnet 5.5 | `subagent_type: "general-purpose"`, `model: "sonnet"` | `claude-sonnet-5-5` |
+| Reviewer | Model, effort    | Agent tool call                                       | `--model` must show | `--effort` must show |
+| -------- | ---------------- | ----------------------------------------------------- | ------------------- | -------------------- |
+| A        | Opus 5.5         | `subagent_type: "general-purpose"`, `model: "opus"`   | `claude-opus-5-5`   | the session's effort |
+| B        | Sonnet 5.5, high | `subagent_type: "review:sonnet-reviewer"`, no `model` | `claude-sonnet-5-5` | `high`               |
+
+- **Reviewer B's effort is pinned by an agent definition**, `agents/sonnet-reviewer.md`
+  in this plugin (`model: claude-sonnet-5-5`, `effort: high`). The Agent tool has no
+  effort parameter, so a `general-purpose` agent with `model: "sonnet"` runs at whatever
+  effort the harness picks: on 2026-10-03 two such Sonnet reviewers ran at `medium`
+  while the Opus reviewer beside them ran at `xhigh`. Do not pass `model` to
+  `review:sonnet-reviewer`: a per-call `model` overrides the definition's.
 
 - **Fresh agents, never `subagent_type: "fork"`.** A fork inherits your whole
   conversation, so it is not independent, and it always runs on your model, ignoring
   `model`. The "Sonnet" reviewer would silently be a second Opus that already knows your
   reasoning.
-- **The same prompt, word for word, for both.** Only the model differs, so a difference
-  in findings comes from the model, not from the wording.
-- **Confirm the model from the transcript** once each reviewer finishes:
+- **The same prompt, word for word, for both.** Only the model and effort differ, so a
+  difference in findings comes from the model, not from the wording.
+- **Confirm the model and effort from the transcript** once each reviewer finishes:
 
   ```bash
-  scripts/agent-health.sh --model <task-id> claude-sonnet-5-5   # reviewer B
-  scripts/agent-health.sh --model <task-id> claude-opus-5-5     # reviewer A
+  scripts/agent-health.sh --model  <task-id> claude-sonnet-5-5  # reviewer B
+  scripts/agent-health.sh --effort <task-id> high               # reviewer B
+  scripts/agent-health.sh --model  <task-id> claude-opus-5-5    # reviewer A
   ```
 
   `MATCH` (exit 0) is the only pass. `MISMATCH` means the reviewer ran on another model;
   `NONE` means the transcript holds no model id, which is no evidence either way. The
   `opus` and `sonnet` aliases resolve to the current version (checked on 2026-10-03:
   `claude-opus-5-5` and `claude-sonnet-5-5`). If a later run shows another version,
-  report the version that ran, not "Sonnet 5.5".
+  report the version that ran, not "Sonnet 5.5". `--effort` works the same way on the
+  `effort` field each assistant record carries; `MISMATCH  want high, ran at: medium`
+  means the agent definition was not used (wrong `subagent_type`, or the plugin was not
+  reloaded after an update).
 
 If one of the two cannot run (quota exhausted, model unavailable), tell the user which
 one is missing and fall back, strongest first:
@@ -106,8 +117,9 @@ requests.
 
 ## After the results arrive
 
-1. **Confirm the model** with `scripts/agent-health.sh --model <task-id> <expected>`.
-   Label each report with the model that actually ran.
+1. **Confirm the model and effort** with `scripts/agent-health.sh --model <task-id>
+<expected>` and `--effort <task-id> <expected>`. Label each report with the model
+   and effort that actually ran.
 2. **Reproduce every finding.** Run exactly the input the reviewer gave. Record which
    are right and which are not.
 3. **Present them verbatim**, including findings you disagree with, consider out of
