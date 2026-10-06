@@ -147,6 +147,28 @@
         "mvp",
         "issues"
       ]
+    },
+    {
+      "name": "cloudflare",
+      "source": "./plugins/cloudflare",
+      "displayName": "Cloudflare (project-scoped)",
+      "description": "Work with Cloudflare through wrangler, the cf CLI, cloudflared and the REST API inside the project's account, zones and name prefixes: writes to another project's Workers, buckets, tunnels or zones are refused, and credentials stay out of command lines and the transcript.",
+      "version": "0.1.0",
+      "author": {
+        "name": "hieuvo"
+      },
+      "license": "MIT",
+      "category": "infrastructure",
+      "keywords": [
+        "cloudflare",
+        "cf",
+        "wrangler",
+        "cloudflared",
+        "workers",
+        "r2",
+        "tunnel",
+        "guardrails"
+      ]
     }
   ]
 }

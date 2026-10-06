@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# cfgate — the project boundary that wrangler, cloudflared and the REST API have
+# no concept of. wrangler stays the main tool, unwrapped; cfgate only declares
+# the boundary, shows it, and checks a command against it.
+#
+#   cfgate whoami                 project, account, zones, prefixes; what wrangler reads here
+#   cfgate zones                  the account's zones (name, id), to fill in "zones"
+#   cfgate init --project P --account ID --prefix P- [--zone NAME=ID]... [--protect GLOB]... [--name N]... [--force]
+#   cfgate doctor                 everything that could make a write land in the wrong place
+#   cfgate check '<command>'      what the guard would decide, and why (nothing runs)
+set -uo pipefail
+
+self=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)
+root_dir=$(cd -- "$self/.." && pwd -P)
+for f in common shell wrangler tunnel api cfcli; do
+  # shellcheck disable=SC1090
+  . "$root_dir/scripts/lib/$f.sh" || { echo "cfgate: cannot load scripts/lib/$f.sh" >&2; exit 1; }
+done
+GUARD="$root_dir/scripts/guard-cloudflare.sh"
+API=https://api.cloudflare.com/client/v4
+
+usage() {
+  sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+here_root() { find_project_root "${CLAUDE_PROJECT_DIR:-$PWD}" 2>/dev/null || find_project_root "$PWD"; }
+
+# A bearer token for read-only API calls, into the variable CFG_TOKEN: the
+# environment's CLOUDFLARE_API_TOKEN, else wrangler's own OAuth login. It is
+# never printed, logged or passed on a command line visible to `ps` (curl reads
+# the header from stdin).
+get_token() {
+  CFG_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
+  [[ -n "$CFG_TOKEN" ]] && return 0
+  command -v wrangler >/dev/null 2>&1 || return 1
+  CFG_TOKEN=$(WRANGLER_SEND_METRICS=false wrangler auth token --json 2>/dev/null \
+    | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  [[ -n "$CFG_TOKEN" ]]
+}
+
+api_get() {  # api_get <path> — prints the body, fails on HTTP >= 400 with the API's own error
+  local out code body
+  out=$(printf 'header = "Authorization: Bearer %s"\n' "$CFG_TOKEN" \
+    | curl -sS -K - -w '\n%{http_code}' "$API/$1" 2>&1) || { echo "cfgate: curl failed: $out" >&2; return 1; }
+  code=${out##*$'\n'}; body=${out%$'\n'*}
+  if [[ ! "$code" =~ ^[0-9]+$ ]] || (( code >= 400 )); then
+    echo "cfgate: GET /$1 returned HTTP $code: $(printf '%s' "$body" | head -c 400)" >&2
+    return 1
+  fi
+  printf '%s' "$body"
+}
+
+cmd_zones() {
+  get_token || die "no token: set CLOUDFLARE_API_TOKEN (through opgate), or log in with 'wrangler login' in a terminal"
+  local page=1 body
+  printf '%-36s %-34s %s\n' ZONE ID ACCOUNT
+  while :; do
+    body=$(api_get "zones?per_page=50&page=$page") || exit 1
+    printf '%s' "$body" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for z in d.get("result", []):
+    a = z.get("account", {})
+    print("%-36s %-34s %s (%s)" % (z["name"], z["id"], a.get("id", "?"), a.get("name", "?")))
+info = d.get("result_info", {})
+sys.exit(0 if info.get("page", 1) >= info.get("total_pages", 1) else 3)'
+    [[ $? -eq 3 ]] || break
+    page=$((page + 1))
+  done
+}
+
+cmd_init() {
+  local project="" account="" force=0 root
+  local -a zones=() prefixes=() names=() protect=()
+  while (( $# )); do
+    case "$1" in
+      --project) project="${2:-}"; shift 2 ;;
+      --account) account="${2:-}"; shift 2 ;;
+      --prefix)  prefixes+=("${2:-}"); shift 2 ;;
+      --zone)    zones+=("${2:-}"); shift 2 ;;
+      --name)    names+=("${2:-}"); shift 2 ;;
+      --protect) protect+=("${2:-}"); shift 2 ;;
+      --force)   force=1; shift ;;
+      *) die "unknown option: $1 (see: cfgate help)" ;;
+    esac
+  done
+  [[ -n "$project" ]] || die "--project is required"
+  [[ "$account" =~ ^[0-9a-f]{32}$ ]] || die "--account must be the 32-character hex account id ('wrangler whoami' shows it)"
+  (( ${#prefixes[@]} + ${#names[@]} > 0 )) || die "give at least one --prefix (e.g. --prefix $project-)"
+  local z
+  for z in ${zones[@]+"${zones[@]}"}; do
+    [[ "$z" =~ ^[A-Za-z0-9.-]+=[0-9a-f]{32}$ ]] || die "--zone must be NAME=ID with a 32-character hex id, got '$z' (cfgate zones lists them)"
+  done
+  root=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)
+  if [[ -f "$root/$CFGATE_CONFIG" && $force -eq 0 ]]; then
+    die "$root/$CFGATE_CONFIG already exists; pass --force to replace it"
+  fi
+  mkdir -p "$root/$CFGATE_DIR" || die "cannot create $root/$CFGATE_DIR"
+  python3 - "$root/$CFGATE_CONFIG.tmp" "$project" "$account" \
+    "$(printf '%s\n' ${zones[@]+"${zones[@]}"})" "$(printf '%s\n' ${prefixes[@]+"${prefixes[@]}"})" \
+    "$(printf '%s\n' ${names[@]+"${names[@]}"})" "$(printf '%s\n' ${protect[@]+"${protect[@]}"})" <<'PY' || die "could not write the config"
+import json, sys
+out, project, account, zones, prefixes, names, protect = sys.argv[1:8]
+lines = lambda s: [x for x in s.split("\n") if x]
+doc = {
+    "project": project,
+    "accountId": account,
+    "zones": {z.split("=", 1)[0].lower(): z.split("=", 1)[1] for z in lines(zones)},
+    "prefixes": lines(prefixes),
+    "names": lines(names),
+    "protected": lines(protect),
+}
+with open(out, "w") as f:
+    json.dump(doc, f, indent=2)
+    f.write("\n")
+PY
+  mv -f "$root/$CFGATE_CONFIG.tmp" "$root/$CFGATE_CONFIG"
+  info "wrote $root/$CFGATE_CONFIG - commit it. Next: cfgate doctor"
+}
+
+cmd_whoami() {
+  local root base flat name
+  root=$(here_root) || die "no $CFGATE_CONFIG from $PWD upward; run 'cfgate init' (see references/project-setup.md)"
+  load_project "$root"
+  echo "project    $CFG_PROJECT  ($root/$CFGATE_CONFIG)"
+  echo "account    $CFG_ACCOUNT"
+  local i=0
+  while (( i < ${#CFG_ZONE_NAMES[@]} )); do
+    echo "zone       ${CFG_ZONE_NAMES[i]}  ${CFG_ZONE_IDS[i]}"; i=$((i + 1))
+  done
+  echo "prefixes   ${CFG_PREFIXES[*]-}"
+  (( ${#CFG_NAMES[@]} )) && echo "names      ${CFG_NAMES[*]}"
+  (( ${#CFG_PROTECTED[@]} )) && echo "protected  ${CFG_PROTECTED[*]}"
+  W_CONFIG=""; W_CWD=""; W_ENV=""; W_NAME=""; W_ENVFILES=(); W_CMD=""; W_ARGS=()
+  wr_find_config "$PWD"
+  if [[ -n "$WR_CFG" ]]; then
+    flat=$(flatten_config "$WR_CFG")
+    name=$(wr_worker_name "$flat" 2>/dev/null) || name="(none)"
+    echo "wrangler   $WR_CFG -> Worker $name, account_id $(printf '%s\n' "$flat" | flat_get account_id | head -1)"
+  else
+    echo "wrangler   no config found from $PWD${WR_CFG_WHY:+ ($WR_CFG_WHY)}"
+  fi
+}
+
+cmd_doctor() {
+  local root problems f flat v n=0 name line host
+  root=$(here_root) || die "no $CFGATE_CONFIG from $PWD upward; run 'cfgate init' (see references/project-setup.md)"
+  load_project "$root"
+  info "project $CFG_PROJECT at $root"
+  problems=$(project_problems)
+  if [[ -z "$problems" ]]; then ok "$CFGATE_CONFIG is usable"
+  else while IFS= read -r line; do bad "$CFGATE_CONFIG: $line"; n=$((n + 1)); done <<< "$problems"; fi
+  (( ${#CFG_ZONE_NAMES[@]} )) || warn "no zones declared: every hostname write will be refused (cfgate zones lists them)"
+
+  if [[ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]]; then
+    if [[ "$CLOUDFLARE_ACCOUNT_ID" == "$CFG_ACCOUNT" ]]; then ok "shell CLOUDFLARE_ACCOUNT_ID is the project's"
+    else bad "shell CLOUDFLARE_ACCOUNT_ID=$CLOUDFLARE_ACCOUNT_ID is NOT the project's account: wrangler in this shell writes elsewhere. The guard may not see this variable (its environment is Claude Code's, not the shell's). Unset it."; n=$((n + 1)); fi
+  fi
+
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    flat=$(flatten_config "$f")
+    W_CONFIG=""; W_CWD=""; W_ENV=""; W_NAME=""; W_ENVFILES=(); W_CMD=""; W_ARGS=()
+    name=$(wr_worker_name "$flat" 2>/dev/null) || name=""
+    v=$(printf '%s\n' "$flat" | flat_get account_id | head -1)
+    if [[ -z "$v" ]]; then
+      bad "${f#$root/}: no account_id - every write from it is refused until it has \"account_id\": \"$CFG_ACCOUNT\""; n=$((n + 1))
+    elif [[ "$v" != "$CFG_ACCOUNT" ]]; then
+      bad "${f#$root/}: account_id $v is not the project's"; n=$((n + 1))
+    else ok "${f#$root/}: account pinned"; fi
+    if [[ -n "$name" ]] && ! name_in_project "$name"; then
+      bad "${f#$root/}: Worker name '$name' is outside the prefixes [${CFG_PREFIXES[*]-}]"; n=$((n + 1))
+    fi
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      host=$(host_of_pattern "${line#*$'\t'}")
+      zone_of_host "$host" >/dev/null || { bad "${f#$root/}: route host '$host' is in no project zone"; n=$((n + 1)); }
+    done <<< "$(printf '%s\n' "$flat" | flat_grep '(^|/)(routes\[\]|route)(/pattern)?$')"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      name_in_project "${line#*$'\t'}" || { bad "${f#$root/}: binds '${line#*$'\t'}' (${line%%$'\t'*}), outside the project"; n=$((n + 1)); }
+    done <<< "$(printf '%s\n' "$flat" | flat_grep '(^|/)(r2_buckets\[\]/bucket_name|queues/(producers|consumers)\[\]/(queue|dead_letter_queue)|d1_databases\[\]/database_name|services\[\]/service)$')"
+    for v in "$(dirname "$f")"/.env "$(dirname "$f")"/.env.*; do
+      [[ -f "$v" ]] || continue
+      line=$(grep -E '^[[:space:]]*(export[[:space:]]+)?CLOUDFLARE_ACCOUNT_ID[[:space:]]*=' "$v" | head -1 | sed 's/.*=//; s/["'"'"'[:space:]]//g')
+      [[ -z "$line" || "$line" == "$CFG_ACCOUNT" ]] || { bad "${v#$root/}: CLOUDFLARE_ACCOUNT_ID=$line is not the project's (wrangler loads this file)"; n=$((n + 1)); }
+    done
+  done <<< "$(find "$root" \( -name node_modules -o -name .git -o -name .wrangler \) -prune -o \
+               \( -name 'wrangler*.json' -o -name 'wrangler*.jsonc' -o -name 'wrangler*.toml' \) -type f -print 2>/dev/null)"
+
+  # cf (the Cloudflare CLI) does not read the wrangler config's account_id.
+  local cfg tv iv src
+  if cfg=$(cf_config_ts "$PWD"); then
+    v=$(grep -o 'accountId[^,}]*' "$cfg" | grep -o '[0-9a-f]\{32\}' | head -1)
+    if ! grep -q accountId "$cfg"; then info "${cfg#$root/}: no accountId; cf writes need CLOUDFLARE_ACCOUNT_ID"
+    elif [[ -z "$v" ]]; then bad "${cfg#$root/}: accountId is computed, so every cf write is refused; write it as a literal"; n=$((n + 1))
+    elif [[ "$v" != "$CFG_ACCOUNT" ]]; then bad "${cfg#$root/}: accountId $v is not the project's"; n=$((n + 1))
+    else ok "${cfg#$root/}: accountId pinned"; fi
+  fi
+  while IFS=$'\t' read -r src v; do
+    [[ -n "$src" ]] || continue
+    if [[ "$v" == "$CFG_ACCOUNT" ]]; then ok "cf saved account ($src) is the project's"
+    else bad "cf saved account $v ($src) is not the project's; delete the file"; n=$((n + 1)); fi
+  done <<< "$(cf_saved_accounts "$PWD")"
+  tv=$(sed -n '1s/.*from cf \([^ ]*\).*/\1/p' "$CF_TABLE" 2>/dev/null)
+  if command -v cf >/dev/null 2>&1; then
+    iv=$(cf --version 2>/dev/null | grep -o '[0-9][0-9.]*-*[a-z]*\.*[0-9]*' | head -1)
+    if [[ -n "$iv" && "$iv" != "$tv" ]]; then
+      warn "cf $iv is installed but the guard's command table is from cf $tv; new commands are refused until it is regenerated (scripts/gen-cf-table.py)"
+    fi
+  fi
+
+  T_ORIGINCERT=""; T_CONFIG=""
+  if cfd_cert_path "$PWD" && cfd_cert_ids "$CFD_CERT"; then
+    if [[ "$CERT_ACCOUNT" != "$CFG_ACCOUNT" ]]; then
+      warn "default cloudflared cert $CFD_CERT is for another account; tunnel writes need --origincert"
+    elif v=$(zone_name_of_id "$CERT_ZONE"); then
+      ok "default cloudflared cert $CFD_CERT is for zone $v"
+    else
+      warn "default cloudflared cert $CFD_CERT is for a zone outside the project; tunnel writes need --origincert"
+    fi
+  else
+    info "no usable cloudflared cert by default ($CFD_CERT_SRC) - only matters for tunnel writes"
+  fi
+
+  if (( n == 0 )); then ok "nothing found that would send a write outside the project"; return 0; fi
+  bad "$n problem(s)"; return 1
+}
+
+cmd_check() {
+  local cwd="$PWD" cmd out
+  [[ "${1:-}" == --cwd ]] && { cwd="$2"; shift 2; }
+  [[ "${1:-}" == -- ]] && shift
+  cmd="$*"
+  [[ -n "$cmd" ]] || die "usage: cfgate check [--cwd DIR] '<command>'"
+  out=$(python3 -c 'import json,sys; print(json.dumps({"tool_input":{"command":sys.argv[1]},"cwd":sys.argv[2]}))' "$cmd" "$cwd" \
+    | CFGATE_DEBUG=1 bash "$GUARD")
+  if [[ -z "$out" ]]; then echo "pass   (no Cloudflare write to check)"; return 0; fi
+  printf '%s' "$out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)["hookSpecificOutput"]
+print("%-6s %s" % (d["permissionDecision"], d["permissionDecisionReason"]))'
+}
+
+case "${1:-help}" in
+  whoami) shift; cmd_whoami "$@" ;;
+  zones)  shift; cmd_zones "$@" ;;
+  init)   shift; cmd_init "$@" ;;
+  doctor) shift; cmd_doctor "$@" ;;
+  check)  shift; cmd_check "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac
