@@ -29,10 +29,11 @@
 #                    (always literal), `other` for the rest (2>, 2>&1, >&2)
 #   H<TAB>body       the body of the heredoc opened by the most recent `heredoc`
 #                    redirection still waiting for one; newlines are \001
+#   S<TAB>value      the value of the `stdin-lit` here-string just before it
 shell_lex() {
   printf '%s' "$1" | awk '
     { s = s $0 "\n" }
-    function flush(   k) {
+    function flush(   k, t) {
       if (rt) {
         # A redirection waits for its target; whitespace in between must not
         # cancel it, or `> file` hands the filename over as a positional word.
@@ -42,6 +43,8 @@ shell_lex() {
         if (k == "stdout" && tok ~ /^\/dev\/(stdout|stderr|tty|fd\/[12])$/) k = "other"
         if (k == "herestr") k = (tok == "" || tok ~ /\$/) ? "stdin" : "stdin-lit"
         print "R\t" k
+        # A literal here-string is a script when a shell reads it.
+        if (k == "stdin-lit") { t = tok; gsub(/\n/, "\001", t); print "S\t" t }
         rt = 0; rdup = 0
       } else if (have) {
         gsub(/[\t\n]/, " ", tok); print "W\t" tok
@@ -71,15 +74,25 @@ shell_lex() {
       i++
     }
     # $(( ... )): arithmetic. Kept as one opaque piece of the current word.
-    function arith(   d, c) {
-      i += 3; d = 2
+    # $(( opens arithmetic only if it closes with )) - bash reads $((cmd) ) as
+    # a command substitution running a subshell. Returns 0, with i unmoved,
+    # for the substitution.
+    function arith(   d, c, st) {
+      st = i; i += 3; d = 2
       while (i <= n && d > 0) {
         c = substr(s, i, 1)
         if (c == "(") d++
-        else if (c == ")") d--
+        else if (c == ")") {
+          if (d == 2) {
+            if (substr(s, i+1, 1) == ")") { i += 2; d = 0; break }
+            i = st; return 0
+          }
+          d--
+        }
         i++
       }
       tok = tok "$"; have = 1
+      return 1
     }
     # The body of a pending heredoc starts at i (just after the newline).
     function heredoc_body(   p, e, line, rest, body, first) {
@@ -118,7 +131,7 @@ shell_lex() {
             if (substr(s, i+1, 1) != "\n") tok = tok substr(s, i+1, 1)
             have = 1; i += 2; continue
           }
-          if (three == "$((") { arith(); continue }
+          if (three == "$((") { if (arith()) continue; sub_open("p", 2); continue }
           if (two == "$(") { sub_open("p", 2); continue }
           if (c == "`") { sub_open("b", 1); continue }
           tok = tok c; have = 1; i++; continue
@@ -145,7 +158,7 @@ shell_lex() {
         if (two == "$\047") { mode = 3; have = 1; i += 2; continue }
         if (c == "\047") { mode = 1; have = 1; i++; continue }
         if (c == "\"") { mode = 2; have = 1; i++; continue }
-        if (three == "$((") { arith(); continue }
+        if (three == "$((") { if (arith()) continue; sub_open("p", 2); continue }
         if (two == "$(") { sub_open("p", 2); continue }
         if (c == "`") {
           if (sp > 0 && skind[sp] == "b") { sub_close(); continue }
@@ -206,12 +219,13 @@ sh_is_boundary() {
 #   seg_kids[]     " id id " of the substitutions inside this segment's words;
 #                  sh_outer_of finds who receives a substitution's output
 #   seg_depth[]    ( ) subshell depth: a `cd` inside a subshell ends with it
-#   seg_hd[]       the heredoc body fed to the segment (\001 for newlines)
+#   seg_hd[]       the heredoc or literal here-string fed to the segment (\001
+#                  for newlines)
 sh_split() {
   local _line _kind _val
-  local cur="" c_out=0 c_pipe=0 c_in="" c_fed=-1 c_cap=0 c_gid=0 c_kids=" " depth=0
+  local cur="" c_out=0 c_pipe=0 c_in="" c_fed=-1 c_cap=0 c_gid=0 c_kids=" " depth=0 c_hs=""
   local pdepth=0 hd_pending=0 hd_queue=""
-  local -a st_cur=() st_out=() st_pipe=() st_in=() st_fed=() st_cap=() st_gid=() st_kids=()
+  local -a st_cur=() st_out=() st_pipe=() st_in=() st_fed=() st_cap=() st_gid=() st_kids=() st_hs=()
   _sh_store() {
     local n=${#segs[@]}
     segs[n]="$cur"
@@ -223,7 +237,7 @@ sh_split() {
     seg_gid[n]=$c_gid
     seg_kids[n]="$c_kids"
     seg_depth[n]=$pdepth
-    seg_hd[n]=""
+    seg_hd[n]="$c_hs"; c_hs=""
     if (( hd_pending )); then hd_queue="$hd_queue $n"; hd_pending=0; fi
   }
   while IFS= read -r _line; do
@@ -236,6 +250,7 @@ sh_split() {
            stdin|stdin-lit) c_in="$_val" ;;
            heredoc) c_in=heredoc; hd_pending=1 ;;
          esac ;;
+      S) c_hs="$_val" ;;
       H)
         # The body belongs to the oldest segment still waiting for one; it may
         # already be stored (`bash <<EOF && echo hi` ends it before the body).
@@ -246,7 +261,7 @@ sh_split() {
         case "$_val" in
           '$(')
             st_cur[depth]="$cur"; st_out[depth]=$c_out; st_pipe[depth]=$c_pipe
-            st_in[depth]="$c_in"; st_fed[depth]=$c_fed; st_cap[depth]=$c_cap
+            st_in[depth]="$c_in"; st_fed[depth]=$c_fed; st_cap[depth]=$c_cap; st_hs[depth]="$c_hs"; c_hs=""
             SH_GID=$((SH_GID + 1))
             st_gid[depth]=$c_gid; st_kids[depth]="$c_kids$SH_GID "
             depth=$((depth + 1))
@@ -256,7 +271,7 @@ sh_split() {
             _sh_store
             (( depth > 0 )) && depth=$((depth - 1))
             cur="${st_cur[depth]:-}"; c_out=${st_out[depth]:-0}; c_pipe=${st_pipe[depth]:-0}
-            c_in="${st_in[depth]:-}"; c_fed=${st_fed[depth]:--1}; c_cap=${st_cap[depth]:-0}
+            c_in="${st_in[depth]:-}"; c_fed=${st_fed[depth]:--1}; c_cap=${st_cap[depth]:-0}; c_hs="${st_hs[depth]:-}"
             c_gid=${st_gid[depth]:-0}; c_kids="${st_kids[depth]:- }"
             continue ;;
         esac
@@ -322,15 +337,44 @@ _sh_re_assign='^[A-Za-z_][A-Za-z0-9_]*='
 # WRANGLER runs wrangler): sets SH_T to wrangler | cloudflared | curl | cf, or
 # fails. `cloudflare` is the npm package's second name for cf.
 # A variable, not output: this runs for every word, and $(...) would fork.
+# A package spec counts too (wrangler@4, cf@latest, deno's npm:cf), and so does
+# zsh's =cf, which runs cf from PATH.
 sh_tool_of() {
   SH_T=""
-  case "${1##*/}" in
+  local b=${1##*/}
+  b=${b#=}; b=${b#npm:}
+  case "$b" in
     [Ww][Rr][Aa][Nn][Gg][Ll][Ee][Rr]|[Ww][Rr][Aa][Nn][Gg][Ll][Ee][Rr]@*) SH_T=wrangler ;;
     [Cc][Ll][Oo][Uu][Dd][Ff][Ll][Aa][Rr][Ee][Dd]) SH_T=cloudflared ;;
     [Cc][Uu][Rr][Ll]) SH_T=curl ;;
-    [Cc][Ff]|[Cc][Ll][Oo][Uu][Dd][Ff][Ll][Aa][Rr][Ee]) SH_T=cf ;;
+    [Cc][Ff]|[Cc][Ff]@*|[Cc][Ll][Oo][Uu][Dd][Ff][Ll][Aa][Rr][Ee]|[Cc][Ll][Oo][Uu][Dd][Ff][Ll][Aa][Rr][Ee]@*) SH_T=cf ;;
     *) return 1 ;;
   esac
+}
+
+# sh_has_tool <word> — does a word that holds a whole command line (a script
+# string handed to some runner: fish -c '...', flock f -c '...') name a tool?
+sh_has_tool() {
+  local w t
+  local -a parts=()
+  case "$1" in *[[:space:]\;\&\|\(\)]*) ;; *) return 1 ;; esac
+  w=${1//[;&|()]/ }
+  read -r -a parts <<< "${w//$'\n'/ }"         # split without globbing
+  for t in ${parts[@]+"${parts[@]}"}; do sh_tool_of "$t" && return 0; done
+  return 1
+}
+
+# sh_tail <index> — the end of a head this file does not fully understand:
+# return 3 (ask) when a later word is, or contains, a tool; 1 otherwise. A
+# runner shape that is not recognised must never fall through to "no tool".
+sh_tail() {
+  local k
+  for ((k = $1 + 1; k < ${#SH_WORDS[@]}; k++)); do
+    if sh_tool_of "${SH_WORDS[k]}" || sh_has_tool "${SH_WORDS[k]}"; then
+      SH_HEAD_UNKNOWN="${SH_WORDS[$1]}"; return 3
+    fi
+  done
+  return 1
 }
 
 # sh_skip_opts <index> "<value-taking options>" — advances SH_I past a
@@ -373,7 +417,7 @@ sh_skip_opts() {
 # Sets exactly one outcome, by return code:
 #   0  SH_TOOL + SH_START: the tool (wrangler|cloudflared|curl) in command
 #      position and its index; SH_VIA names a package runner that may download
-#      (npx, bunx, dlx, npm-exec); SH_CHDIR is a directory the command is told
+#      (npx, bunx, dlx, npm-exec, deno); SH_CHDIR is a directory the command is told
 #      to run in (env -C, sudo -D, pnpm -C, yarn --cwd), or empty
 #   1  the segment runs none of the tools
 #   2  SH_NESTED: a script string to check as a command line of its own
@@ -399,43 +443,74 @@ sh_scan() {
       command|builtin)
         case "${SH_WORDS[i+1]:-}" in -v|-V) return 1 ;; esac
         i=$((i + 1)); continue ;;
-      node|nodejs|bun)
-        # node .../wrangler/bin/wrangler.js, node .../wrangler-dist/cli.js
+      node|nodejs)
+        # node .../wrangler/bin/wrangler.js, node node_modules/.bin/cf
         j=$((i + 1))
         while (( j < n )) && [[ "${SH_WORDS[j]}" == -* ]]; do j=$((j + 1)); done
         case "${SH_WORDS[j]:-}" in
           *[Ww]rangler*) SH_TOOL=wrangler; SH_START=$j; return 0 ;;
           */node_modules/cf/*|node_modules/cf/*) SH_TOOL=cf; SH_START=$j; return 0 ;;
         esac
-        break ;;
+        if (( j < n )) && sh_tool_of "${SH_WORDS[j]}"; then SH_TOOL=$SH_T; SH_START=$j; return 0; fi
+        sh_tail $i; return $? ;;
+      bun)
+        # bun [--cwd d] [x|run|exec] <tool>; bun x may download, like bunx.
+        SH_CHDIR_OPTS="--cwd"
+        sh_skip_opts $((i + 1)) "--cwd"; SH_CHDIR_OPTS=""; j=$SH_I
+        case "${SH_WORDS[j]:-}" in
+          x)        j=$((j + 1)); SH_VIA=bunx ;;
+          run|exec) j=$((j + 1)) ;;
+        esac
+        sh_skip_opts $j "-p --package"; j=$SH_I
+        case "${SH_WORDS[j]:-}" in
+          */node_modules/cf/*|node_modules/cf/*) SH_TOOL=cf; SH_START=$j; return 0 ;;
+          *[Ww]rangler*.js) SH_TOOL=wrangler; SH_START=$j; return 0 ;;
+        esac
+        if (( j < n )) && sh_tool_of "${SH_WORDS[j]}"; then SH_TOOL=$SH_T; SH_START=$j; return 0; fi
+        SH_VIA=""; sh_tail $i; return $? ;;
+      deno)
+        # deno run|x [flags] npm:<tool> - downloads the package.
+        j=$((i + 1))
+        case "${SH_WORDS[j]:-}" in run|x) j=$((j + 1)) ;; esac
+        while (( j < n )) && [[ "${SH_WORDS[j]}" == -* ]]; do j=$((j + 1)); done
+        if (( j < n )) && [[ "${SH_WORDS[j]}" == npm:* ]] && sh_tool_of "${SH_WORDS[j]}"; then
+          SH_TOOL=$SH_T; SH_START=$j; SH_VIA=deno; return 0
+        fi
+        sh_tail $i; return $? ;;
       npx|bunx)
         # npx [-y] [-p pkg] wrangler ... — the package runner may download.
         sh_skip_opts $((i + 1)) "-p --package -c --call"; j=$SH_I
         if (( j < n )) && sh_tool_of "${SH_WORDS[j]}" && [[ $SH_T == wrangler || $SH_T == cf ]]; then
           SH_TOOL=$SH_T; SH_START=$j; SH_VIA=$base; return 0
         fi
-        break ;;
+        sh_tail $i; return $? ;;
       pnpm|yarn)
         SH_CHDIR_OPTS="-C --dir --cwd"
         sh_skip_opts $((i + 1)) "-C --dir --cwd --filter -F --workspace-concurrency --reporter --loglevel"
         SH_CHDIR_OPTS=""; j=$SH_I
+        # yarn workspace <name> runs in a directory only package.json knows.
+        if [[ "${SH_WORDS[j]:-}" == workspace ]]; then SH_CHDIR='$workspace'; j=$((j + 2)); fi
         case "${SH_WORDS[j]:-}" in
-          dlx)  j=$((j + 1)); SH_VIA=dlx ;;
-          exec) j=$((j + 1)) ;;
+          dlx)      j=$((j + 1)); SH_VIA=dlx ;;
+          exec|run) j=$((j + 1)) ;;
         esac
-        if sh_tool_of "${SH_WORDS[j]:-}" && [[ $SH_T == wrangler || $SH_T == cf ]]; then
+        sh_skip_opts $j ""; j=$SH_I
+        if (( j < n )) && sh_tool_of "${SH_WORDS[j]}" && [[ $SH_T == wrangler || $SH_T == cf ]]; then
           SH_TOOL=$SH_T; SH_START=$j; return 0
         fi
-        SH_VIA=""; break ;;
+        SH_VIA=""; SH_CHDIR=""; sh_tail $i; return $? ;;
       npm)
-        case "${SH_WORDS[i+1]:-}" in
+        # npm [-w ws] [--prefix d] exec|x [-y] [--] <tool>
+        SH_CHDIR_OPTS="--prefix -C"
+        sh_skip_opts $((i + 1)) "-w --workspace --prefix -C"; SH_CHDIR_OPTS=""; j=$SH_I
+        case "${SH_WORDS[j]:-}" in
           exec|x)
-            sh_skip_opts $((i + 2)) "-p --package -c --call -w --workspace"; j=$SH_I
+            sh_skip_opts $((j + 1)) "-p --package -c --call -w --workspace"; j=$SH_I
             if (( j < n )) && sh_tool_of "${SH_WORDS[j]}" && [[ $SH_T == wrangler || $SH_T == cf ]]; then
               SH_TOOL=$SH_T; SH_START=$j; SH_VIA=npm-exec; return 0
             fi ;;
         esac
-        break ;;
+        SH_CHDIR=""; sh_tail $i; return $? ;;
       env)
         SH_CHDIR_OPTS="-C --chdir"
         sh_skip_opts $((i + 1)) "-u -C -S --unset --chdir --split-string"
@@ -460,13 +535,16 @@ sh_scan() {
       stdbuf)           sh_skip_opts $((i + 1)) "-i -o -e --input --output --error"; i=$SH_I; continue ;;
       timeout|gtimeout) sh_skip_opts $((i + 1)) "-s -k --signal --kill-after"; i=$((SH_I + 1)); continue ;;
       xargs)            sh_skip_opts $((i + 1)) "-I -i -n -P -L -d -a -s -E --max-args --max-procs --max-lines --delimiter --arg-file --max-chars --eof --replace"; i=$SH_I; continue ;;
-      watch)            sh_skip_opts $((i + 1)) "-n --interval"; i=$SH_I; continue ;;
+      watch)
+        # watch joins its operands into one string and runs it with sh -c.
+        sh_skip_opts $((i + 1)) "-n --interval -d --differences"
+        SH_NESTED=$(sh_join $SH_I); return 2 ;;
       perl)
         # perl -e 'alarm N; exec @ARGV' cmd ... — the documented macOS timeout.
         if [[ "${SH_WORDS[i+1]:-}" == -e && "${SH_WORDS[i+2]:-}" == *'exec @ARGV'* ]]; then
           i=$((i + 3)); [[ "${SH_WORDS[i]:-}" =~ ^[0-9]+$ ]] && i=$((i + 1)); continue
         fi
-        break ;;
+        sh_tail $i; return $? ;;
       eval)             SH_NESTED=$(sh_join $((i + 1))); return 2 ;;
       bash|sh|zsh|dash|ksh)
         # Options first. A cluster containing c makes the next operand a
@@ -500,10 +578,7 @@ sh_scan() {
         esac ;;
     esac
     case " $SH_NONRUNNERS " in *" $base "*) return 1 ;; esac
-    for ((k = i + 1; k < n; k++)); do
-      if sh_tool_of "${SH_WORDS[k]}"; then SH_HEAD_UNKNOWN="$w"; return 3; fi
-    done
-    return 1
+    sh_tail $i; return $?
   done
   return 1
 }

@@ -27,9 +27,13 @@ payload=$(cat)
 # call in the session pays for this script's startup. The test runs on the text
 # with quotes, backslashes and line continuations removed and case folded, so
 # `wran""gler`, `wrang\<NL>ler` and `WRANGLER` (macOS file systems ignore case)
-# are all seen. `\\\n` is how JSON spells a backslash-newline.
-_norm=${payload//'\\\n'/}
-_norm=$(printf '%s' "$_norm" | tr -d '"\\'"'" | tr '[:upper:]' '[:lower:]')
+# are all seen. `\\\n` is how JSON spells a backslash-newline. The other JSON
+# escapes (\n \t \r \uXXXX) separate words and become spaces first: deleting
+# only their backslash would glue the letter onto the next word (`ls\ncf` ->
+# `lsncf`), and a cf on the second line of a script would pass unseen. sed, not
+# ${var//}: bash 3.2's substitution is quadratic, and a 30000-line command
+# would outlive the hook's time limit.
+_norm=$(printf '%s' "$payload" | sed -e 's/\\\\\\n//g' -e 's/\\[ntru]/ /g' | tr -d '"\\'"'" | tr '[:upper:]' '[:lower:]')
 # `cf` (the Cloudflare CLI) is two letters, so it counts only as a whole word.
 case "$_norm" in
   *wrangler*|*cloudflare*|*cf_api_*|*tunnel_token*) ;;
@@ -118,8 +122,31 @@ esac
 # Where the command runs. The Bash tool reports its cwd in the payload; that is
 # the directory whose .cloudflare/project.json applies. A `cd` moves it again;
 # "?" means a cd went somewhere the guard cannot know.
+# norm_path <path> — sets NP to the path with . and .. resolved the way the
+# shell's logical cd and node's path.resolve do it, on the text: every upward
+# search (project root, wrangler and cf configs, .env) walks parents by
+# stripping the last component, and repo/a/../b must give repo, not repo/a.
+norm_path() {
+  local seg
+  local -a parts=() out=()
+  NP="$1"
+  [[ "$NP" == "?" || "$NP" != /* ]] && return 0
+  IFS=/ read -r -a parts <<< "$NP"
+  for seg in ${parts[@]+"${parts[@]}"}; do
+    case "$seg" in
+      ''|.) ;;
+      ..) (( ${#out[@]} )) && unset "out[$(( ${#out[@]} - 1 ))]" ;;
+      *) out[${#out[@]}]="$seg" ;;
+    esac
+  done
+  NP=""
+  for seg in ${out[@]+"${out[@]}"}; do NP="$NP/$seg"; done
+  [[ -n "$NP" ]] || NP=/
+}
+
 eff_cwd=$(payload_str "$payload" '.cwd' 'cwd')
 [[ -n "$eff_cwd" ]] || eff_cwd="${CLAUDE_PROJECT_DIR:-$PWD}"
+norm_path "$eff_cwd"; eff_cwd=$NP
 inv_cwd="$eff_cwd"
 
 # --- the project ----------------------------------------------------------------
@@ -382,7 +409,7 @@ guard_wrangler() {
 
   # --- a write that reaches the account ---
   case "$SH_VIA" in
-    npx|bunx|dlx|npm-exec)
+    npx|bunx|dlx|npm-exec|deno)
       decide deny \
         "'$SH_VIA wrangler' may silently download and run a different wrangler than the project pins (from a directory with no local install it fetches the latest), and this command writes. Run the project's own binary by path, e.g. ./node_modules/.bin/wrangler $W_CMD ..., or the global 'wrangler'." ;;
   esac
@@ -644,8 +671,19 @@ cf_zone_id() {
   fi
   if [[ -z "$z" ]] && line_var_get CLOUDFLARE_ZONE_ID exported; then z="$LV"; src="CLOUDFLARE_ZONE_ID exported on this line"; fi
   if [[ -z "$z" && -n "${CLOUDFLARE_ZONE_ID:-}" ]]; then z="$CLOUDFLARE_ZONE_ID"; src="CLOUDFLARE_ZONE_ID"; fi
+  # Last, the files cf loads from the run directory; a later file wins.
+  if [[ -z "$z" && "$inv_cwd" != "?" ]]; then
+    local f v
+    for f in "$inv_cwd/.env" "$inv_cwd/.env.local" ${CF_MODE:+"$inv_cwd/.env.$CF_MODE" "$inv_cwd/.env.$CF_MODE.local"}; do
+      [[ -r "$f" ]] || continue
+      v=$(grep -E '^[[:space:]]*(export[[:space:]]+)?CLOUDFLARE_ZONE_ID[[:space:]]*=' "$f" 2>/dev/null | tail -1)
+      [[ -n "$v" ]] || continue
+      v=${v#*=}; v=${v%%#*}; v=${v//[[:space:]]/}; v=${v//\"/}; v=${v//\'/}
+      z="$v"; src="$f"
+    done
+  fi
   [[ -n "$z" ]] || decide deny \
-    "'cf $CF_CMD' acts on a zone, but no zone is given (--zone or CLOUDFLARE_ZONE_ID), so there is no way to tell whose zone it changes. Pass --zone <zone id or domain>."
+    "'cf $CF_CMD' acts on a zone, but no zone is given (--zone, CLOUDFLARE_ZONE_ID or .env), so there is no way to tell whose zone it changes. Pass --zone <zone id or domain>."
   is_literal "$z" || decide deny \
     "The zone ($src) is '$z', a value the shell supplies at run time, so the guard cannot tell whose zone this changes. Write it literally."
   if [[ "$z" =~ ^[0-9a-fA-F]{32}$ ]]; then
@@ -661,6 +699,40 @@ cf_zone_id() {
   done
   decide deny \
     "Zone $z ($src) is not a zone of project '$CFG_PROJECT' ([${CFG_ZONE_NAMES[*]-}]). Its DNS, rules and settings belong to another project."
+}
+
+# Options that put a zone or a hostname into the request body. A zone id must
+# be one of the project's; a custom domain's hostname must be in one of its zones.
+cf_check_zone_opts() {
+  local i nm v z pass
+  for pass in zone host; do
+  for i in ${CF_OPTN[@]+"${!CF_OPTN[@]}"}; do
+    nm=${CF_OPTN[i]}
+    case "$nm" in
+      zone-id|zone-ids|zone-tag|zones)
+        [[ $pass == zone ]] || continue
+        is_literal "${CF_OPTV[i]}" || decide deny \
+          "--$nm is '${CF_OPTV[i]}', a value the shell supplies at run time, so the guard cannot tell whose zone this changes. Write it literally."
+        while IFS= read -r z; do
+          [[ -n "$z" ]] || continue
+          if [[ "$z" =~ ^[0-9a-fA-F]{32}$ ]]; then
+            zone_id_is_ours "$z" || decide deny \
+              "Zone id $z (--$nm) is not a zone of project '$CFG_PROJECT' ([${CFG_ZONE_NAMES[*]-}]). Its DNS, rules and settings belong to another project."
+          else
+            zone_of_host "$z" >/dev/null || decide deny \
+              "Zone $z (--$nm) is not a zone of project '$CFG_PROJECT' ([${CFG_ZONE_NAMES[*]-}]). Its DNS, rules and settings belong to another project."
+          fi
+        done <<< "${CF_OPTV[i]//,/$'\n'}"
+        note "--$nm ${CF_OPTV[i]}" ;;
+      domain|domains|hostname|hostnames|host)
+        if [[ $pass == host && ( "$CF_API" == */domains/custom* || "$CF_API" == */custom-domains* ) ]]; then
+          while IFS= read -r v; do
+            [[ -n "$v" ]] && check_host "custom domain" "$v"
+          done <<< "${CF_OPTV[i]//,/$'\n'}"
+        fi ;;
+    esac
+  done
+  done
 }
 
 guard_cf() {
@@ -704,14 +776,26 @@ guard_cf() {
   esac
   (( CF_DRYRUN == 1 )) && { note "cf $CF_CMD (dry run)"; return 0; }
 
+  # cf's yargs is strict, so an option or positional it does not declare makes
+  # it fail; the guard refuses instead of guessing how cf would have read it.
+  case "$CF_KIND" in
+    write|d1id|tunnelrun)
+      [[ -z "$CF_UNKOPT" ]] || decide deny \
+        "'$CF_UNKOPT' is not an option of 'cf $CF_CMD', so the guard cannot tell how cf reads the words after it. Spell options as 'cf $CF_CMD --help' lists them (cf also accepts their camelCase form)."
+      (( CF_EXTRA == 0 )) || decide deny \
+        "'cf $CF_CMD' is given more positional arguments than it takes (${CF_ARGV[*]-}), so the guard cannot tell which one names the target. Give each value once, in the order 'cf $CF_CMD --help' shows."
+      ;;
+  esac
+
   # --- a write that reaches the account ---
   case "$SH_VIA" in
-    npx|bunx|dlx|npm-exec)
+    npx|bunx|dlx|npm-exec|deno)
       decide deny \
         "'$SH_VIA cf' may silently download and run a different cf than the project pins, and this command writes. Run the installed cf (cf, or ./node_modules/.bin/cf)." ;;
   esac
   need_project
   cf_check_account
+  cf_check_zone_opts
 
   case "$CF_KIND" in
     account)
@@ -751,8 +835,16 @@ guard_cf() {
       "'cf $CF_CMD' sends $CF_METHOD $CF_API, and the guard cannot find the value of {$p} on the command line, so it cannot tell what this changes. Pass it explicitly."
     is_literal "$CF_V" || decide deny \
       "{$p} of 'cf $CF_CMD' is given as '$CF_V', a value the shell supplies at run time, so the guard cannot verify whose resource this changes. Write it literally."
-    [[ "$CF_V" != */* && "$CF_V" != *..* ]] || decide deny \
-      "{$p} of 'cf $CF_CMD' is '$CF_V'; a slash or dot segment in a path parameter changes which resource the request reaches."
+    [[ "$CF_V" != *,* ]] || decide deny \
+      "{$p} of 'cf $CF_CMD' is '$CF_V'; a comma there means cf joined several values (an option given twice, or a list), and the request would not name one resource. Give one value."
+    if [[ "$p" == object_key ]]; then
+      # An object key may contain slashes; check_api_write refuses dot and empty segments.
+      [[ "$CF_V" != /* ]] || decide deny "{$p} of 'cf $CF_CMD' is '$CF_V'; a key starting with / makes an empty path segment."
+    else
+      [[ "$CF_V" != */* && "$CF_V" != *..* ]] || decide deny \
+        "{$p} of 'cf $CF_CMD' is '$CF_V'; a slash or dot segment in a path parameter changes which resource the request reaches."
+    fi
+    case "$p" in domain|domain_name|hostname) [[ "$CF_API" == */domains/custom* || "$CF_API" == */custom-domains* ]] && check_host "custom domain" "$CF_V" ;; esac
     path=${path//\{$p\}/$CF_V}
   done
 
@@ -760,7 +852,12 @@ guard_cf() {
   # path. (Inside a zone - a DNS record, a rule - the zone is the boundary.)
   if [[ "$CF_CATEGORY" == create && "$path" == accounts/* ]]; then
     if cf_create_name; then
-      check_name "$(cf_label "$path")" "$CF_V"; named=1
+      # The name identifies the new resource only when the account is its sole
+      # parent; under a namespace, site or gateway given by id, the parent may
+      # be another project's, and the id says nothing about whose.
+      check_name "$(cf_label "$path")" "$CF_V"
+      t=${CF_API//\{account_id\}/}
+      [[ "$t" == *'{'* ]] || named=1
     elif [[ -n "$CF_BODY" ]]; then
       decide ask "'cf $CF_CMD' takes the new resource's name from --body, which the guard does not parse. Use the command's own name option, or the user confirms."
     fi
@@ -950,16 +1047,23 @@ track_assignments() {
 # pipeline stage, which is a subshell. A target the guard cannot read makes the
 # directory unknown ("?"), and every later write that depends on it is refused.
 track_cd() {
-  local idx="$1" i=0 n=${#SH_WORDS[@]} w head target=""
+  local idx="$1" i=0 n=${#SH_WORDS[@]} w head target="" cond=0
+  # Reserved words in front run the cd in this shell too. After then/do/else
+  # it may or may not run, so the directory is unknown from here on.
   while (( i < n )); do
     w=${SH_WORDS[i]}
-    if [[ "$w" =~ $_sh_re_assign || "$w" == command || "$w" == builtin ]]; then i=$((i + 1)); continue; fi
+    case "$w" in
+      then|do|else|elif) cond=1; i=$((i + 1)); continue ;;
+      if|while|until|'!'|'{'|time|-p|command|builtin) i=$((i + 1)); continue ;;
+    esac
+    if [[ "$w" =~ $_sh_re_assign ]]; then i=$((i + 1)); continue; fi
     break
   done
   head=${SH_WORDS[i]:-}
   case "$head" in cd|pushd|popd) ;; *) return 0 ;; esac
   [[ "${seg_piped[idx]}" == 1 || "${seg_fed[idx]}" -ge 0 ]] && return 0
   [[ "$head" == popd ]] && { eff_cwd="?"; return 0; }
+  (( cond )) && { eff_cwd="?"; return 0; }
   i=$((i + 1))
   while (( i < n )); do
     w=${SH_WORDS[i]}
@@ -978,6 +1082,7 @@ track_cd() {
     /*) eff_cwd="$target" ;;
     *) [[ "$eff_cwd" == "?" ]] || eff_cwd="$eff_cwd/$target" ;;
   esac
+  norm_path "$eff_cwd"; eff_cwd=$NP
 }
 
 # The directory one invocation runs in: the line's, moved by a wrapper's own
@@ -993,6 +1098,7 @@ set_inv_cwd() {
     /*) inv_cwd="$t" ;;
     *) [[ "$inv_cwd" == "?" ]] || inv_cwd="$inv_cwd/$t" ;;
   esac
+  norm_path "$inv_cwd"; inv_cwd=$NP
 }
 
 # check_line <command line> <nesting level> — every segment, in order. A nested

@@ -1,14 +1,20 @@
 # What the hook enforces
 
 `scripts/guard-cloudflare.sh` runs before every Bash call. A call that does not
-mention `wrangler`, `cloudflare`, `CF_API_` or `TUNNEL_TOKEN` exits at once; the
-test ignores case, quotes and line continuations, so `WRANGLER`, `wran""gler` and
-`wrang\<newline>ler` are all seen. The rest is lexed like a shell would: quotes
-(also `$'...'`), `&&`, pipes, `( )` subshells, `$(...)`, `$((...))`, heredocs with
-quoted or unquoted delimiters, `bash -c`, `eval`, `env`, `sudo`, `timeout`,
-`xargs`, `pnpm`/`yarn`, `node .../wrangler.js`, `opgate exec|run`. Each invocation
-of `wrangler`, `cloudflared` or `curl` is checked on its own, and a script handed
-to a shell (`bash -c '...'`, `bash <<EOF`, `echo '...' | sh`) is checked in place.
+mention `wrangler`, `cloudflare`, `cf`, `CF_API_` or `TUNNEL_TOKEN` exits at once;
+the test ignores case, quotes and line continuations, and reads newlines and tabs
+as spaces, so `WRANGLER`, `wran""gler`, `wrang\<newline>ler` and a `cf` on the
+second line of a script are all seen. The rest is lexed like a shell would: quotes
+(also `$'...'`), `&&`, pipes, `( )` subshells, `$(...)` (also `$((cmd) )`, which is
+a substitution, not arithmetic), heredocs with quoted or unquoted delimiters,
+`bash -c`, `eval`, `env`, `sudo`, `timeout`, `xargs`, `watch`, `pnpm`/`yarn`
+(`exec`, `run`, `dlx`, `workspace`), `npm exec`, `npx`, `bun`/`bunx`, `deno run
+npm:`, `node .../wrangler.js` or `node node_modules/.bin/<tool>`, zsh's `=cf`,
+`opgate exec|run`. Each invocation of `wrangler`, `cf`, `cloudflared` or `curl` is
+checked on its own, and a script handed to a shell (`bash -c '...'`, `bash <<EOF`,
+`bash <<< '...'`, `echo '...' | sh`, `watch '...'`) is checked in place. A command
+this list does not know that has a tool name behind it, alone or inside one quoted
+word (`fish -c 'cf ...'`, `flock f -c '...'`), asks.
 A refusal anywhere refuses the whole call; a prompt is issued only if nothing
 refuses.
 
@@ -16,13 +22,13 @@ refuses.
 
 ## Everywhere, project or not
 
-| Refused                                                                                 | Why                                                                    |
-| --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| `CLOUDFLARE_API_TOKEN=<literal>` (also `_API_KEY`, `CF_API_TOKEN`, `TUNNEL_TOKEN`, ...) | The value is in the transcript. `op://...` references are fine.        |
-| `curl -H 'Authorization: Bearer <literal>'`, `X-Auth-Key`, `--oauth2-bearer`, `-u u:p`  | Same.                                                                  |
-| `--value`, `--connection-string`, `--password`, `--secret-access-key`... literal        | wrangler options whose value is a credential.                          |
-| `cloudflared ... --token <literal>`, `service install <literal>`                        | A tunnel token runs the tunnel for whoever holds it.                   |
-| `npx` / `bunx` / `pnpm dlx` / `npm exec` wrangler, for a write                          | May download a different wrangler. Use `./node_modules/.bin/wrangler`. |
+| Refused                                                                                          | Why                                                                   |
+| ------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |
+| `CLOUDFLARE_API_TOKEN=<literal>` (also `_API_KEY`, `CF_API_TOKEN`, `TUNNEL_TOKEN`, ...)          | The value is in the transcript. `op://...` references are fine.       |
+| `curl -H 'Authorization: Bearer <literal>'`, `X-Auth-Key`, `--oauth2-bearer`, `-u u:p`           | Same.                                                                 |
+| `--value`, `--connection-string`, `--password`, `--secret-access-key`... literal                 | wrangler options whose value is a credential.                         |
+| `cloudflared ... --token <literal>`, `service install <literal>`                                 | A tunnel token runs the tunnel for whoever holds it.                  |
+| `npx` / `bunx` / `bun x` / `pnpm dlx` / `npm exec` / `deno run npm:` wrangler or cf, for a write | May download a different version. Use `./node_modules/.bin/wrangler`. |
 
 | Asks                                                                               | Unless                                                                                                                                                                                             |
 | ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -33,11 +39,14 @@ refuses.
 Reads pass untouched, including reads of other projects' data. A write first
 needs `.cloudflare/project.json`, found by walking up from the directory the
 command really runs in: the Bash cwd, moved by every `cd`/`pushd` on the line
-(`cd -P`, `cd --`, `command cd`, a variable assigned earlier on the line), by a
-wrapper's own `-C` (`env -C`, `sudo -D`, `pnpm -C`, `yarn --cwd`) and by wrangler's
-`--cwd`. A `cd` inside `( )` or in a pipeline stage moves nothing after it. A `cd`
-the guard cannot follow (`cd -`, `popd`, `cd $(...)`) makes every later write on
-the line refused. Then:
+(`cd -P`, `cd --`, `command cd`, `time cd`, `{ cd x; }`, a variable assigned
+earlier on the line), by a wrapper's own `-C` (`env -C`, `sudo -D`, `pnpm -C`,
+`yarn --cwd`, `npm --prefix`, `bun --cwd`) and by wrangler's `--cwd`. `..` is
+resolved on the path text, as the shell's `cd` and node do. A `cd` inside `( )` or
+in a pipeline stage moves nothing after it. A `cd` the guard cannot follow
+(`cd -`, `popd`, `cd $(...)`, a `cd` after `then`/`do`/`else` that may not run)
+makes every later write on the line refused, and so is a write through
+`yarn workspace <name>`, which runs in a directory only package.json names. Then:
 
 **Names.** Every resource a write names must start with a project prefix or be in
 `names`: Worker (`--name`, the config's `name`, or `<name>-<env>` for `--env`),
@@ -110,17 +119,28 @@ source present (`CLOUDFLARE_ACCOUNT_ID`, a literal `accountId` in the nearest
 under `-m/--mode <mode>`) must be the project's, and at least one must be
 present; a computed `accountId` or a mode the shell supplies is refused.
 `{zone_id}` comes from `--zone`/`-z` or `CLOUDFLARE_ZONE_ID` (id or
-domain). Other parameters come from the positional or option of the same name;
-one the hook cannot find, or one containing `/` or `..`, is refused. An
-account-level create's name option (`--name`, `--title`, `--queue-name`...) must
-carry the project prefix. GET commands and dry runs pass. `cf` and its alias
+domain; on the line, in the environment, or in the `.env` files above). Other
+parameters come from the positional or option of the same name (or, where the
+names differ, the one positional); one the hook cannot find, or one containing
+`/`, `..` or a comma, is refused (an R2 object key may contain `/`, not dot or
+empty segments). An account-level create's name option (`--name`, `--title`,
+`--queue-name`...) must carry the project prefix; when the new resource sits
+under a parent given by id (a namespace, a site, a gateway), the hook still asks,
+since the id says nothing about whose parent it is. Zones named in options
+(`--zone-id`, `--zone-tag`, `--zones`) must be the project's, and so must the
+hostname of a custom domain (`r2 buckets domains custom ...`,
+`ai-gateway custom-domains ...`). GET commands and dry runs pass. `cf` and its alias
 `cloudflare` are recognised by name in any case, also as `npx cf` (refused for
 writes) and `node .../node_modules/cf/...`.
 
 The hook reads cf's argv the way cf's yargs does. Global options (`-q`, `-z`,
 `--profile`, `-m`, `--local`, `--persist-to`, `-h`, `-v`) may come before the
 command path; any other option there, `--` included, is refused. After `--`
-nothing is an option. `--dry-run`, `--help` and `--version` count only bare, as
+nothing is an option. Option names are read in their camelCase form too
+(`--dryRun`, `--cfR2Jurisdiction`) and through the builders' aliases (`-f`); an
+option yargs declares as an array takes every following word that is not an
+option, as yargs does. cf is strict, so on a write an option the command does not
+declare, or one positional too many, is refused rather than guessed at. `--dry-run`, `--help` and `--version` count only bare, as
 `=true` or followed by `true`, and only when every occurrence on the line says so:
 `--dry-run=0`, `=1`, `=TRUE` and `--help false` all run the command for real, and
 are checked as such. Options that carry a secret are flagged in the table by name,

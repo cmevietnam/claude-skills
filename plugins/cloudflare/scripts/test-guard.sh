@@ -112,6 +112,10 @@ mkdir -p "$repo/cfmode"
 printf 'export default { accountId: "%s" };\n' "$ACC" > "$repo/cfmode/cloudflare.config.ts"
 printf 'CLOUDFLARE_ACCOUNT_ID=%s\n' "$ACC_OTHER" > "$repo/cfmode/.env.staging"
 printf 'CLOUDFLARE_ACCOUNT_ID=%s\n' "$ACC_OTHER" > "$repo/cfmode/.env.qa.local"
+# cf also loads CLOUDFLARE_ZONE_ID from .env.
+mkdir -p "$repo/cfzone"
+printf 'export default { accountId: "%s" };\n' "$ACC" > "$repo/cfzone/cloudflare.config.ts"
+printf 'CLOUDFLARE_ZONE_ID=cmevietnam.dev\n' > "$repo/cfzone/.env"
 
 # --- review round 1 fixtures ---------------------------------------------------------
 # svc: an ordinary, unprotected Worker to stand in. other: another project's Worker
@@ -647,6 +651,75 @@ t deny "sets CLOUDFLARE_ACCOUNT_ID=$ACC_OTHER" "cf r2 buckets delete cme-x --mod
 t deny "sets CLOUDFLARE_ACCOUNT_ID=$ACC_OTHER" "cf r2 buckets delete cme-x --mode=staging" "$CM"
 t deny "sets CLOUDFLARE_ACCOUNT_ID=$ACC_OTHER" "cf r2 buckets delete cme-x -m qa" "$CM"
 t deny "--mode is '\$M'" "cf -m \$M r2 buckets delete cme-x" "$CM"
+
+echo
+echo "review round 3: multi-line commands, yargs option names, wrappers, cwd, zones in options"
+NL=$'\n'; TAB=$'\t'
+OUT="R2 bucket 'noscam-uploads' is outside"
+# The fast path must see cf after a newline or a tab (JSON spells them \n and \t).
+t deny "$OUT" "ls${NL}cf r2 buckets delete noscam-uploads" "$CP"
+t deny "$OUT" "true;${TAB}cf r2 buckets delete noscam-uploads" "$CP"
+t deny "$OUT" "cf${TAB}r2 buckets delete noscam-uploads" "$CP"
+t deny "a value the shell supplies" "for b in noscam-uploads; do${NL}${TAB}cf r2 buckets delete \$b${NL}done" "$CP"
+t deny "$OUT" "cd .${NL}cf r2 buckets delete noscam-uploads" "$CP"
+# yargs reads camelCase option names, aliases, greedy arrays, and is strict.
+t deny "$OUT" "$P cf r2 buckets delete noscam-uploads --dry-run --dryRun=false" "$S"
+t deny "$OUT" "$P cf r2 buckets delete noscam-uploads --dry-run --no-dryRun" "$S"
+t deny "$OUT" "$P cf r2 buckets delete --cfR2Jurisdiction cme-x noscam-uploads" "$S"
+t deny "$OUT" "$P cf r2 buckets domains custom create --ciphers ECDHE cme-x --enabled noscam-uploads --domain x.cmevietnam.dev --zone-id $Z_DEV" "$S"
+t deny "cannot find the value of {bucket_name}" "$P cf r2 buckets domains custom create --ciphers=ECDHE cme-x noscam-uploads --domain x.cmevietnam.dev --zone-id $Z_DEV" "$S"   # greedy after = too; cf has no bucket left
+t deny "is not an option of 'cf r2 buckets delete'" "$P cf r2 buckets delete cme-x --cf_r2_jurisdiction eu" "$S"
+t deny "more positional arguments" "$P cf r2 buckets delete cme-x noscam-uploads" "$S"
+t deny "is given more than once" "$P cf dns records delete abc --zone $Z_FOREIGN -z $Z_DEV" "$S"
+t deny "a comma" "$P cf r2 buckets delete cme-a,noscam-b" "$S"
+t allow "R2 bucket cme-x" "$P cf r2 buckets delete -f cme-x" "$S"
+t allow "R2 bucket cme-x" "$P cf r2 buckets delete cme-x --cfR2Jurisdiction eu" "$S"
+t pass "" "cf zones list --perPage 5" "$S"   # reads are not held to the option list
+# Shells and runners that execute cf.
+t deny "$OUT" "bash <<< 'cf r2 buckets delete noscam-uploads'" "$CP"
+t deny "$OUT" "sh <<< \"cf r2 buckets delete noscam-uploads\"" "$CP"
+t deny "may silently download" "bun x cf r2 buckets delete noscam-uploads" "$CP"
+t deny "$OUT" "bun run cf r2 buckets delete noscam-uploads" "$CP"
+t deny "$OUT" "bun cf r2 buckets delete noscam-uploads" "$CP"
+t deny "$OUT" "yarn run cf r2 buckets delete noscam-uploads" "$CP"
+t deny "$OUT" "node node_modules/.bin/cf r2 buckets delete noscam-uploads" "$CP"
+t deny "$OUT" "watch -n 60 'cf r2 buckets delete noscam-uploads'" "$CP"
+t deny "may silently download" "npx -y cf@latest r2 buckets delete noscam-uploads" "$CP"
+t deny "$OUT" "pnpm exec -- cf r2 buckets delete noscam-uploads" "$CP"
+t deny "may silently download" "npm -w web exec -- cf r2 buckets delete noscam-uploads" "$CP"
+t deny "cannot tell which directory" "yarn workspace web cf r2 buckets delete noscam-uploads" "$CP"
+t deny "may silently download" "deno run -A npm:cf r2 buckets delete noscam-uploads" "$CP"
+t deny "$OUT" "=cf r2 buckets delete noscam-uploads" "$CP"
+t ask "precedes a Cloudflare CLI" "fish -c 'cf r2 buckets delete noscam-uploads'" "$CP"
+t ask "precedes a Cloudflare CLI" "busybox sh -c 'cf r2 buckets delete noscam-uploads'" "$CP"
+t ask "precedes a Cloudflare CLI" "flock /tmp/l -c 'cf r2 buckets delete noscam-uploads'" "$CP"
+t ask "precedes a Cloudflare CLI" "node scripts/run.js cf r2 buckets delete noscam-uploads" "$CP"   # a runner shape not recognised
+t ask "precedes a Cloudflare CLI" "pnpm mytask cf r2 buckets delete noscam-uploads" "$CP"
+t deny "Worker 'noscam-w' is outside" "pnpm exec -- wrangler delete --name noscam-w" "$S"
+t deny "Worker 'noscam-w' is outside" "yarn run wrangler delete --name noscam-w" "$S"
+t deny "may silently download" "npm --prefix web exec -- wrangler delete --name noscam-w" "$S"
+t deny "may silently download" "bun --cwd web x wrangler delete --name noscam-w" "$S"
+t deny "$OUT" "echo \$((cf r2 buckets delete noscam-uploads) )" "$CP"
+t pass "" "echo \$((1 + 2)) \$(( (1 + 2) * 3 ))" "$CP"
+# The directory a cd leaves the line in.
+t deny "cannot tell which directory" "if true; then cd ../cfbad; fi; cf r2 buckets delete cme-x" "$CP"
+t deny "sets accountId $ACC_OTHER" "time cd ../cfbad; cf r2 buckets delete cme-x" "$CP"
+t deny "sets accountId $ACC_OTHER" "{ cd ../cfbad; } && cf r2 buckets delete cme-x" "$CP"
+t deny "Nothing pins this cf write" "cd ../bare; cf r2 buckets delete cme-x" "$CP"
+t deny "Nothing pins this cf write" "cf r2 buckets delete cme-x" "$CP/../bare"
+# Zones and parents named in options, not in the path.
+t deny "Zone id $Z_FOREIGN (--zone-id) is not a zone" "$P cf r2 buckets domains custom create cme-x --domain cdn.noscam.pro --zone-id $Z_FOREIGN --enabled" "$S"
+t deny "'cdn.noscam.pro' is not in any zone" "$P cf r2 buckets domains custom create cme-x --domain cdn.noscam.pro --zone-id $Z_DEV" "$S"
+t deny "'cdn.noscam.pro' is not in any zone" "$P cf r2 buckets domains custom delete cdn.noscam.pro --bucket-name cme-x" "$S"
+t allow "R2 bucket cme-x" "$P cf r2 buckets domains custom create cme-x --domain cdn.cmevietnam.dev --zone-id $Z_DEV --enabled" "$S"
+t deny "Zone id $Z_FOREIGN (--zones) is not a zone" "$P cf dns settings account views create --name cme-v --zones $Z_FOREIGN" "$S"
+t ask "addresses its target by id" "$P cf artifacts namespaces repos create foreignns --name cme-x" "$S"
+t ask "addresses its target by id" "$P cf magic-transit sites lans create site1 --name cme-x" "$S"
+# Wrong refusals.
+t allow "R2 bucket cme-x" "$P cf r2 objects put a/b.txt --bucket-name cme-x" "$S"
+t deny "dot segment" "$P cf r2 objects put a/../b.txt --bucket-name cme-x" "$S"
+t ask "addresses its target by id" "$P cf ai-gateway gateways delete gw1" "$S"
+t allow "API DELETE zone cmevietnam.dev" "cf dns records delete abc" "$repo/cfzone"
 
 echo
 echo "config reader"

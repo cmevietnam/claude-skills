@@ -36,6 +36,10 @@ curl call:
   `--dry-run`: `--dry-run=1` and `--dry-run=TRUE` are real runs in cf.
 - `-m <mode>` makes cf load `.env.<mode>` and `.env.<mode>.local` too; an account
   set there is checked like `.env`.
+- On a write, spell options as `cf <cmd> --help` lists them and give each
+  positional once: an option the command does not declare, or an extra
+  positional, is refused (cf would reject it anyway). A custom domain's hostname
+  and any `--zone-id`/`--zones` must be the project's.
 
 When cf is upgraded, regenerate the table, or new commands are refused:
 
