@@ -616,7 +616,11 @@ cf_check_account() {
       "$src is the account cf saved for this directory, $v, which is not project '$CFG_PROJECT''s account ($CFG_ACCOUNT). Delete that file, or pin the account: CLOUDFLARE_ACCOUNT_ID=$CFG_ACCOUNT cf ..."
     found=1
   done <<< "$(cf_saved_accounts "$inv_cwd")"
-  W_ENVFILES=(); W_ENV=""
+  # cf loads .env and .env.local from the run directory, and with -m <mode> also
+  # .env.<mode> and .env.<mode>.local.
+  is_literal "${CF_MODE:-x}" || decide deny \
+    "--mode is '$CF_MODE', a value the shell supplies at run time, so the guard cannot tell which .env.<mode> file sets this cf write's account. Write the mode literally."
+  W_ENVFILES=(); W_ENV="$CF_MODE"
   while IFS=$'\t' read -r src v; do
     [[ -n "$src" ]] || continue
     [[ "$v" == "$CFG_ACCOUNT" ]] || decide deny \
@@ -664,6 +668,11 @@ guard_cf() {
   [[ -r "$CF_TABLE" ]] || decide deny \
     "cfgate: $CF_TABLE is missing, so cf commands cannot be classified. Regenerate it: python3 plugins/cloudflare/scripts/gen-cf-table.py <node_modules/cf>."
   parse_cf
+  # A literal credential is in the transcript whether or not cf then runs.
+  [[ -z "$CF_SECRET_LIT" ]] || decide deny \
+    "$CF_SECRET_LIT is given a literal value on the command line; it lands in the transcript and the shell history and must be rotated. Pass it from a variable filled by opgate: opgate exec VAR=op://... -- cf ... $CF_SECRET_LIT \"\$VAR\". See skills/cloudflare/references/secrets.md"
+  [[ -z "$CF_BADLEAD" ]] || decide deny \
+    "cfgate cannot read 'cf $CF_BADLEAD ...': '$CF_BADLEAD' before the command path is not one of cf's global options, and cf would read the words after it differently from the guard. Put the command path first: cf <command> <subcommand> ... $CF_BADLEAD"
   (( CF_HELP == 1 )) && return 0
   # API requests carry the credential; a different base URL sends it elsewhere.
   for a in ${SH_ASSIGNS[@]+"${SH_ASSIGNS[@]}"}; do
@@ -674,8 +683,6 @@ guard_cf() {
   if line_var_get CLOUDFLARE_API_BASE_URL exported && [[ "$LV" != https://api.cloudflare.com* ]]; then
     decide deny "CLOUDFLARE_API_BASE_URL is exported on this line to '$LV', which sends cf's credential to another endpoint. Remove it."
   fi
-  [[ -z "$CF_SECRET_LIT" ]] || decide deny \
-    "$CF_SECRET_LIT is given a literal value on the command line; it lands in the transcript and the shell history and must be rotated. Pass it from a variable filled by opgate: opgate exec VAR=op://... -- cf ... $CF_SECRET_LIT \"\$VAR\". See skills/cloudflare/references/secrets.md"
 
   if [[ -z "$CF_CMD" ]]; then
     [[ -z "$CF_FIRSTPOS" ]] && return 0      # bare `cf`: prints help

@@ -107,6 +107,11 @@ printf 'import { defineConfig } from "cf/config";\nexport default defineConfig({
 printf 'export default { accountId: "%s" };\n' "$ACC_OTHER" > "$repo/cfbad/cloudflare.config.ts"
 printf 'export default { accountId: process.env.PICK_ME };\n' > "$repo/cfcomp/cloudflare.config.ts"
 printf '{"account":{"id":"%s","name":"x"}}\n' "$ACC_OTHER" > "$repo/cfsaved/.cloudflare/cache/cloudflare-account.json"
+# cf -m <mode> also loads .env.<mode> and .env.<mode>.local from the run directory.
+mkdir -p "$repo/cfmode"
+printf 'export default { accountId: "%s" };\n' "$ACC" > "$repo/cfmode/cloudflare.config.ts"
+printf 'CLOUDFLARE_ACCOUNT_ID=%s\n' "$ACC_OTHER" > "$repo/cfmode/.env.staging"
+printf 'CLOUDFLARE_ACCOUNT_ID=%s\n' "$ACC_OTHER" > "$repo/cfmode/.env.qa.local"
 
 # --- review round 1 fixtures ---------------------------------------------------------
 # svc: an ordinary, unprotected Worker to stand in. other: another project's Worker
@@ -591,6 +596,57 @@ t deny "does not know 'cf frobnicate" "cf frobnicate now" "$S"
 t deny "Zone noscam.pro (--zone) is not a zone" "$P bash -c 'cf dns records delete abc --zone noscam.pro'" "$S"
 t deny "Nothing pins this cf write" "$P bash -c 'true'; cf r2 buckets create --name cme-x" "$S"   # a prefix on bash -c does not outlive it
 t deny "is not project 'cme''s account" "CLOUDFLARE_ACCOUNT_ID=$ACC_OTHER bash -c 'wrangler deploy -c wrangler.staging.jsonc'" "$C"
+
+echo
+echo "cf argv, read the way cf's yargs reads it (review round 2)"
+# Global options may come before the command path; any other leading option is refused.
+t deny "Zone noscam.pro (--zone) is not a zone" "$P cf -q dns records delete 0123 --zone noscam.pro --force" "$S"
+t deny "Zone noscam.pro (--zone) is not a zone" "$P cf --zone=noscam.pro dns records delete 0123" "$S"
+t deny "Zone noscam.pro (--zone) is not a zone" "$P cf -q -z noscam.pro dns records delete 0123" "$S"
+t deny "R2 bucket 'noscam-uploads' is outside" "$P cf --quiet r2 buckets delete noscam-uploads" "$S"
+t deny "R2 bucket 'noscam-uploads' is outside" "$P cf --profile=work r2 buckets delete noscam-uploads" "$S"
+t deny "R2 bucket 'noscam-uploads' is outside" "$P cf --quiet=false r2 buckets delete noscam-uploads" "$S"
+t deny "R2 bucket 'noscam-uploads' is outside" "$P cf -q true r2 buckets delete noscam-uploads" "$S"
+t deny "R2 bucket 'noscam-uploads' is outside" "$P cf r2 buckets delete -q true noscam-uploads" "$S"   # a boolean takes a following true
+t deny "'-x' before the command path" "$P cf -x r2 buckets delete noscam-uploads" "$S"
+t deny "'--' before the command path" "$P cf -- r2 buckets delete noscam-uploads" "$S"
+t pass "" "cf -q --help" "$S"
+t pass "" "cf --version" "$S"
+# Help and version count only in the forms cf honours; after -- nothing is an option.
+t deny "R2 bucket 'noscam-uploads' is outside" "$P cf r2 buckets delete noscam-uploads -- --help" "$S"
+t deny "R2 bucket 'noscam-uploads' is outside" "$P cf r2 buckets delete noscam-uploads -- -h" "$S"
+t deny "R2 bucket 'noscam-uploads' is outside" "$P cf r2 buckets delete -- noscam-uploads" "$S"
+t deny "R2 bucket 'noscam-uploads' is outside" "$P cf r2 buckets delete noscam-uploads --help=0" "$S"
+t deny "R2 bucket 'noscam-uploads' is outside" "$P cf r2 buckets delete noscam-uploads --help=1" "$S"
+t deny "R2 bucket 'noscam-uploads' is outside" "$P cf r2 buckets delete noscam-uploads --help false" "$S"
+t deny "R2 bucket 'noscam-uploads' is outside" "$P cf r2 buckets delete noscam-uploads --help --help=false" "$S"
+t deny "R2 bucket 'noscam-uploads' is outside" "$P cf r2 buckets delete noscam-uploads --version=0" "$S"
+t pass "" "cf r2 buckets delete noscam-uploads --help=true" "$S"
+t pass "" "cf r2 buckets delete noscam-uploads -h" "$S"
+# A dry run only when cf reads true: bare, =true, or a following "true".
+for v in "--dry-run=0" "--dry-run=no" "--dry-run=FALSE" "--dry-run=1" "--dry-run=" "--dry-run --dry-run=false" "--no-dry-run"; do
+  t deny "R2 bucket 'noscam-uploads' is outside" "$P cf r2 buckets delete noscam-uploads $v" "$S"
+done
+t allow "(dry run)" "cf r2 buckets delete noscam-uploads --dry-run=true" "$S"
+t allow "(dry run)" "cf r2 buckets delete noscam-uploads --dry-run true" "$S"
+# Commands whose whole purpose is storing a secret: the value options carry it.
+t deny "--text is given a literal value" "$P cf workers secrets update STRIPE_KEY --worker cme-api --type secret_text --text sk_live_abc123" "$S"
+t deny "--text is given a literal value" "$P cf workers secrets update STRIPE_KEY --worker cme-api --type secret_text --text=sk_live_abc123" "$S"
+t deny "--body is given a literal value" "$P cf workers secrets bulk --worker cme-api --body '{\"K\":{\"type\":\"secret_text\",\"text\":\"sk_live\"}}'" "$S"
+t deny "--value is given a literal value" "$P cf secrets-store secrets edit 0123 --store-id abc --value sk_live_abc123" "$S"
+t deny "--value is given a literal value" "$P cf api-security vulnerability-scanner credential-sets credentials create cs1 --name n --location header --location-name X --value sk_live" "$S"
+t deny "--stripe-authorization is given a literal value" "$P cf ai-gateway gateways create --id cme-gw --stripe-authorization sk_live_abc" "$S"
+t deny "--text is given a literal value" "$P cf workers secrets update STRIPE_KEY --worker cme-api --text sk_live_abc123 --help" "$S"   # help does not unsay it
+t allow "Worker cme-api" "$P cf workers secrets update STRIPE_KEY --worker cme-api --type secret_text --text \"\$STRIPE_KEY\"" "$S"
+t allow "Worker cme-api" "$P cf workers secrets bulk --worker cme-api --body @secrets.json" "$S"
+# cf -m <mode> loads .env.<mode> and .env.<mode>.local; their account counts too.
+CM="$repo/cfmode"
+t allow "R2 bucket cme-x" "cf r2 buckets delete cme-x" "$CM"
+t deny "sets CLOUDFLARE_ACCOUNT_ID=$ACC_OTHER" "cf -m staging r2 buckets delete cme-x" "$CM"
+t deny "sets CLOUDFLARE_ACCOUNT_ID=$ACC_OTHER" "cf r2 buckets delete cme-x --mode staging" "$CM"
+t deny "sets CLOUDFLARE_ACCOUNT_ID=$ACC_OTHER" "cf r2 buckets delete cme-x --mode=staging" "$CM"
+t deny "sets CLOUDFLARE_ACCOUNT_ID=$ACC_OTHER" "cf r2 buckets delete cme-x -m qa" "$CM"
+t deny "--mode is '\$M'" "cf -m \$M r2 buckets delete cme-x" "$CM"
 
 echo
 echo "config reader"

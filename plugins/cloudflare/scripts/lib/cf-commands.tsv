@@ -172,7 +172,7 @@ ai-gateway dynamic-routing update	write	PATCH	/accounts/{account_id}/ai-gateway/
 ai-gateway dynamic-routing versions create	write	POST	/accounts/{account_id}/ai-gateway/gateways/{gateway_id}/routes/{id}/versions	id	gateway-id,elements,body	-	create
 ai-gateway dynamic-routing versions get	read	GET	/accounts/{account_id}/ai-gateway/gateways/{gateway_id}/routes/{id}/versions/{version_id}	version-id	gateway-id,id	-	read
 ai-gateway dynamic-routing versions list	read	GET	/accounts/{account_id}/ai-gateway/gateways/{gateway_id}/routes/{id}/versions	-	gateway-id,id	-	read
-ai-gateway gateways create	write	POST	/accounts/{account_id}/ai-gateway/gateways	-	cache-ttl,guardrails-prompt-p1,guardrails-prompt-s1,guardrails-prompt-s10,guardrails-prompt-s11,guardrails-prompt-s12,guardrails-prompt-s13,guardrails-prompt-s2,guardrails-prompt-s3,guardrails-prompt-s4,guardrails-prompt-s5,guardrails-prompt-s6,guardrails-prompt-s7,guardrails-prompt-s8,guardrails-prompt-s9,guardrails-response-p1,guardrails-response-s1,guardrails-response-s10,guardrails-response-s11,guardrails-response-s12,guardrails-response-s13,guardrails-response-s2,guardrails-response-s3,guardrails-response-s4,guardrails-response-s5,guardrails-response-s6,guardrails-response-s7,guardrails-response-s8,guardrails-response-s9,id,log-management,log-management-strategy,logpush-public-key,otel,rate-limiting-interval,rate-limiting-limit,rate-limiting-technique,retry-backoff,retry-delay,retry-max-attempts,store-id,stripe-authorization,workers-ai-billing-mode,body	-	create
+ai-gateway gateways create	write	POST	/accounts/{account_id}/ai-gateway/gateways	-	cache-ttl,guardrails-prompt-p1,guardrails-prompt-s1,guardrails-prompt-s10,guardrails-prompt-s11,guardrails-prompt-s12,guardrails-prompt-s13,guardrails-prompt-s2,guardrails-prompt-s3,guardrails-prompt-s4,guardrails-prompt-s5,guardrails-prompt-s6,guardrails-prompt-s7,guardrails-prompt-s8,guardrails-prompt-s9,guardrails-response-p1,guardrails-response-s1,guardrails-response-s10,guardrails-response-s11,guardrails-response-s12,guardrails-response-s13,guardrails-response-s2,guardrails-response-s3,guardrails-response-s4,guardrails-response-s5,guardrails-response-s6,guardrails-response-s7,guardrails-response-s8,guardrails-response-s9,id,log-management,log-management-strategy,logpush-public-key,otel,rate-limiting-interval,rate-limiting-limit,rate-limiting-technique,retry-backoff,retry-delay,retry-max-attempts,store-id,stripe-authorization,workers-ai-billing-mode,body	stripe-authorization	create
 ai-gateway gateways delete	write	DELETE	/accounts/{account_id}/ai-gateway/gateways/{id}	gateway-id	-	-	delete
 ai-gateway gateways get	read	GET	/accounts/{account_id}/ai-gateway/gateways/{id}	gateway-id	-	-	read
 ai-gateway gateways get-url	read	GET	/accounts/{account_id}/ai-gateway/gateways/{gateway_id}/url/{provider}	provider	gateway-id	-	action
@@ -182,7 +182,7 @@ ai-gateway gateways providers delete	write	DELETE	/accounts/{account_id}/ai-gate
 ai-gateway gateways providers get	read	GET	/accounts/{account_id}/ai-gateway/gateways/{gateway_id}/provider_configs/{id}	id	gateway-id	-	read
 ai-gateway gateways providers list	read	GET	/accounts/{account_id}/ai-gateway/gateways/{gateway_id}/provider_configs	-	gateway-id,page,per-page	-	read
 ai-gateway gateways providers update	write	PUT	/accounts/{account_id}/ai-gateway/gateways/{gateway_id}/provider_configs/{id}	id	gateway-id,secret,body	secret	update
-ai-gateway gateways update	write	PUT	/accounts/{account_id}/ai-gateway/gateways/{id}	gateway-id	cache-ttl,guardrails-prompt-p1,guardrails-prompt-s1,guardrails-prompt-s10,guardrails-prompt-s11,guardrails-prompt-s12,guardrails-prompt-s13,guardrails-prompt-s2,guardrails-prompt-s3,guardrails-prompt-s4,guardrails-prompt-s5,guardrails-prompt-s6,guardrails-prompt-s7,guardrails-prompt-s8,guardrails-prompt-s9,guardrails-response-p1,guardrails-response-s1,guardrails-response-s10,guardrails-response-s11,guardrails-response-s12,guardrails-response-s13,guardrails-response-s2,guardrails-response-s3,guardrails-response-s4,guardrails-response-s5,guardrails-response-s6,guardrails-response-s7,guardrails-response-s8,guardrails-response-s9,log-management,log-management-strategy,logpush-public-key,otel,rate-limiting-interval,rate-limiting-limit,rate-limiting-technique,retry-backoff,retry-delay,retry-max-attempts,store-id,stripe-authorization,workers-ai-billing-mode,body	-	update
+ai-gateway gateways update	write	PUT	/accounts/{account_id}/ai-gateway/gateways/{id}	gateway-id	cache-ttl,guardrails-prompt-p1,guardrails-prompt-s1,guardrails-prompt-s10,guardrails-prompt-s11,guardrails-prompt-s12,guardrails-prompt-s13,guardrails-prompt-s2,guardrails-prompt-s3,guardrails-prompt-s4,guardrails-prompt-s5,guardrails-prompt-s6,guardrails-prompt-s7,guardrails-prompt-s8,guardrails-prompt-s9,guardrails-response-p1,guardrails-response-s1,guardrails-response-s10,guardrails-response-s11,guardrails-response-s12,guardrails-response-s13,guardrails-response-s2,guardrails-response-s3,guardrails-response-s4,guardrails-response-s5,guardrails-response-s6,guardrails-response-s7,guardrails-response-s8,guardrails-response-s9,log-management,log-management-strategy,logpush-public-key,otel,rate-limiting-interval,rate-limiting-limit,rate-limiting-technique,retry-backoff,retry-delay,retry-max-attempts,store-id,stripe-authorization,workers-ai-billing-mode,body	stripe-authorization	update
 ai-gateway logs delete	write	DELETE	/accounts/{account_id}/ai-gateway/gateways/{gateway_id}/logs	gateway-id	order-by,order-by-direction,filters,limit	-	delete
 ai-gateway logs get	read	GET	/accounts/{account_id}/ai-gateway/gateways/{gateway_id}/logs/{id}	id	gateway-id	-	read
 ai-gateway logs get-request	read	GET	/accounts/{account_id}/ai-gateway/gateways/{gateway_id}/logs/{id}/request	id	gateway-id	-	action
@@ -285,8 +285,8 @@ api-security schema-validation settings update	write	PUT	/zones/{zone_id}/schema
 api-security session-identifiers get	read	GET	/zones/{zone_id}/api_gateway/configuration	-	-	-	read
 api-security session-identifiers update	write	PUT	/zones/{zone_id}/api_gateway/configuration	-	auth-id-characteristics,body	-	update
 api-security token-validation configurations create	write	POST	/zones/{zone_id}/token_validation/config	-	description,title,token-type,body	-	create
-api-security token-validation configurations credentials edit	write	PATCH	/zones/{zone_id}/token_validation/config/{config_id}/credentials	config-id	keys,body	-	update
-api-security token-validation configurations credentials update	write	PUT	/zones/{zone_id}/token_validation/config/{config_id}/credentials	config-id	keys,body	-	update
+api-security token-validation configurations credentials edit	write	PATCH	/zones/{zone_id}/token_validation/config/{config_id}/credentials	config-id	keys,body	body	update
+api-security token-validation configurations credentials update	write	PUT	/zones/{zone_id}/token_validation/config/{config_id}/credentials	config-id	keys,body	body	update
 api-security token-validation configurations delete	write	DELETE	/zones/{zone_id}/token_validation/config/{config_id}	config-id	-	-	delete
 api-security token-validation configurations edit	write	PATCH	/zones/{zone_id}/token_validation/config/{config_id}	config-id	description,title,body	-	update
 api-security token-validation configurations get	read	GET	/zones/{zone_id}/token_validation/config/{config_id}	config-id	-	-	read
@@ -299,12 +299,12 @@ api-security token-validation rules edit	write	PATCH	/zones/{zone_id}/token_vali
 api-security token-validation rules get	read	GET	/zones/{zone_id}/token_validation/rules/{rule_id}	rule-id	-	-	read
 api-security token-validation rules list	read	GET	/zones/{zone_id}/token_validation/rules	-	per-page,page,token-configuration,action,id,rule-id,host,hostname	-	read
 api-security vulnerability-scanner credential-sets create	write	POST	/accounts/{account_id}/vuln_scanner/credential_sets	-	name,body	-	create
-api-security vulnerability-scanner credential-sets credentials create	write	POST	/accounts/{account_id}/vuln_scanner/credential_sets/{credential_set_id}/credentials	credential-set-id	location,location-name,name,value,body	-	create
+api-security vulnerability-scanner credential-sets credentials create	write	POST	/accounts/{account_id}/vuln_scanner/credential_sets/{credential_set_id}/credentials	credential-set-id	location,location-name,name,value,body	value,body	create
 api-security vulnerability-scanner credential-sets credentials delete	write	DELETE	/accounts/{account_id}/vuln_scanner/credential_sets/{credential_set_id}/credentials/{credential_id}	credential-id	credential-set-id	-	delete
-api-security vulnerability-scanner credential-sets credentials edit	write	PATCH	/accounts/{account_id}/vuln_scanner/credential_sets/{credential_set_id}/credentials/{credential_id}	credential-id	credential-set-id,location,location-name,name,value,body	-	update
+api-security vulnerability-scanner credential-sets credentials edit	write	PATCH	/accounts/{account_id}/vuln_scanner/credential_sets/{credential_set_id}/credentials/{credential_id}	credential-id	credential-set-id,location,location-name,name,value,body	value,body	update
 api-security vulnerability-scanner credential-sets credentials get	read	GET	/accounts/{account_id}/vuln_scanner/credential_sets/{credential_set_id}/credentials/{credential_id}	credential-id	credential-set-id	-	read
 api-security vulnerability-scanner credential-sets credentials list	read	GET	/accounts/{account_id}/vuln_scanner/credential_sets/{credential_set_id}/credentials	-	credential-set-id,page,per-page	-	read
-api-security vulnerability-scanner credential-sets credentials update	write	PUT	/accounts/{account_id}/vuln_scanner/credential_sets/{credential_set_id}/credentials/{credential_id}	credential-id	credential-set-id,location,location-name,name,value,body	-	update
+api-security vulnerability-scanner credential-sets credentials update	write	PUT	/accounts/{account_id}/vuln_scanner/credential_sets/{credential_set_id}/credentials/{credential_id}	credential-id	credential-set-id,location,location-name,name,value,body	value,body	update
 api-security vulnerability-scanner credential-sets delete	write	DELETE	/accounts/{account_id}/vuln_scanner/credential_sets/{credential_set_id}	credential-set-id	-	-	delete
 api-security vulnerability-scanner credential-sets edit	write	PATCH	/accounts/{account_id}/vuln_scanner/credential_sets/{credential_set_id}	credential-set-id	name,body	-	update
 api-security vulnerability-scanner credential-sets get	read	GET	/accounts/{account_id}/vuln_scanner/credential_sets/{credential_set_id}	credential-set-id	-	-	read
@@ -352,7 +352,7 @@ auth list	read	-	-	-	-	-	read
 auth login	cli	-	-	-	scopes	-	action
 auth logout	cli	-	-	-	-	-	action
 auth whoami	read	-	-	-	-	-	read
-basin-catalog credentials create	write	POST	/accounts/{account_id}/basin-catalog/{bucket_name}/credential	bucket-name	token,body	token	create
+basin-catalog credentials create	write	POST	/accounts/{account_id}/basin-catalog/{bucket_name}/credential	bucket-name	token,body	token,body	create
 basin-catalog credentials status	read	GET	/accounts/{account_id}/basin-catalog/{bucket_name}/credential/status	bucket-name	-	-	read
 basin-catalog delete	write	POST	/accounts/{account_id}/basin-catalog/{bucket_name}/delete	bucket-name	-	-	delete
 basin-catalog disable	write	POST	/accounts/{account_id}/basin-catalog/{bucket_name}/disable	bucket-name	-	-	action
@@ -783,10 +783,10 @@ custom-csrs delete	write	DELETE	/{account_or_zone}/{account_or_zone_id}/custom_c
 custom-csrs get	read	GET	/{account_or_zone}/{account_or_zone_id}/custom_csrs/{custom_csr_id}	custom-csr-id	-	-	read
 custom-csrs list	read	GET	/{account_or_zone}/{account_or_zone_id}/custom_csrs	-	page,per-page,order,direction	-	read
 custom-hostnames certificate-pack certificates delete	write	DELETE	/zones/{zone_id}/custom_hostnames/{custom_hostname_id}/certificate_pack/{certificate_pack_id}/certificates/{certificate_id}	certificate-id	custom-hostname-id,certificate-pack-id	-	delete
-custom-hostnames certificate-pack certificates update	write	PUT	/zones/{zone_id}/custom_hostnames/{custom_hostname_id}/certificate_pack/{certificate_pack_id}/certificates/{certificate_id}	certificate-id	custom-hostname-id,certificate-pack-id,custom-certificate,custom-key,body	-	update
-custom-hostnames create	write	POST	/zones/{zone_id}/custom_hostnames	-	custom-origin-server,custom-origin-sni,hostname,ssl-bundle-method,ssl-certificate-authority,ssl-custom-certificate,ssl-custom-csr-id,ssl-custom-key,ssl-method,ssl-settings-ciphers,ssl-settings-early-hints,ssl-settings-http2,ssl-settings-min-tls-version,ssl-settings-tls-1-3,ssl-type,body	-	create
+custom-hostnames certificate-pack certificates update	write	PUT	/zones/{zone_id}/custom_hostnames/{custom_hostname_id}/certificate_pack/{certificate_pack_id}/certificates/{certificate_id}	certificate-id	custom-hostname-id,certificate-pack-id,custom-certificate,custom-key,body	custom-key	update
+custom-hostnames create	write	POST	/zones/{zone_id}/custom_hostnames	-	custom-origin-server,custom-origin-sni,hostname,ssl-bundle-method,ssl-certificate-authority,ssl-custom-certificate,ssl-custom-csr-id,ssl-custom-key,ssl-method,ssl-settings-ciphers,ssl-settings-early-hints,ssl-settings-http2,ssl-settings-min-tls-version,ssl-settings-tls-1-3,ssl-type,body	ssl-custom-key	create
 custom-hostnames delete	write	DELETE	/zones/{zone_id}/custom_hostnames/{custom_hostname_id}	custom-hostname-id	-	-	delete
-custom-hostnames edit	write	PATCH	/zones/{zone_id}/custom_hostnames/{custom_hostname_id}	custom-hostname-id	custom-origin-server,custom-origin-sni,ssl-bundle-method,ssl-certificate-authority,ssl-custom-certificate,ssl-custom-csr-id,ssl-custom-key,ssl-method,ssl-settings-ciphers,ssl-settings-early-hints,ssl-settings-http2,ssl-settings-min-tls-version,ssl-settings-tls-1-3,ssl-type,body	-	update
+custom-hostnames edit	write	PATCH	/zones/{zone_id}/custom_hostnames/{custom_hostname_id}	custom-hostname-id	custom-origin-server,custom-origin-sni,ssl-bundle-method,ssl-certificate-authority,ssl-custom-certificate,ssl-custom-csr-id,ssl-custom-key,ssl-method,ssl-settings-ciphers,ssl-settings-early-hints,ssl-settings-http2,ssl-settings-min-tls-version,ssl-settings-tls-1-3,ssl-type,body	ssl-custom-key	update
 custom-hostnames fallback-origin delete	write	DELETE	/zones/{zone_id}/custom_hostnames/fallback_origin	-	-	-	delete
 custom-hostnames fallback-origin get	read	GET	/zones/{zone_id}/custom_hostnames/fallback_origin	-	-	-	read
 custom-hostnames fallback-origin update	write	PUT	/zones/{zone_id}/custom_hostnames/fallback_origin	-	origin,body	-	update
@@ -1382,7 +1382,7 @@ magic-transit bgp-settings update	write	PUT	/accounts/{account_id}/magic/bgp/set
 magic-transit cf-interconnects bulk-update	write	PUT	/accounts/{account_id}/magic/cf_interconnects	-	x-magic-new-hc-target,body	-	action
 magic-transit cf-interconnects get	read	GET	/accounts/{account_id}/magic/cf_interconnects/{cf_interconnect_id}	cf-interconnect-id	x-magic-new-hc-target	-	read
 magic-transit cf-interconnects list	read	GET	/accounts/{account_id}/magic/cf_interconnects	-	x-magic-new-hc-target	-	read
-magic-transit cf-interconnects update	write	PUT	/accounts/{account_id}/magic/cf_interconnects/{cf_interconnect_id}	cf-interconnect-id	x-magic-new-hc-target,bgp-as-no,bgp-cloudflare-endpoint,bgp-customer-asn,bgp-customer-endpoint,bgp-export-filter-id,bgp-extra-prefixes,bgp-import-filter-id,bgp-md5-key,description,gre-cloudflare-endpoint,health-check-rate,health-check-target-saved,health-check-type,health-check-direction,health-check-source,interface-address,interface-address6,mtu,name,body	-	update
+magic-transit cf-interconnects update	write	PUT	/accounts/{account_id}/magic/cf_interconnects/{cf_interconnect_id}	cf-interconnect-id	x-magic-new-hc-target,bgp-as-no,bgp-cloudflare-endpoint,bgp-customer-asn,bgp-customer-endpoint,bgp-export-filter-id,bgp-extra-prefixes,bgp-import-filter-id,bgp-md5-key,description,gre-cloudflare-endpoint,health-check-rate,health-check-target-saved,health-check-type,health-check-direction,health-check-source,interface-address,interface-address6,mtu,name,body	bgp-md5-key	update
 magic-transit cf1-sites create	write	POST	/accounts/{account_id}/magic/cf1_sites	-	body	-	create
 magic-transit cf1-sites delete	write	DELETE	/accounts/{account_id}/magic/cf1_sites/{cf1_site_id}	cf1-site-id	-	-	delete
 magic-transit cf1-sites get	read	GET	/accounts/{account_id}/magic/cf1_sites/{cf1_site_id}	cf1-site-id	-	-	read
@@ -1393,19 +1393,19 @@ magic-transit cf1-sites ramps get	read	GET	/accounts/{account_id}/magic/cf1_site
 magic-transit cf1-sites ramps list	read	GET	/accounts/{account_id}/magic/cf1_sites/{cf1_site_id}/ramps	-	cf1-site-id	-	read
 magic-transit cf1-sites update	write	PATCH	/accounts/{account_id}/magic/cf1_sites/{cf1_site_id}	cf1-site-id	description,location-lat,location-long,location-name,name,body	-	update
 magic-transit gre-tunnels bulk-update	write	PUT	/accounts/{account_id}/magic/gre_tunnels	-	x-magic-new-hc-target,body	-	action
-magic-transit gre-tunnels create	write	POST	/accounts/{account_id}/magic/gre_tunnels	-	x-magic-new-hc-target,bgp-customer-asn,bgp-export-filter-id,bgp-extra-prefixes,bgp-import-filter-id,bgp-md5-key,cloudflare-gre-endpoint,customer-gre-endpoint,description,health-check-rate,health-check-target-saved,health-check-type,health-check-direction,interface-address,interface-address6,mtu,name,ttl,body	-	create
+magic-transit gre-tunnels create	write	POST	/accounts/{account_id}/magic/gre_tunnels	-	x-magic-new-hc-target,bgp-customer-asn,bgp-export-filter-id,bgp-extra-prefixes,bgp-import-filter-id,bgp-md5-key,cloudflare-gre-endpoint,customer-gre-endpoint,description,health-check-rate,health-check-target-saved,health-check-type,health-check-direction,interface-address,interface-address6,mtu,name,ttl,body	bgp-md5-key	create
 magic-transit gre-tunnels delete	write	DELETE	/accounts/{account_id}/magic/gre_tunnels/{gre_tunnel_id}	gre-tunnel-id	x-magic-new-hc-target	-	delete
 magic-transit gre-tunnels get	read	GET	/accounts/{account_id}/magic/gre_tunnels/{gre_tunnel_id}	gre-tunnel-id	x-magic-new-hc-target	-	read
 magic-transit gre-tunnels list	read	GET	/accounts/{account_id}/magic/gre_tunnels	-	x-magic-new-hc-target	-	read
 magic-transit gre-tunnels update	write	PUT	/accounts/{account_id}/magic/gre_tunnels/{gre_tunnel_id}	gre-tunnel-id	x-magic-new-hc-target,cloudflare-gre-endpoint,customer-gre-endpoint,description,health-check-rate,health-check-target-saved,health-check-type,health-check-direction,interface-address,interface-address6,mtu,name,ttl,body	-	update
 magic-transit ipsec-tunnels bulk-update	write	PUT	/accounts/{account_id}/magic/ipsec_tunnels	-	x-magic-new-hc-target,body	-	action
-magic-transit ipsec-tunnels create	write	POST	/accounts/{account_id}/magic/ipsec_tunnels	-	x-magic-new-hc-target,bgp-customer-asn,bgp-export-filter-id,bgp-extra-prefixes,bgp-import-filter-id,bgp-md5-key,cloudflare-endpoint,custom-remote-identities-fqdn-id,customer-endpoint,description,health-check-rate,health-check-target-saved,health-check-type,health-check-direction,interface-address,interface-address6,name,psk,body	-	create
+magic-transit ipsec-tunnels create	write	POST	/accounts/{account_id}/magic/ipsec_tunnels	-	x-magic-new-hc-target,bgp-customer-asn,bgp-export-filter-id,bgp-extra-prefixes,bgp-import-filter-id,bgp-md5-key,cloudflare-endpoint,custom-remote-identities-fqdn-id,customer-endpoint,description,health-check-rate,health-check-target-saved,health-check-type,health-check-direction,interface-address,interface-address6,name,psk,body	bgp-md5-key	create
 magic-transit ipsec-tunnels delete	write	DELETE	/accounts/{account_id}/magic/ipsec_tunnels/{ipsec_tunnel_id}	ipsec-tunnel-id	x-magic-new-hc-target	-	delete
 magic-transit ipsec-tunnels get	read	GET	/accounts/{account_id}/magic/ipsec_tunnels/{ipsec_tunnel_id}	ipsec-tunnel-id	x-magic-new-hc-target	-	read
 magic-transit ipsec-tunnels list	read	GET	/accounts/{account_id}/magic/ipsec_tunnels	-	x-magic-new-hc-target	-	read
 magic-transit ipsec-tunnels psk-generate	write	POST	/accounts/{account_id}/magic/ipsec_tunnels/{ipsec_tunnel_id}/psk_generate	ipsec-tunnel-id	-	-	action
-magic-transit ipsec-tunnels psk-set	write	POST	/accounts/{account_id}/magic/ipsec_tunnels/psk	-	psks,body	-	action
-magic-transit ipsec-tunnels update	write	PUT	/accounts/{account_id}/magic/ipsec_tunnels/{ipsec_tunnel_id}	ipsec-tunnel-id	x-magic-new-hc-target,bgp-customer-asn,bgp-export-filter-id,bgp-extra-prefixes,bgp-import-filter-id,bgp-md5-key,cloudflare-endpoint,custom-remote-identities-fqdn-id,customer-endpoint,description,health-check-rate,health-check-target-saved,health-check-type,health-check-direction,interface-address,interface-address6,name,psk,body	-	update
+magic-transit ipsec-tunnels psk-set	write	POST	/accounts/{account_id}/magic/ipsec_tunnels/psk	-	psks,body	psks	action
+magic-transit ipsec-tunnels update	write	PUT	/accounts/{account_id}/magic/ipsec_tunnels/{ipsec_tunnel_id}	ipsec-tunnel-id	x-magic-new-hc-target,bgp-customer-asn,bgp-export-filter-id,bgp-extra-prefixes,bgp-import-filter-id,bgp-md5-key,cloudflare-endpoint,custom-remote-identities-fqdn-id,customer-endpoint,description,health-check-rate,health-check-target-saved,health-check-type,health-check-direction,interface-address,interface-address6,name,psk,body	bgp-md5-key	update
 magic-transit pcaps create	write	POST	/accounts/{account_id}/pcaps	-	body	-	create
 magic-transit pcaps download get	read	GET	/accounts/{account_id}/pcaps/{pcap_id}/download	pcap-id	-	-	read
 magic-transit pcaps get	read	GET	/accounts/{account_id}/pcaps/{pcap_id}	pcap-id	-	-	read
@@ -1536,11 +1536,11 @@ network virtual-networks delete	write	DELETE	/accounts/{account_id}/teamnet/virt
 network virtual-networks edit	write	PATCH	/accounts/{account_id}/teamnet/virtual_networks/{virtual_network_id}	virtual-network-id	comment,name,body	-	update
 network virtual-networks get	read	GET	/accounts/{account_id}/teamnet/virtual_networks/{virtual_network_id}	virtual-network-id	comment,name	-	read
 network virtual-networks list	read	GET	/accounts/{account_id}/teamnet/virtual_networks	-	id,name	-	read
-network-interconnects cnis create	write	POST	/accounts/{account_id}/cni/cnis	-	account,bgp-customer-asn,bgp-extra-prefixes,bgp-md5-key,interconnect,magic-conduit-name,magic-description,magic-mtu,body	-	create
+network-interconnects cnis create	write	POST	/accounts/{account_id}/cni/cnis	-	account,bgp-customer-asn,bgp-extra-prefixes,bgp-md5-key,interconnect,magic-conduit-name,magic-description,magic-mtu,body	bgp-md5-key	create
 network-interconnects cnis delete	write	DELETE	/accounts/{account_id}/cni/cnis/{cni}	cni	-	-	delete
 network-interconnects cnis get	read	GET	/accounts/{account_id}/cni/cnis/{cni}	cni	-	-	read
 network-interconnects cnis list	read	GET	/accounts/{account_id}/cni/cnis	-	slot,tunnel-id,cursor,limit	-	read
-network-interconnects cnis update	write	PUT	/accounts/{account_id}/cni/cnis/{cni}	cni	account,bgp-customer-asn,bgp-extra-prefixes,bgp-md5-key,bgp-mode,cust-ip,id,interconnect,magic-conduit-name,magic-description,magic-mtu,p2p-ip,body	-	update
+network-interconnects cnis update	write	PUT	/accounts/{account_id}/cni/cnis/{cni}	cni	account,bgp-customer-asn,bgp-extra-prefixes,bgp-md5-key,bgp-mode,cust-ip,id,interconnect,magic-conduit-name,magic-description,magic-mtu,p2p-ip,body	bgp-md5-key	update
 network-interconnects interconnects create	write	POST	/accounts/{account_id}/cni/interconnects	-	account,type,slot-id,speed,bandwidth,pairing-key,body	-	create
 network-interconnects interconnects delete	write	DELETE	/accounts/{account_id}/cni/interconnects/{icon}	icon	-	-	delete
 network-interconnects interconnects get	read	GET	/accounts/{account_id}/cni/interconnects/{icon}	icon	-	-	read
@@ -2134,10 +2134,10 @@ scim users list	read	GET	/accounts/{account_id}/scim/v2/Users	-	startIndex,count
 scim users update	write	PUT	/accounts/{account_id}/scim/v2/Users/{user_id}	user-id	body,file	-	update
 secrets-store quota get	read	GET	/accounts/{account_id}/secrets_store/quota	-	-	-	read
 secrets-store secrets bulk-delete	write	DELETE	/accounts/{account_id}/secrets_store/stores/{store_id}/secrets	-	store-id,ids,body	-	action
-secrets-store secrets create	write	POST	/accounts/{account_id}/secrets_store/stores/{store_id}/secrets	store-id	body	-	create
+secrets-store secrets create	write	POST	/accounts/{account_id}/secrets_store/stores/{store_id}/secrets	store-id	body	body	create
 secrets-store secrets delete	write	DELETE	/accounts/{account_id}/secrets_store/stores/{store_id}/secrets/{secret_id}	secret-id	store-id	-	delete
 secrets-store secrets duplicate	write	POST	/accounts/{account_id}/secrets_store/stores/{store_id}/secrets/{secret_id}/duplicate	secret-id	store-id,comment,name,scopes,body	-	action
-secrets-store secrets edit	write	PATCH	/accounts/{account_id}/secrets_store/stores/{store_id}/secrets/{secret_id}	secret-id	store-id,comment,scopes,value,body	-	update
+secrets-store secrets edit	write	PATCH	/accounts/{account_id}/secrets_store/stores/{store_id}/secrets/{secret_id}	secret-id	store-id,comment,scopes,value,body	value,body	update
 secrets-store secrets get	read	GET	/accounts/{account_id}/secrets_store/stores/{store_id}/secrets/{secret_id}	secret-id	store-id	-	read
 secrets-store secrets list	read	GET	/accounts/{account_id}/secrets_store/stores/{store_id}/secrets	-	store-id,direction,page,per-page,search,order,scopes	-	read
 secrets-store stores get	read	GET	/accounts/{account_id}/secrets_store/stores/{store_id}	store-id	-	-	read
@@ -2254,7 +2254,7 @@ stream videos downloads delete	write	DELETE	/accounts/{account_id}/stream/{ident
 stream videos edit	write	POST	/accounts/{account_id}/stream/{identifier}	identifier	allowed-origins,creator,max-duration-seconds,public-details-channel-link,public-details-logo,public-details-share-link,public-details-title,scheduled-deletion,thumbnail-timestamp-pct,uid,upload-expiry,body	-	update
 stream videos get	read	GET	/accounts/{account_id}/stream/{identifier}	identifier	-	-	read
 stream videos list	read	GET	/accounts/{account_id}/stream	-	status,creator,type,video-name,search,start,end,id,name,live-input-id,before,after,limit	-	read
-stream videos token create	write	POST	/accounts/{account_id}/stream/{identifier}/token	identifier	access-rules,exp,id,nbf,pem,body	-	create
+stream videos token create	write	POST	/accounts/{account_id}/stream/{identifier}/token	identifier	access-rules,exp,id,nbf,pem,body	pem	create
 stream watermarks create	write	POST	/accounts/{account_id}/stream/watermarks	-	name,opacity,padding,position,scale,url,body,file	-	create
 stream watermarks delete	write	DELETE	/accounts/{account_id}/stream/watermarks/{identifier}	identifier	-	-	delete
 stream watermarks get	read	GET	/accounts/{account_id}/stream/watermarks/{identifier}	identifier	-	-	read
@@ -2446,11 +2446,11 @@ workers deployments list	read	GET	/accounts/{account_id}/workers/scripts/{script
 workers get	read	GET	/accounts/{account_id}/workers/workers/{worker_id}	worker-id	-	-	read
 workers list	read	GET	/accounts/{account_id}/workers/workers	-	page,per-page,order-by,order	-	read
 workers scripts search	read	GET	/accounts/{account_id}/workers/scripts-search	-	name,id,order-by,page,per-page	-	action
-workers secrets bulk	write	PATCH	/accounts/{account_id}/workers/scripts/{script_name}/secrets-bulk	-	worker,body,file	-	action
+workers secrets bulk	write	PATCH	/accounts/{account_id}/workers/scripts/{script_name}/secrets-bulk	-	worker,body,file	body	action
 workers secrets delete	write	DELETE	/accounts/{account_id}/workers/scripts/{script_name}/secrets/{secret_name}	secret-name	worker	-	delete
 workers secrets get	read	GET	/accounts/{account_id}/workers/scripts/{script_name}/secrets/{secret_name}	secret-name	worker	-	read
 workers secrets list	read	GET	/accounts/{account_id}/workers/scripts/{script_name}/secrets	-	worker	-	read
-workers secrets update	write	PUT	/accounts/{account_id}/workers/scripts/{script_name}/secrets	name	worker,text,type,format,key-base64,usages,body	-	update
+workers secrets update	write	PUT	/accounts/{account_id}/workers/scripts/{script_name}/secrets	name	worker,text,type,format,key-base64,usages,body	text,key-base64,body	update
 workers triggers deploy	project	-	-	-	worker	-	action
 workers types	local	-	-	-	-	-	action
 workers versions create	project	-	-	-	tag,message,secrets-file,worker,preview-alias	-	create
@@ -2471,11 +2471,11 @@ workers-for-platforms dispatch-namespaces scripts bindings get	read	GET	/account
 workers-for-platforms dispatch-namespaces scripts delete	write	DELETE	/accounts/{account_id}/workers/dispatch/namespaces/{dispatch_namespace}/scripts/{script_name}	script-name	dispatch-namespace	-	delete
 workers-for-platforms dispatch-namespaces scripts get	read	GET	/accounts/{account_id}/workers/dispatch/namespaces/{dispatch_namespace}/scripts/{script_name}	script-name	dispatch-namespace	-	read
 workers-for-platforms dispatch-namespaces scripts list	read	GET	/accounts/{account_id}/workers/dispatch/namespaces/{dispatch_namespace}/scripts	-	dispatch-namespace,tags	-	read
-workers-for-platforms dispatch-namespaces scripts secrets bulk	write	PATCH	/accounts/{account_id}/workers/dispatch/namespaces/{dispatch_namespace}/scripts/{script_name}/secrets-bulk	-	dispatch-namespace,script-name,body,file	-	action
+workers-for-platforms dispatch-namespaces scripts secrets bulk	write	PATCH	/accounts/{account_id}/workers/dispatch/namespaces/{dispatch_namespace}/scripts/{script_name}/secrets-bulk	-	dispatch-namespace,script-name,body,file	body	action
 workers-for-platforms dispatch-namespaces scripts secrets delete	write	DELETE	/accounts/{account_id}/workers/dispatch/namespaces/{dispatch_namespace}/scripts/{script_name}/secrets/{secret_name}	secret-name	dispatch-namespace,script-name	-	delete
 workers-for-platforms dispatch-namespaces scripts secrets get	read	GET	/accounts/{account_id}/workers/dispatch/namespaces/{dispatch_namespace}/scripts/{script_name}/secrets/{secret_name}	secret-name	dispatch-namespace,script-name	-	read
 workers-for-platforms dispatch-namespaces scripts secrets list	read	GET	/accounts/{account_id}/workers/dispatch/namespaces/{dispatch_namespace}/scripts/{script_name}/secrets	-	dispatch-namespace,script-name	-	read
-workers-for-platforms dispatch-namespaces scripts secrets update	write	PUT	/accounts/{account_id}/workers/dispatch/namespaces/{dispatch_namespace}/scripts/{script_name}/secrets	script-name	dispatch-namespace,name,text,type,format,key-base64,usages,body	-	update
+workers-for-platforms dispatch-namespaces scripts secrets update	write	PUT	/accounts/{account_id}/workers/dispatch/namespaces/{dispatch_namespace}/scripts/{script_name}/secrets	script-name	dispatch-namespace,name,text,type,format,key-base64,usages,body	text,key-base64,body	update
 workers-for-platforms dispatch-namespaces scripts settings edit	write	PATCH	/accounts/{account_id}/workers/dispatch/namespaces/{dispatch_namespace}/scripts/{script_name}/settings	script-name	dispatch-namespace,body,file	-	update
 workers-for-platforms dispatch-namespaces scripts settings get	read	GET	/accounts/{account_id}/workers/dispatch/namespaces/{dispatch_namespace}/scripts/{script_name}/settings	script-name	dispatch-namespace	-	read
 workers-for-platforms dispatch-namespaces scripts tags delete	write	DELETE	/accounts/{account_id}/workers/dispatch/namespaces/{dispatch_namespace}/scripts/{script_name}/tags/{tag}	tag	dispatch-namespace,script-name	-	delete

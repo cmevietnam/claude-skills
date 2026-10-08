@@ -77,10 +77,27 @@ HAND = {
 }
 
 # Options whose value is a credential: written literally, it is in the transcript.
+# Three signals, because a name alone misses the commands whose whole purpose is
+# storing a secret (`workers secrets update --text`, `secrets-store ... --value`).
 SECRET_RE = re.compile(
-    r"(^|-)(password|secret|private-key|token|api-key|credentials|secret-access-key|client-secret|signing-secret|tunnel-secret)$"
+    r"(^|-)(password|secret|private-key|token|api-key|credentials|secret-access-key|client-secret|signing-secret"
+    r"|tunnel-secret|authorization|md5-key|custom-key|key-base64|pem|psks)$"
 )
 NOT_SECRET = {"page-token", "filters-token-id"}
+# The manifest's own description says the value is the secret.
+SECRET_DESC_RE = re.compile(r"^(The (secret|credential) value|The value of the secret)", re.I)
+# Commands that store secrets: their --body carries the same values.
+SECRET_BODY_CMD_RE = re.compile(r"(^| )(secrets|credentials) (bulk|create|edit|update)$")
+
+
+def is_secret(path, opt):
+    if opt["type"] == "boolean" or opt["name"] in NOT_SECRET:
+        return False
+    return bool(
+        SECRET_RE.search(opt["name"])
+        or SECRET_DESC_RE.search(opt.get("description") or "")
+        or (opt["name"] == "body" and SECRET_BODY_CMD_RE.search(path))
+    )
 
 
 def main():
@@ -104,10 +121,7 @@ def main():
         opts = c.get("options", [])
         args = ",".join(a["name"] for a in c.get("arguments", []))
         vals = ",".join(o["name"] for o in opts if o["type"] != "boolean")
-        secrets = ",".join(
-            o["name"] for o in opts
-            if o["type"] != "boolean" and SECRET_RE.search(o["name"]) and o["name"] not in NOT_SECRET
-        )
+        secrets = ",".join(o["name"] for o in opts if is_secret(path, o))
         rows.append("\t".join([path, kind, method, api, args or "-", vals or "-", secrets or "-", c.get("category") or "-"]))
     if missing:
         sys.exit("unclassified commands with no API path (add them to HAND): " + ", ".join(missing))

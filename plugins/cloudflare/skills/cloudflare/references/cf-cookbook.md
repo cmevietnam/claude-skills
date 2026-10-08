@@ -31,6 +31,11 @@ curl call:
 - GET commands and `--dry-run` pass. `{account_or_zone}` commands (rulesets,
   subscriptions) ask: cf decides at run time whether they hit the account or a
   zone.
+- Put the command path first: `cf r2 buckets delete x -q`, not `cf -x ... r2`.
+  Only cf's global options may come before it. Write a dry run as bare
+  `--dry-run`: `--dry-run=1` and `--dry-run=TRUE` are real runs in cf.
+- `-m <mode>` makes cf load `.env.<mode>` and `.env.<mode>.local` too; an account
+  set there is checked like `.env`.
 
 When cf is upgraded, regenerate the table, or new commands are refused:
 
@@ -85,4 +90,7 @@ a write lands in and refuses until `CLOUDFLARE_ACCOUNT_ID` pins it.
 `CLOUDFLARE_API_TOKEN` (fill it with `opgate exec`). The hook refuses
 `CLOUDFLARE_API_BASE_URL` pointing anywhere but `api.cloudflare.com`, since every
 request carries the credential, and any credential option (`--secret`, `--token`,
-`--password`...) written literally.
+`--password`, `workers secrets update --text`, `secrets-store secrets edit
+--value`, the `--body` of a secrets command...) written literally. Pass the value
+from a variable (`--text "$STRIPE_KEY"` under `opgate exec`) or a file
+(`workers secrets bulk --body @secrets.json`).

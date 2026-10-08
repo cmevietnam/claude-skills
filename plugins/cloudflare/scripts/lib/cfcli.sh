@@ -10,8 +10,22 @@
 
 CF_TABLE="${CF_TABLE:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)/cf-commands.tsv}"
 
-# Global options of every cf command (from `cf <any> --help`).
+# Global options of every cf command (from `cf <any> --help`). yargs accepts
+# them anywhere, before the command path too.
 CF_GLOBAL_VAL=" -z --zone --profile -m --mode --persist-to "
+CF_GLOBAL_BOOL=" -q --quiet --local -h --help -v --version "
+
+# cf_bool <word> <next word> — how yargs reads a boolean flag: sets CF_B to 1 or
+# 0 and CF_BN to the words it takes. Bare or =true is true, and so is a
+# following "true"; =anything else (0, 1, TRUE, no, empty) is false.
+cf_bool() {
+  CF_B=1; CF_BN=1
+  if [[ "$1" == --no-* ]]; then CF_B=0
+  elif [[ "$1" == *=* ]]; then [[ "${1#*=}" == true ]] || CF_B=0
+  elif [[ "$2" == true || "$2" == false ]]; then
+    [[ "$2" == true ]] || CF_B=0; CF_BN=2
+  fi
+}
 
 # cf_lookup <path> — sets CF_ROW to the table line for an exact command path.
 cf_lookup() {
@@ -23,18 +37,29 @@ cf_lookup() {
 #   CF_CMD CF_KIND CF_METHOD CF_API CF_CATEGORY   the command and its table row
 #   CF_ARGN[] CF_ARGV[]       positional argument names and the values given
 #   CF_OPTN[] CF_OPTV[]       options given (name without dashes, last value)
-#   CF_ZONE CF_DRYRUN CF_HELP CF_BODY CF_DUP CF_SECRET_LIT CF_FIRSTPOS
+#   CF_ZONE CF_MODE CF_DRYRUN CF_HELP CF_BODY CF_DUP CF_SECRET_LIT CF_FIRSTPOS
+#   CF_BADLEAD   an option before the command path that is not a global one
+# CF_HELP and CF_DRYRUN are 1 only when every occurrence reads true: a mix is
+# checked as a real run.
 parse_cf() {
   CF_CMD=""; CF_KIND=""; CF_METHOD=""; CF_API=""; CF_CATEGORY=""; CF_ARGN=(); CF_ARGV=()
-  CF_OPTN=(); CF_OPTV=(); CF_ZONE=""; CF_DRYRUN=0; CF_HELP=0; CF_BODY=""; CF_DUP=""
-  CF_SECRET_LIT=""; CF_FIRSTPOS=""
-  local n=${#SH_WORDS[@]} j=$((SH_START + 1)) t f val b bv k p i
+  CF_OPTN=(); CF_OPTV=(); CF_ZONE=""; CF_MODE=""; CF_DRYRUN=0; CF_HELP=0; CF_BODY=""; CF_DUP=""
+  CF_SECRET_LIT=""; CF_FIRSTPOS=""; CF_BADLEAD=""
+  local n=${#SH_WORDS[@]} j=$((SH_START + 1)) t f val b k p i help_seen=0 help_off=0 dry_seen=0 dry_off=0
   local -a lead=()
-  # The command path: the leading words, skipping global options.
+  # The command path: the leading words, skipping global options. Anything else
+  # starting with - ends it; before the first word, cf would read the line
+  # differently from the guard (an unknown option takes the next word as its
+  # value, and -- ends option parsing), so it is refused.
   while (( j < n )); do
-    t=${SH_WORDS[j]}
-    if [[ "$CF_GLOBAL_VAL" == *" $t "* ]]; then j=$((j + 2)); continue; fi
-    [[ "$t" == -* ]] && break
+    t=${SH_WORDS[j]}; f=${t%%=*}
+    if [[ "$t" != -- && "$CF_GLOBAL_VAL" == *" $f "* ]]; then
+      [[ "$t" == *=* ]] && j=$((j + 1)) || j=$((j + 2)); continue
+    fi
+    if [[ "$t" != -- && "$CF_GLOBAL_BOOL" == *" $f "* ]]; then
+      cf_bool "$t" "${SH_WORDS[j+1]:-}"; j=$((j + CF_BN)); continue
+    fi
+    if [[ "$t" == -* ]]; then (( ${#lead[@]} == 0 )) && CF_BADLEAD="$t"; break; fi
     lead[${#lead[@]}]="$t"
     j=$((j + 1))
   done
@@ -54,41 +79,47 @@ parse_cf() {
   [[ "$args" == - ]] || IFS=, read -r -a argn <<< "$args"
   vals=",${vals},"; secrets=",${secrets},"
 
-  # Everything after the command path, in order.
-  local skip=$k pos=0
+  # Everything after the command path, in order. After -- nothing is an option.
+  local skip=$k pos=0 opts=1
   j=$((SH_START + 1))
   while (( j < n )); do
     t=${SH_WORDS[j]}
-    if [[ "$t" == -- ]]; then j=$((j + 1)); continue; fi
-    if [[ "$t" == -?* ]]; then
+    if (( opts )) && [[ "$t" == -- ]]; then opts=0; j=$((j + 1)); continue; fi
+    if (( opts )) && [[ "$t" == -?* ]]; then
       f=${t%%=*}
-      # Booleans the guard acts on, read the way yargs reads them.
-      b=""; bv=1
-      case "$f" in
-        -h|--help) b=help ;; -v|--version) b=help ;; --dry-run) b=dry ;;
-        --no-dry-run) b=dry; bv=0 ;; --no-help) b=help; bv=0 ;;
-      esac
-      if [[ -n "$b" ]]; then
-        if [[ "$t" == *=* ]]; then [[ "${t#*=}" == false ]] && bv=0
-        elif [[ "$f" != --no-* ]] && [[ "${SH_WORDS[j+1]:-}" == true || "${SH_WORDS[j+1]:-}" == false ]]; then
-          [[ "${SH_WORDS[j+1]}" == false ]] && bv=0; j=$((j + 1))
-        fi
-        case "$b" in help) CF_HELP=$bv ;; dry) CF_DRYRUN=$bv ;; esac
-        j=$((j + 1)); continue
-      fi
       val=""
       local name=${f#--}; name=${name#-}
+      # Booleans the guard acts on, read the way yargs reads them.
+      b=""
+      case "$f" in
+        -h|--help|--no-help|-v|--version|--no-version) b=help ;;
+        --dry-run|--no-dry-run) b=dry ;;
+      esac
+      if [[ -n "$b" ]]; then
+        cf_bool "$t" "${SH_WORDS[j+1]:-}"
+        case "$b" in
+          help) help_seen=1; (( CF_B )) || help_off=1 ;;
+          dry)  dry_seen=1;  (( CF_B )) || dry_off=1 ;;
+        esac
+        j=$((j + CF_BN)); continue
+      fi
       if [[ "$t" == *=* ]]; then val=${t#*=}
       elif [[ "$CF_GLOBAL_VAL" == *" $f "* || ( "$f" == --* && "$vals" == *",$name,"* ) ]]; then
         val="${SH_WORDS[j+1]:-}"; j=$((j + 1))
       else
-        j=$((j + 1)); continue                      # a boolean option
+        cf_bool "$t" "${SH_WORDS[j+1]:-}"           # a boolean option
+        j=$((j + CF_BN)); continue
       fi
       case "$f" in
         -z|--zone) CF_ZONE="$val" ;;
+        -m|--mode) CF_MODE="$val" ;;
         --body)    CF_BODY="$val" ;;
       esac
-      if [[ "$secrets" == *",$name,"* ]] && is_literal "$val" && [[ -z "$CF_SECRET_LIT" ]]; then CF_SECRET_LIT="--$name"; fi
+      # A literal credential, except a --body read from a file (@path).
+      if [[ "$secrets" == *",$name,"* ]] && is_literal "$val" && [[ -z "$CF_SECRET_LIT" ]] &&
+         ! [[ "$name" == body && "$val" == @?* ]]; then
+        CF_SECRET_LIT="--$name"
+      fi
       # An option given twice: the guard cannot know which value cf uses.
       for i in ${CF_OPTN[@]+"${!CF_OPTN[@]}"}; do
         [[ "${CF_OPTN[i]}" == "$name" && "${CF_OPTV[i]}" != "$val" ]] && CF_DUP="--$name"
@@ -100,6 +131,8 @@ parse_cf() {
     CF_ARGN[${#CF_ARGN[@]}]="${argn[pos]:-extra}"; CF_ARGV[${#CF_ARGV[@]}]="$t"
     pos=$((pos + 1)); j=$((j + 1))
   done
+  (( help_seen && ! help_off )) && CF_HELP=1
+  (( dry_seen && ! dry_off )) && CF_DRYRUN=1
   return 0
 }
 

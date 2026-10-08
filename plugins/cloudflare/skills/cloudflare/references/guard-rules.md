@@ -105,15 +105,29 @@ API request it sends (`cf dns records create` is
 `POST /zones/{zone_id}/dns_records`). The hook fills the template and applies the
 API rules above to the result. `{account_id}` is the account cf will use: every
 source present (`CLOUDFLARE_ACCOUNT_ID`, a literal `accountId` in the nearest
-`cloudflare.config.ts`, the account cf saved for the directory, `.env`) must be
-the project's, and at least one must be present; a computed `accountId` is
-refused. `{zone_id}` comes from `--zone`/`-z` or `CLOUDFLARE_ZONE_ID` (id or
+`cloudflare.config.ts`, the account cf saved for the directory, `.env` and
+`.env.local` in the run directory, plus `.env.<mode>` and `.env.<mode>.local`
+under `-m/--mode <mode>`) must be the project's, and at least one must be
+present; a computed `accountId` or a mode the shell supplies is refused.
+`{zone_id}` comes from `--zone`/`-z` or `CLOUDFLARE_ZONE_ID` (id or
 domain). Other parameters come from the positional or option of the same name;
 one the hook cannot find, or one containing `/` or `..`, is refused. An
 account-level create's name option (`--name`, `--title`, `--queue-name`...) must
-carry the project prefix. GET commands and `--dry-run` pass. `cf` and its alias
+carry the project prefix. GET commands and dry runs pass. `cf` and its alias
 `cloudflare` are recognised by name in any case, also as `npx cf` (refused for
 writes) and `node .../node_modules/cf/...`.
+
+The hook reads cf's argv the way cf's yargs does. Global options (`-q`, `-z`,
+`--profile`, `-m`, `--local`, `--persist-to`, `-h`, `-v`) may come before the
+command path; any other option there, `--` included, is refused. After `--`
+nothing is an option. `--dry-run`, `--help` and `--version` count only bare, as
+`=true` or followed by `true`, and only when every occurrence on the line says so:
+`--dry-run=0`, `=1`, `=TRUE` and `--help false` all run the command for real, and
+are checked as such. Options that carry a secret are flagged in the table by name,
+by the manifest's own description ("The secret value..."), and for `--body` of
+the commands that store secrets (`workers secrets bulk|update`,
+`secrets-store secrets create|edit`...); a literal value is refused even next to
+`--help`. `--body @file.json` is not a literal.
 
 **Local state.** `kv`, `r2 object`, `d1 execute` and `d1 migrations apply` without
 `--remote` touch `.wrangler/state` only and pass. `deploy --dry-run` passes.
