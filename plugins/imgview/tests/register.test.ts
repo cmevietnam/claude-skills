@@ -1,0 +1,831 @@
+import { expect, mock, test } from "claude-code/testing";
+import type { On, RenderElement } from "claude-code";
+import type { Engine } from "claude-code/testing";
+
+import { toBase64 } from "../hooks/picture";
+
+/**
+ * What a path leads to in the fake file system. An `image` is 200 by 100 in
+ * the format its suffix names; the others are what a preview has to refuse.
+ */
+type Kind =
+  | "image"
+  | "text"
+  | "dir"
+  // A PDF whatever its suffix: sips names a file's real format.
+  | "pdf"
+  // A picture of 40000 by 40000 pixels.
+  | "huge"
+  // A picture file of 100 MiB.
+  | "heavy"
+  // A picture whose path lands outside the working directory.
+  | "link-out"
+  // A JPEG whatever its suffix.
+  | "jpeg"
+  // A picture the converter writes at another size than it was asked.
+  | "misconverted";
+
+const FORMATS: Record<string, string> = {
+  png: "png",
+  jpg: "jpeg",
+  jpeg: "jpeg",
+  gif: "gif",
+  webp: "webp",
+  heic: "heic",
+  svg: "svg",
+};
+
+/** A solid orange 24-bit BMP, bottom row first, as a converter would write. */
+function bmp(width: number, height: number): string {
+  const stride = (width * 3 + 3) & ~3;
+  const bytes = new Uint8Array(54 + stride * height);
+  const view = new DataView(bytes.buffer);
+  bytes.set([0x42, 0x4d]);
+  view.setUint32(10, 54, true);
+  view.setUint32(14, 40, true);
+  view.setInt32(18, width, true);
+  view.setInt32(22, height, true);
+  view.setUint16(28, 24, true);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++)
+      bytes.set([0x00, 0x88, 0xff], 54 + y * stride + x * 3);
+  }
+
+  return toBase64(bytes);
+}
+
+/**
+ * The host beneath the mod: the working directory `/work`, a file system of
+ * `files`, a `sips` that measures and converts the pictures among them, and
+ * no ImageMagick. With `isWriting` false no converter's output ever appears.
+ */
+function world(
+  on: On,
+  files: Record<string, Kind>,
+  env: Record<string, string> = {},
+  isWriting = true,
+  // A barrier every conversion waits at before it writes its file.
+  barrier?: Promise<void>,
+) {
+  const runs: string[][] = [];
+  // The timeout each run was given, beside `runs`.
+  const timeouts: (number | undefined)[] = [];
+  const opened: {
+    id: string;
+    title?: string;
+    rows?: number;
+    columns?: number;
+  }[] = [];
+  const written = new Map<string, string>();
+  const realOf = (name: string) =>
+    files[name] === "link-out"
+      ? `/elsewhere/${name.split("/").pop()}`
+      : name.startsWith("/")
+        ? name
+        : `/work/${name}`;
+
+  mock.env(on, {
+    HOME: "/home/me",
+    TMPDIR: "/tmp/t/",
+    TERM: "xterm-256color",
+    ...env,
+  });
+  on("fs.stat", (_$, e) => {
+    const directory = {
+      kind: "dir" as const,
+      size: 0,
+      mtimeMs: 7,
+      isLink: false,
+    };
+    if (e.path === "/work")
+      return { value: { ...directory, realPath: "/work" } };
+    // The engine resolves a relative path under its working directory first.
+    const name = Object.keys(files).find(
+      (key) =>
+        e.path === key || (!key.startsWith("/") && e.path.endsWith(`/${key}`)),
+    );
+    if (name === undefined) return { deny: "no such file" };
+    const kind = files[name];
+    if (kind === "dir")
+      return { value: { ...directory, realPath: realOf(name) } };
+
+    return {
+      value: {
+        kind: "file" as const,
+        size: kind === "heavy" ? 100 * 1024 * 1024 : 10,
+        mtimeMs: 7,
+        isLink: kind === "link-out",
+        realPath: realOf(name),
+      },
+    };
+  });
+  on("process.run", async (_$, e) => {
+    runs.push([...e.argv]);
+    if (e.argv[1] === "-s") await barrier;
+    timeouts.push(e.init?.timeoutMs);
+    if (e.argv[0] !== "sips" && e.argv[0] !== "rm")
+      return { deny: "not installed" };
+    const source = Object.keys(files).find((name) =>
+      e.argv.includes(realOf(name)),
+    );
+    const kind = source === undefined ? undefined : files[source];
+    const isPicture = kind !== undefined && kind !== "text" && kind !== "dir";
+    let stdout = "";
+    if (e.argv[1] === "-g") {
+      const suffix = source?.split(".").pop() ?? "";
+      const format =
+        kind === "pdf" || kind === "jpeg" ? kind : (FORMATS[suffix] ?? suffix);
+      const side = kind === "huge" ? [40000, 40000] : [200, 100];
+      stdout =
+        `${source}\n  format: ${format}\n` +
+        `  pixelWidth: ${isPicture ? side[0] : "<nil>"}\n` +
+        `  pixelHeight: ${isPicture ? side[1] : "<nil>"}\n`;
+    }
+    if (e.argv[1] === "-s" && isPicture) {
+      const z = e.argv.indexOf("-z");
+      const out = e.argv[e.argv.indexOf("--out") + 1]!;
+      written.set(
+        out,
+        z < 0
+          ? "png"
+          : bmp(
+              Number(e.argv[z + 2]) + (kind === "misconverted" ? 2 : 0),
+              Number(e.argv[z + 1]),
+            ),
+      );
+    }
+
+    return {
+      value: {
+        exitCode: 0,
+        stdout,
+        stderr: "",
+        isStdoutTruncated: false,
+        isStderrTruncated: false,
+      },
+    };
+  });
+  on("fs.exists", (_$, e) => ({
+    value: isWriting && written.has(e.path),
+  }));
+  on("session.start", (_$, e) => ({ cwd: e.cwd }));
+  on("command.register", (_$, e) => ({ value: { command: e.name } }));
+  on("fs.read", (_$, e) => ({ value: { base64: written.get(e.path) ?? "" } }));
+  // The engine's own drawing of a reply, which the mod wraps.
+  on("ui.render", { component: "AssistantMessage" }, ($, e) => {
+    const { Text } = $.ui.resolve(e);
+
+    return h(Text, {}, "ENGINE ROW") as RenderElement;
+  });
+  on("ui.open", (_$, e) => {
+    opened.push(e);
+
+    return { value: { isPlaced: true as const } };
+  });
+
+  return { runs, timeouts, opened };
+}
+
+async function start($: Engine) {
+  await $.session.start({
+    cwd: "/work",
+    surface: "terminal",
+    isInteractive: true,
+  });
+}
+
+function img($: Engine, args: string) {
+  return $.command.run({
+    command: "img",
+    args,
+    origin: { kind: "composer" },
+    presentation: { isFullscreen: true, columns: 160 },
+  });
+}
+
+function pane($: Engine, bodyColumns: number, bodyRows: number) {
+  return $.ui.mount({
+    plugin: "imgview",
+    surface: "terminal",
+    component: "Pane",
+    requestId: "imgview",
+    props: {
+      title: "imgview",
+      isFocused: false,
+      bodyColumns,
+      placement: "dock",
+      scroll: { offset: 0, bodyRows },
+      view: {},
+    },
+    viewport: { columns: 160, rows: 50, isFullscreen: true },
+  });
+}
+
+test("says how to use it when given no path and nothing is shown", async ($, on) => {
+  const { opened, runs } = world(on, {});
+  await start($);
+
+  expect((await img($, "")).text).toBe(
+    "Usage: /img [--cells|--pixels] <image path>",
+  );
+  expect(opened).toHaveLength(0);
+  expect(runs).toHaveLength(0);
+});
+
+test("draws a picture as half-block cells on a terminal without graphics", async ($, on) => {
+  const { opened, runs } = world(
+    on,
+    { "shot.png": "image" },
+    { TERM_PROGRAM: "iTerm.app" },
+  );
+  await start($);
+
+  expect((await img($, "shot.png")).text).toBe("shot.png · 200×100 · cells");
+  expect(opened).toHaveLength(1);
+  expect(opened[0]).toMatchObject({ id: "imgview", title: "shot.png" });
+
+  const ui = await pane($, 40, 21);
+  const raster = await ui.find({ type: "Raster" });
+  // 200x100 in 40 columns: 40 cells by 10, each two pixels wide and tall.
+  expect(raster?.props).toMatchObject({ columns: 40, rows: 10 });
+  expect(String(raster?.props.cells)).toHaveLength(40 * 10 * 12 * (4 / 3));
+  expect(
+    await ui.find({ type: "Text", text: "shot.png · 200×100" }),
+  ).toBeDefined();
+  expect(await ui.find({ type: "Image" })).toBeUndefined();
+
+  const convert = runs.find((argv) => argv[1] === "-s");
+  expect(convert?.slice(0, 8)).toEqual([
+    "sips",
+    "-s",
+    "format",
+    "bmp",
+    "-z",
+    "20",
+    "80",
+    "/work/shot.png",
+  ]);
+  expect(convert?.[9]).toMatch(/^\/tmp\/t\/claude-imgview-[a-z0-9]+-0\.bmp$/);
+  // The converted file is read once and removed.
+  expect(runs).toContainEqual(["rm", "-f", convert![9]!]);
+});
+
+test("converts once for a size and again when the pane's size changes", async ($, on) => {
+  const { runs } = world(on, { "shot.png": "image" });
+  await start($);
+  await img($, "shot.png");
+  const conversions = () => runs.filter((argv) => argv[1] === "-s").length;
+
+  await (await pane($, 40, 21)).unmount();
+  await (await pane($, 40, 21)).unmount();
+  expect(conversions()).toBe(1);
+
+  const ui = await pane($, 80, 11);
+  expect((await ui.find({ type: "Raster" }))?.props).toMatchObject({
+    columns: 40,
+    rows: 10,
+  });
+  expect(conversions()).toBe(1);
+  await ui.unmount();
+
+  const narrow = await pane($, 20, 11);
+  expect((await narrow.find({ type: "Raster" }))?.props).toMatchObject({
+    columns: 20,
+    rows: 5,
+  });
+  expect(conversions()).toBe(2);
+});
+
+test("hands a PNG to a terminal that draws pixels, by its absolute path", async ($, on) => {
+  const { runs } = world(on, { "shot.png": "image" }, { TERM: "xterm-kitty" });
+  await start($);
+
+  expect((await img($, "shot.png")).text).toBe("shot.png · 200×100 · pixels");
+  const ui = await pane($, 40, 21);
+  const image = await ui.find({ type: "Image" });
+  expect(image?.props).toMatchObject({
+    columns: 40,
+    rows: 10,
+    source: { file: "/work/shot.png", format: "png", generation: 7 },
+  });
+  expect(await ui.find({ type: "Raster" })).toBeUndefined();
+  expect(runs.filter((argv) => argv[1] === "-s")).toHaveLength(0);
+});
+
+test("converts a picture that is not a PNG before a pixel terminal reads it", async ($, on) => {
+  const { runs } = world(
+    on,
+    { "/photos/cat.jpg": "image" },
+    { TERM_PROGRAM: "ghostty" },
+  );
+  await start($);
+  await img($, "/photos/cat.jpg");
+
+  const ui = await pane($, 40, 21);
+  const source = (await ui.find({ type: "Image" }))?.props.source as {
+    file: string;
+  };
+  expect(source.file).toMatch(/^\/tmp\/t\/claude-imgview-[a-z0-9]+-0\.png$/);
+  expect(runs).toContainEqual([
+    "sips",
+    "-s",
+    "format",
+    "png",
+    "/photos/cat.jpg",
+    "--out",
+    source.file,
+  ]);
+});
+
+test("draws cells under tmux, which passes no pixels through", async ($, on) => {
+  world(
+    on,
+    { "shot.png": "image" },
+    { TERM: "xterm-kitty", TMUX: "/tmp/tmux-501/default,1,0" },
+  );
+  await start($);
+
+  expect((await img($, "shot.png")).text).toBe("shot.png · 200×100 · cells");
+});
+
+test("takes the mode a flag names over the terminal's, and re-draws the shown picture with it", async ($, on) => {
+  world(on, { "shot.png": "image" }, { TERM: "xterm-kitty" });
+  await start($);
+
+  expect((await img($, "--cells shot.png")).text).toBe(
+    "shot.png · 200×100 · cells",
+  );
+  const ui = await pane($, 40, 21);
+  expect(await ui.find({ type: "Raster" })).toBeDefined();
+
+  // The open pane follows: the same drawing now holds the Image.
+  expect((await img($, "--pixels")).text).toBe("shot.png · 200×100 · pixels");
+  expect(await ui.find({ type: "Image" })).toBeDefined();
+  expect(await ui.find({ type: "Raster" })).toBeUndefined();
+});
+
+test("finds a path under the home directory, with a mention mark, or with spaces", async ($, on) => {
+  world(on, {
+    "/home/me/a.png": "image",
+    "docs/b.png": "image",
+    "/tmp/my shot.png": "image",
+  });
+  await start($);
+
+  expect((await img($, "~/a.png")).text).toBe("a.png · 200×100 · cells");
+  expect((await img($, "@docs/b.png")).text).toBe("b.png · 200×100 · cells");
+  expect((await img($, "/tmp/my\\ shot.png")).text).toBe(
+    "my shot.png · 200×100 · cells",
+  );
+});
+
+test("names what it could not show, and opens nothing", async ($, on) => {
+  const { opened } = world(on, { "notes.txt": "text", shots: "dir" });
+  await start($);
+
+  expect((await img($, "gone.png")).text).toBe("img: no such file: gone.png");
+  expect((await img($, "shots")).text).toBe("img: not a file: shots");
+  expect((await img($, "notes.txt")).text).toBe(
+    "img: not an image sips or ImageMagick can read: notes.txt",
+  );
+  expect(opened).toHaveLength(0);
+});
+
+test("says why in the pane when no converter can paint the picture", async ($, on) => {
+  const { runs } = world(on, { "shot.png": "image" }, {}, false);
+  await start($);
+  await img($, "shot.png");
+
+  const ui = await pane($, 40, 21);
+  expect(await ui.find({ type: "Raster" })).toBeUndefined();
+  expect(
+    await ui.find({
+      type: "Text",
+      text: /neither sips nor ImageMagick could convert it/,
+    }),
+  ).toBeDefined();
+  expect(
+    runs.some((argv) => argv[0] === "magick" && argv.includes("80x20!")),
+  ).toBe(true);
+});
+
+test("tells a surface that is not a terminal that it draws there only", async ($, on) => {
+  world(on, { "shot.png": "image" });
+  await start($);
+  await img($, "shot.png");
+
+  const ui = await $.ui.mount({
+    plugin: "imgview",
+    surface: "desktop",
+    component: "Pane",
+    requestId: "imgview",
+    props: {
+      title: "imgview",
+      isFocused: false,
+      bodyColumns: 40,
+      placement: "dock",
+      scroll: { offset: 0, bodyRows: 21 },
+      view: {},
+    },
+  });
+  expect(await ui.find({ type: "Text", text: /terminal only/ })).toBeDefined();
+});
+
+function reply(
+  $: Engine,
+  text: string,
+  where: {
+    columns?: number;
+    isFullscreen?: boolean;
+    isOffScreen?: boolean;
+    id?: string;
+  } = {},
+) {
+  return $.ui.mount({
+    plugin: "imgview",
+    surface: "terminal",
+    component: "AssistantMessage",
+    requestId: where.id ?? "reply-1",
+    props: {
+      text,
+      isFirstOfReply: true,
+      ...(where.isOffScreen ? { onScreen: null } : {}),
+    },
+    viewport: {
+      columns: where.columns ?? 120,
+      rows: 50,
+      isFullscreen: where.isFullscreen ?? true,
+    },
+  });
+}
+
+type Node = {
+  type?: string;
+  props?: Record<string, unknown>;
+  hover?: unknown;
+  children?: unknown;
+};
+
+/**
+ * The hidden boxes of a drawing, the cards a hover reveals: each one's props
+ * with the `hover` the tree carries beside them.
+ */
+async function cards(ui: Awaited<ReturnType<typeof reply>>) {
+  const found: Record<string, unknown>[] = [];
+  const walk = (node: unknown) => {
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (typeof node !== "object" || node === null) return;
+    const { props, hover, children } = node as Node;
+    if (props?.display === "none") found.push({ ...props, hover });
+    walk(children);
+  };
+  walk(await ui.drawn());
+
+  return found;
+}
+
+test("draws a chip under a reply that names an image file, with its picture in a hidden card", async ($, on) => {
+  const { runs } = world(on, { "shot.png": "image", "notes.txt": "text" });
+  await start($);
+
+  const ui = await reply(
+    $,
+    "Saved the chart to `shot.png`; notes in notes.txt.",
+  );
+  expect(await ui.find({ type: "Text", text: "ENGINE ROW" })).toBeDefined();
+  const chips = await ui.findAll({ type: "Button" });
+  expect(chips.map((chip) => chip.props.label)).toEqual(["▣ shot.png"]);
+
+  // 200x100 in a card of at most 80 by 24 cells: 80 by 20.
+  expect((await ui.find({ type: "Raster" }))?.props).toMatchObject({
+    columns: 80,
+    rows: 20,
+  });
+  expect(runs.find((argv) => argv[1] === "-s")?.slice(4, 8)).toEqual([
+    "-z",
+    "40",
+    "160",
+    "/work/shot.png",
+  ]);
+
+  // The card sits over the rows above the chip, shown by the hover alone.
+  const [card, ...others] = await cards(ui);
+  expect(others).toHaveLength(0);
+  expect(card).toMatchObject({
+    position: "absolute",
+    top: -23,
+    left: 0,
+    hover: { display: "flex" },
+  });
+  expect(
+    await ui.find({ type: "Text", text: /^shot\.png · 200×100 +$/ }),
+  ).toBeDefined();
+});
+
+test("leaves a reply as the engine drew it when it names no image that exists", async ($, on) => {
+  const { runs } = world(on, { "fake.png": "text" });
+  await start($);
+
+  const plain = await reply($, "Nothing to see in main.ts or gone.png.");
+  expect(await plain.drawn()).toMatchObject({ type: "Text" });
+  expect(runs).toHaveLength(0);
+  await plain.unmount();
+
+  // A file named like a picture that no converter reads loses its chip.
+  const fake = await reply($, "See fake.png.");
+  expect(await fake.findAll({ type: "Button" })).toHaveLength(0);
+  expect(await fake.find({ type: "Text", text: "ENGINE ROW" })).toBeDefined();
+  // sips could not read it, and nothing else is asked.
+  expect(runs.filter((argv) => argv[0] === "magick")).toEqual([]);
+});
+
+test("draws no chip on the main screen, which reports no pointer", async ($, on) => {
+  const { runs } = world(on, { "shot.png": "image" });
+  await start($);
+
+  const ui = await reply($, "Saved shot.png.", { isFullscreen: false });
+  expect(await ui.drawn()).toMatchObject({ type: "Text" });
+  expect(runs).toHaveLength(0);
+});
+
+test("converts nothing for a reply that is off screen", async ($, on) => {
+  const { runs } = world(on, { "shot.png": "image" });
+  await start($);
+
+  const ui = await reply($, "Saved shot.png.", { isOffScreen: true });
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(1);
+  expect(await ui.find({ type: "Raster" })).toBeUndefined();
+  expect(await ui.find({ type: "Text", text: /^Rendering…/ })).toBeDefined();
+  expect(runs).toHaveLength(0);
+});
+
+test("opens the pane on the picture when its chip is clicked", async ($, on) => {
+  const { opened } = world(on, { "shot.png": "image" });
+  await start($);
+
+  const ui = await reply($, "Saved shot.png.");
+  await ui.press({ key: "imgview-open-0" });
+  expect(opened).toHaveLength(1);
+  expect(opened[0]).toMatchObject({ id: "imgview", title: "shot.png" });
+
+  const shownPane = await pane($, 40, 21);
+  expect((await shownPane.find({ type: "Raster" }))?.props).toMatchObject({
+    columns: 40,
+    rows: 10,
+  });
+});
+
+test("hands a pixel terminal the PNG itself in the card, and cells for any other format", async ($, on) => {
+  const { runs } = world(
+    on,
+    { "shot.png": "image", "cat.jpg": "image" },
+    { TERM: "xterm-kitty" },
+  );
+  await start($);
+
+  const ui = await reply($, "Compare shot.png with cat.jpg.");
+  expect((await ui.find({ type: "Image" }))?.props).toMatchObject({
+    columns: 80,
+    rows: 20,
+    source: { file: "/work/shot.png", format: "png" },
+  });
+  expect(await ui.findAll({ type: "Raster" })).toHaveLength(1);
+  expect(
+    runs.filter((argv) => argv[1] === "-s").map((argv) => argv[7]),
+  ).toEqual(["/work/cat.jpg"]);
+});
+
+test("draws four chips at most, and keeps every card at the row's left edge", async ($, on) => {
+  world(on, {
+    "a.png": "image",
+    "b.png": "image",
+    "c.png": "image",
+    "d.png": "image",
+    "e.png": "image",
+  });
+  await start($);
+
+  const ui = await reply($, "a.png b.png c.png d.png e.png");
+  const chips = await ui.findAll({ type: "Button" });
+  expect(chips.map((chip) => chip.props.label)).toEqual([
+    "▣ a.png",
+    "▣ b.png",
+    "▣ c.png",
+    "▣ d.png",
+  ]);
+  // Each chip is seven cells and a gap of two past the one before it.
+  expect((await cards(ui)).map((card) => card.left)).toEqual([0, -9, -18, -27]);
+});
+
+test("fits the card to a narrow terminal", async ($, on) => {
+  world(on, { "shot.png": "image" });
+  await start($);
+
+  const ui = await reply($, "Saved shot.png.", { columns: 40 });
+  expect((await ui.find({ type: "Raster" }))?.props).toMatchObject({
+    columns: 28,
+    rows: 7,
+  });
+});
+
+// Codex review, round 1, finding 1.
+test("removes the PNG it converted when another picture replaces it, and never a picture of the person's", async ($, on) => {
+  const { runs } = world(
+    on,
+    {
+      "/home/me/claude-imgview-family.png": "image",
+      "/photos/cat.jpg": "image",
+      "shot.png": "image",
+    },
+    { TERM: "xterm-kitty" },
+  );
+  await start($);
+  const removed = () =>
+    runs.filter((argv) => argv[0] === "rm").map((argv) => argv[2]);
+
+  // Shown as it is: the terminal reads the person's own file.
+  await img($, "/home/me/claude-imgview-family.png");
+  // A JPEG is converted to a temporary PNG first.
+  await img($, "/photos/cat.jpg");
+  expect(removed()).toEqual([]);
+
+  await img($, "shot.png");
+  expect(removed()).toHaveLength(1);
+  expect(removed()[0]).toMatch(/^\/tmp\/t\/claude-imgview-[a-z0-9]+-0\.png$/);
+});
+
+// Codex review, round 1, finding 2: what a reply names is looked at with no
+// action of the person's, so only a bitmap inside the working directory is.
+test("previews no file outside the working directory, by its path or through a link", async ($, on) => {
+  const { runs } = world(on, {
+    "/etc/outside.png": "image",
+    "/home/me/mine.png": "image",
+    "escape.png": "link-out",
+  });
+  await start($);
+
+  const ui = await reply($, "See /etc/outside.png, ~/mine.png and escape.png.");
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
+  expect(await ui.drawn()).toMatchObject({ type: "Text" });
+  expect(runs).toHaveLength(0);
+});
+
+test("previews bitmaps only: no SVG by its suffix, no PDF by its content", async ($, on) => {
+  const { runs } = world(on, { "logo.svg": "image", "scan.png": "pdf" });
+  await start($);
+
+  const ui = await reply($, "See logo.svg and scan.png.");
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
+  // The SVG is never opened; the PDF is asked its format and no more.
+  expect(runs.filter((argv) => argv.includes("/work/logo.svg"))).toEqual([]);
+  expect(runs.filter((argv) => argv[1] === "-s")).toEqual([]);
+});
+
+test("previews no file too heavy and no picture too large", async ($, on) => {
+  const { runs } = world(on, { "heavy.png": "heavy", "huge.png": "huge" });
+  await start($);
+
+  const ui = await reply($, "See heavy.png and huge.png.");
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
+  expect(runs.filter((argv) => argv.includes("/work/heavy.png"))).toEqual([]);
+  expect(runs.filter((argv) => argv[1] === "-s")).toEqual([]);
+});
+
+test("gives a mentioned file to sips alone, under a short timeout", async ($, on) => {
+  // No converter's output appears: /img would go on to ImageMagick here.
+  const { runs, timeouts } = world(on, { "shot.png": "image" }, {}, false);
+  await start($);
+
+  const ui = await reply($, "Saved shot.png.");
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
+  expect(runs.length).toBeGreaterThan(0);
+  expect(runs.filter((argv) => argv[0] === "magick")).toEqual([]);
+  for (const [index, argv] of runs.entries()) {
+    if (argv[0] === "sips") expect(timeouts[index]).toBeLessThanOrEqual(5000);
+  }
+});
+
+// Codex review, round 1, finding 3.
+test(
+  "settles with more cards on screen than it keeps: none is converted twice",
+  { timeoutMs: 20000 },
+  async ($, on) => {
+    const files: Record<string, Kind> = {};
+    const replies: string[] = [];
+    for (let n = 0; n < 9; n++) {
+      const names = [0, 1, 2, 3].map((k) => `p${n}-${k}.png`);
+      for (const name of names) files[name] = "image";
+      replies.push(names.join(" "));
+    }
+    const { runs } = world(on, files);
+    await start($);
+
+    // 36 pictures on screen at once, four more than are kept.
+    const drawings = [];
+    for (const [n, text] of replies.entries()) {
+      drawings.push(await reply($, text, { id: `reply-${n}` }));
+    }
+    const conversions = runs
+      .filter((argv) => argv[1] === "-s")
+      .map((argv) => argv[7]);
+    expect(new Set(conversions).size).toBe(conversions.length);
+    expect(conversions.length).toBeLessThanOrEqual(32);
+
+    let chips = 0;
+    for (const ui of drawings)
+      chips += (await ui.findAll({ type: "Raster" })).length;
+    expect(chips).toBe(32);
+  },
+);
+
+// Codex review, round 1, findings 6, 7 and 10.
+test("hands the terminal a PNG by its content, not its suffix", async ($, on) => {
+  const { runs } = world(
+    on,
+    { "renamed.png": "jpeg" },
+    { TERM: "xterm-kitty" },
+  );
+  await start($);
+
+  // /img: converted first, as any JPEG is.
+  await img($, "renamed.png");
+  const shownPane = await pane($, 40, 21);
+  const source = (await shownPane.find({ type: "Image" }))?.props.source as {
+    file: string;
+  };
+  expect(source.file).toMatch(/^\/tmp\/t\/claude-imgview-[a-z0-9]+-0\.png$/);
+  expect(runs).toContainEqual([
+    "sips",
+    "-s",
+    "format",
+    "png",
+    "/work/renamed.png",
+    "--out",
+    source.file,
+  ]);
+
+  // The hover card: cells, never the file itself.
+  const ui = await reply($, "Saved renamed.png.");
+  expect(await ui.find({ type: "Image" })).toBeUndefined();
+  expect(await ui.findAll({ type: "Raster" })).toHaveLength(1);
+});
+
+for (const variable of ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]) {
+  test(`draws cells across ssh (${variable}), where the terminal cannot read this machine's files`, async ($, on) => {
+    world(
+      on,
+      { "shot.png": "image" },
+      { TERM: "xterm-kitty", [variable]: "10.0.0.2 51022 10.0.0.9 22" },
+    );
+    await start($);
+
+    expect((await img($, "shot.png")).text).toBe("shot.png · 200×100 · cells");
+    const ui = await reply($, "Saved shot.png.");
+    expect(await ui.find({ type: "Image" })).toBeUndefined();
+    expect(await ui.findAll({ type: "Raster" })).toHaveLength(1);
+  });
+}
+
+test("refuses a conversion that came back another size than asked", async ($, on) => {
+  world(on, { "odd.png": "misconverted" });
+  await start($);
+  await img($, "odd.png");
+
+  const ui = await pane($, 40, 21);
+  expect(await ui.find({ type: "Raster" })).toBeUndefined();
+  expect(
+    await ui.find({
+      type: "Text",
+      text: /the converter wrote 82x20, not 80x20/,
+    }),
+  ).toBeDefined();
+});
+
+// Codex review, round 1, finding 4.
+test("converts a pane size once however the pane is resized meanwhile, and keeps the size last asked", async ($, on) => {
+  let release = () => {};
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const { runs } = world(on, { "shot.png": "image" }, {}, true, barrier);
+  await start($);
+  await img($, "shot.png");
+  const sizes = () =>
+    runs.filter((argv) => argv[1] === "-s").map((argv) => argv[6]);
+
+  // 40 columns, then 20, then 40 again, each before any conversion ends.
+  for (const columns of [40, 20, 40]) {
+    const ui = await pane($, columns, 21);
+    expect(await ui.find({ type: "Text", text: "Rendering…" })).toBeDefined();
+    await ui.unmount();
+  }
+  expect(sizes()).toEqual(["80", "40"]);
+
+  release();
+  const ui = await pane($, 40, 21);
+  expect((await ui.find({ type: "Raster" }))?.props).toMatchObject({
+    columns: 40,
+    rows: 10,
+  });
+  expect(sizes()).toEqual(["80", "40"]);
+});
