@@ -50,11 +50,14 @@ to a word in it (`ui.render` on `AssistantMessage` wraps what `next(e)` drew).
   a terminal narrower than 92. In `cells` mode that is a 160 by 48 pixel thumbnail.
 - The terminal applies a hover by itself and runs no hook for it, so the card cannot be
   made on demand: its picture is converted when the reply comes on screen.
-- 32 cards are kept, drawn or still converting (`MAX_THUMBS`). A card drawn in the last
-  five seconds is on screen and is not dropped for another, and one still converting
-  never is, so with more than 32 pictures on screen the extra mentions get no chip
+- 32 cards are kept, drawn or waiting their turn (`MAX_THUMBS`). A card a reply on
+  screen asked for in the last five seconds is in use: a drawn one is not dropped for
+  another, so with more than 32 pictures on screen the extra mentions get no chip
   until one of the others scrolls away. A file no preview could draw is remembered
   apart and holds no card's place.
+- Cards are converted one after another, the one asked for last first. One that scrolls
+  off screen before its turn is given up, so what is on screen now does not wait behind
+  what was (`pruneQueue` and `drain` in `hooks/register.tsx`).
 - Chips are drawn in the fullscreen layout only (`"tui": "fullscreen"`), on a terminal
   surface. A card that would rise past the top of the viewport is clipped there.
 
@@ -74,29 +77,39 @@ to less than what `/img` takes (`locateMention`, `preview` and `sketch` in
 
 How the conversion itself is held:
 
-- `sips` never opens the path the reply named. `preview` copies the file to
-  `$TMPDIR/claude-imgview-*.snap` with `cp`, checks the copy, and measures and converts
-  the copy alone, so what was checked is what is decoded.
-- One preview is converted at a time (`previews` is a chain, not a pool): 32 mentions
-  mean 32 conversions in a row, never 32 decoders at once.
+- `sips` never opens the path the reply named. `preview` copies the file with `cp` to a
+  name under `$TMPDIR` that nobody can guess (`crypto.randomUUID()`), gives up if that
+  name is taken or `cp` does not exit 0, checks the copy, looks at the original again,
+  and measures and converts the copy alone.
+- One preview is converted at a time (`drain` takes one job from `queue` and returns at
+  once while another call is running): 32 mentions mean 32 conversions in a row, never
+  32 decoders at once.
 - Each `cp` and `sips` run for a chip is killed after five seconds
   (`PREVIEW_TIMEOUT_MS`), and ImageMagick is never run for one. So where `sips` is
   missing (Linux) there are no hover cards, only `/img`.
 - On a terminal that draws pixels the card shows a small PNG the mod converted from the
   copy, never the file the reply named.
+- When the working directory changes, every card, lookup and waiting conversion made
+  under the old one is dropped before anything else happens, and nothing is previewed
+  until the new directory is resolved.
 
 This stops protecting at three edges:
 
 1. `sips` still decodes, with no click, any bitmap in the working directory that passes
    the table. A hostile bitmap inside the repository you opened reaches ImageIO.
-2. The check of where a path lands is made before the copy, and the engine gives a mod
-   no file handle to hold in between. A process already running as you that swaps the
-   file for a link at that moment, and swaps it back with the same modification time
-   before the mod looks again, gets the link's target copied, decoded and shown, within
-   the size, format and megapixel limits above.
+2. The engine gives a mod paths, not file handles, so nothing here can hold a file still
+   between two steps. A process already running as you can swap the file for a link, a
+   pipe or a larger file after the mod has looked at it and before `cp` opens it. The
+   mod looks again after the copy and gives up if the path then lands elsewhere, is no
+   regular file, or has another modification time; a swap undone in time, with the same
+   modification time, gets the other file copied, decoded and shown, within the size,
+   format and megapixel limits above. A pipe holds `cp` for the five seconds it is
+   allowed; a huge file is copied for as long before the size check drops it. The same
+   process could as well replace the copy itself: its name is not guessable, but it can
+   be read from the process list while `cp` and `sips` run.
 3. `/img <path>` has none of these limits: a path you type is opened wherever it is,
    SVG and PDF included, with ImageMagick as the fallback. So is a chip you click: the
-   pane then takes the file itself.
+   pane then takes the file itself, measured again as it is at the click.
 
 ## How it draws
 
