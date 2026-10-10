@@ -1,0 +1,17 @@
+{
+  "description": "Keeps every Cloudflare write (wrangler, cloudflared, curl to the REST API) inside the project's account, zones and name prefixes, and keeps Cloudflare credentials out of command lines and the transcript.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/guard-cloudflare.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
