@@ -46,6 +46,15 @@ into a neighbour's resources, and nothing stops it.
 claude plugin install cloudflare@hieuvo-skills
 ```
 
+A session that was already running does not load the plugin until you type
+`/reload-plugins` (or restart it): until then the hook does not run and `cfgate` is not
+on the Bash tool's PATH, so nothing is guarded. Check that it is active with a command
+that never reaches cf, which the hook must still refuse:
+
+```bash
+true || cf r2 buckets delete x    # refused by the hook (no project, or outside it)
+```
+
 Then, in each project:
 
 ```bash
