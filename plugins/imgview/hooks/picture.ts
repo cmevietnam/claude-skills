@@ -86,19 +86,29 @@ const BITMAP_FORMATS = ["png", "jpeg", "gif", "tiff", "bmp", "heic", "webp"];
 /**
  * The image files a text mentions, in order, each once, `limit` at most: every
  * run of path characters that ends in a bitmap's suffix, as markdown writes it
- * (bare, in backticks, in a link) or as `file://`.
+ * (bare, in a code span, in a link) or as `file://`.
  *
- * A web address is left out: nothing here fetches. Whether a mention is a
- * file at all is the caller's to check.
+ * A code span's runs are taken as written. In prose, the punctuation and the
+ * parentheses around a run are the sentence's. A web address is left out:
+ * nothing here fetches. Whether a mention is a file at all is the caller's to
+ * check.
  */
 export function findImagePaths(text: string, limit: number): string[] {
   const found: string[] = [];
-  for (const run of text.split(/[\s`'"<>[\]{}|*]+/)) {
-    if (found.length >= limit) break;
-    let path = unwrap(run.replace(/[.,;:!?]+$/, "")).replace(/[.,;:!?]+$/, "");
-    if (path.startsWith("file://")) path = path.slice("file://".length);
-    if (path.includes("://") || !IMAGE_SUFFIX.test(path)) continue;
-    if (!found.includes(path)) found.push(path);
+  const take = (run: string) => {
+    const path = run.startsWith("file://") ? run.slice("file://".length) : run;
+    if (path.includes("://") || !IMAGE_SUFFIX.test(path)) return;
+    if (found.length < limit && !found.includes(path)) found.push(path);
+  };
+  // A code span, or the prose up to the next one.
+  for (const [, code, prose] of text.matchAll(/`([^`\n]+)`|([^`]+)/g)) {
+    if (code !== undefined) {
+      for (const run of code.split(/\s+/)) take(run);
+      continue;
+    }
+    for (const run of prose!.split(/[\s'"<>[\]{}|*]+/)) {
+      take(unwrap(run.replace(/[.,;:!?]+$/, "")).replace(/[.,;:!?]+$/, ""));
+    }
   }
 
   return found;
@@ -226,8 +236,11 @@ export function decodeBmp(bytes: Uint8Array): Bitmap {
   const width = view.getInt32(18, true);
   const signedHeight = view.getInt32(22, true);
   const height = Math.abs(signedHeight);
+  const planes = view.getUint16(26, true);
   const bitsPerPixel = view.getUint16(28, true);
   const compression = view.getUint32(30, true);
+  if (headerSize < 40 || planes !== 1)
+    throw new Error(`a BMP header of ${headerSize} bytes, ${planes} planes`);
   if (bitsPerPixel !== 24 && bitsPerPixel !== 32)
     throw new Error(`a ${bitsPerPixel}-bit BMP`);
   if (compression !== 0 && compression !== 3)
@@ -240,31 +253,37 @@ export function decodeBmp(bytes: Uint8Array): Bitmap {
   )
     throw new Error(`a ${width}x${signedHeight} BMP`);
 
+  // Three masks follow the first 40 header bytes, a fourth in the longer
+  // headers; the pixels start past the header and past the masks.
+  const hasMasks = compression === 3;
+  const hasAlphaMask = hasMasks && headerSize >= 56;
+  if (hasMasks && bitsPerPixel !== 32)
+    throw new Error("a 24-bit BMP with channel masks");
+  const firstPixel = Math.max(
+    14 + headerSize,
+    hasMasks ? (hasAlphaMask ? 70 : 66) : 54,
+  );
+  // The sides are small, so none of this leaves the safe integers.
+  const step = bitsPerPixel / 8;
+  const stride = Math.ceil((width * step) / 4) * 4;
+  if (
+    dataOffset < firstPixel ||
+    dataOffset + stride * (height - 1) + width * step > bytes.length
+  )
+    throw new Error("a truncated BMP");
+
   // Which byte of a pixel holds each channel: B, G, R(, A) unless masks say otherwise.
   let red = 2;
   let green = 1;
   let blue = 0;
   let alpha = bitsPerPixel === 32 ? 3 : -1;
-  const hasMasks = compression === 3;
   if (hasMasks) {
-    // Three masks follow the 40 header bytes, a fourth in the longer headers.
-    const hasAlphaMask = headerSize >= 56;
-    if (bitsPerPixel !== 32 || bytes.length < (hasAlphaMask ? 70 : 66))
-      throw new Error("a BMP with no room for its channel masks");
     red = maskByte(view.getUint32(54, true));
     green = maskByte(view.getUint32(58, true));
     blue = maskByte(view.getUint32(62, true));
     alpha = hasAlphaMask ? maskByte(view.getUint32(66, true), true) : -1;
   }
 
-  // The sides are small, so none of this leaves the safe integers.
-  const step = bitsPerPixel / 8;
-  const stride = Math.ceil((width * step) / 4) * 4;
-  if (
-    dataOffset < (hasMasks ? 66 : 54) ||
-    dataOffset + stride * (height - 1) + width * step > bytes.length
-  )
-    throw new Error("a truncated BMP");
   const rgba = new Uint8Array(width * height * 4);
   let isAlphaUsed = false;
   for (let y = 0; y < height; y++) {

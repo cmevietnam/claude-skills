@@ -16,7 +16,7 @@ import {
   parseSipsSize,
   toCells,
 } from "./picture";
-import type { Measured, Size } from "./picture";
+import type { Measured, Mode, Size } from "./picture";
 
 const PANE = "imgview";
 const KEY = "picture";
@@ -29,19 +29,23 @@ const TEMP_PREFIX = "claude-imgview-";
 const MAX_CHIPS = 4;
 const CARD_COLUMNS = 80;
 const CARD_ROWS = 24;
+// The pixels a card's PNG is given a cell, where the terminal draws pixels.
+const CARD_CELL_PIXELS = { width: 10, height: 20 };
 // A reply is drawn again for every piece that streams in: a path is looked up
 // once in this long, and this many lookups are remembered.
 const LOCATE_TTL_MS = 2000;
 const MAX_LOCATED = 128;
-// This many cards' cells are kept. One drawn in the last while is on screen
-// and is never dropped for another: past the limit a new card waits.
+// This many cards are kept, drawn or still converting. One drawn in the last
+// while is on screen and is never dropped for another: past the limit a new
+// card waits. A picture that could not be drawn is remembered apart.
 const MAX_THUMBS = 32;
 const THUMB_ACTIVE_MS = 5000;
+const MAX_FAILED = 128;
 // What a reply names is converted with no action of the person's, so it is
 // held to less than what `/img` takes: a file this small, a picture of this
-// many pixels, `sips` alone, and this long.
+// many pixels, `sips` alone, this long, and one conversion at a time.
 const PREVIEW_MAX_BYTES = 20 * 1024 * 1024;
-const PREVIEW_MAX_PIXELS = 100_000_000;
+const PREVIEW_MAX_PIXELS = 40_000_000;
 const PREVIEW_TIMEOUT_MS = 5000;
 
 const shown = atom({ plugin: "imgview", key: "shown" } as const, null);
@@ -60,14 +64,19 @@ type Frame = {
 /** A file a path leads to: where it landed and when it last changed. */
 type Located = { path: string; mtimeMs: number };
 
-/** A hover card's picture: `pending` until measured and converted. */
-type Thumb =
-  | { state: "pending" }
-  | { state: "failed" }
-  | ({ state: "ready"; cells?: string } & Size & {
-        columns: number;
-        rows: number;
-      });
+/**
+ * A hover card's picture, measured and converted: cells, or on a terminal
+ * that draws pixels a small PNG of the mod's own for it to read.
+ */
+type Card = Measured & {
+  columns: number;
+  rows: number;
+  cells?: string;
+  png?: string;
+};
+
+/** A card's place among those kept: no `card` yet while it is converted. */
+type Slot = { card?: Card; usedAt: number };
 
 /** How a conversion is held back: `/img` passes none of these. */
 type Limits = {
@@ -102,10 +111,13 @@ type Host = {
   /** A file's bytes, base64. */
   readBytes: (path: string) => Promise<string>;
   /** A fresh path under the temporary directory. */
-  tempPath: (suffix: "bmp" | "png") => string;
+  tempPath: (suffix: "bmp" | "png" | "snap") => string;
   redraw: () => void;
   home: string | undefined;
-  /** Where the session's working directory lands; undefined when unknown. */
+  /**
+   * Where the session's working directory lands, kept up as it changes;
+   * undefined when unknown, and then no reply's mention is previewed.
+   */
   root: string | undefined;
   /**
    * kitty and Ghostty draw an Image as pixels, from a file they read
@@ -209,11 +221,101 @@ async function locateMention(
 }
 
 /**
+ * The card of a file a reply named, or undefined when it is not a picture a
+ * preview takes. Everything is decoded from a copy of the file made first:
+ * the copy is the mod's own, so what was checked is what `sips` reads.
+ */
+async function preview(
+  host: Host,
+  file: Located,
+  maxColumns: number,
+): Promise<Card | undefined> {
+  const copy = host.tempPath("snap");
+  try {
+    await host.run(["cp", file.path, copy], PREVIEW_TIMEOUT_MS);
+    const copied = await host.stat(copy);
+    if (copied?.kind !== "file" || copied.size > PREVIEW_MAX_BYTES)
+      return undefined;
+    // Swapped for another file or a link while it was copied: not this one.
+    const still = await host.stat(file.path);
+    if (still?.realPath !== file.path || still.mtimeMs !== file.mtimeMs)
+      return undefined;
+
+    const size = await measure(host, copy, PREVIEW);
+    if (
+      size === undefined ||
+      !isBitmapFormat(size.format) ||
+      size.width * size.height > PREVIEW_MAX_PIXELS
+    )
+      return undefined;
+    const box = fit(size, maxColumns, CARD_ROWS);
+    if (host.isPixelTerminal) {
+      // A small PNG of the mod's own for the terminal to read, whatever the
+      // file's format: never the file the reply named.
+      const png = host.tempPath("png");
+      const pixels = {
+        width: box.columns * CARD_CELL_PIXELS.width,
+        height: box.rows * CARD_CELL_PIXELS.height,
+      };
+      if (await convert(host, copy, png, pixels, PREVIEW))
+        return { ...size, ...box, png };
+    }
+
+    return { ...size, ...(await rasterize(host, copy, box, PREVIEW)) };
+  } finally {
+    void host.run(["rm", "-f", copy]);
+  }
+}
+
+/**
  * Whether the terminal can read this picture itself: a PNG by its content,
  * as the converter named it, at an absolute path.
  */
 function isReadablePng(path: string, format: string | undefined): boolean {
   return path.startsWith("/") && format === "png";
+}
+
+/**
+ * The picture the pane will show in place of `previous`, or undefined when
+ * `pixels` mode needs a PNG and nothing converts the file to one. The PNG the
+ * mod converted for `previous` goes: it is the mod's to remove, where a PNG
+ * the pane was shown as it is never is.
+ */
+async function present(
+  host: Host,
+  previous: Shown | null,
+  file: Located,
+  size: Measured,
+  mode: Mode,
+): Promise<Shown | undefined> {
+  const picture: Shown = {
+    path: file.path,
+    name: baseName(file.path),
+    width: size.width,
+    height: size.height,
+    mtimeMs: file.mtimeMs,
+    mode,
+  };
+  if (mode === "pixels") {
+    // The terminal reads a PNG by its absolute path; anything else is converted.
+    if (isReadablePng(file.path, size.format)) {
+      picture.png = file.path;
+    } else {
+      const out = host.tempPath("png");
+      if (!(await convert(host, file.path, out))) return undefined;
+      picture.png = out;
+      picture.isPngTemporary = true;
+    }
+  }
+  if (
+    previous?.png !== undefined &&
+    previous.isPngTemporary === true &&
+    previous.png !== picture.png
+  ) {
+    void host.run(["rm", "-f", previous.png]);
+  }
+
+  return picture;
 }
 
 /**
@@ -242,8 +344,14 @@ export const register: Register = (on) => {
   // The pane's conversions in flight, and the one its last drawing asked for.
   const painting = new Set<string>();
   let wanted: string | undefined;
-  const thumbs = new Map<string, { thumb: Thumb; usedAt: number }>();
+  const thumbs = new Map<string, Slot>();
+  // Pictures no preview could draw, oldest first: they hold no card's place.
+  const failed = new Set<string>();
   const located = new Map<string, { at: number; file: Located | undefined }>();
+  // Previews are converted one after another, never side by side.
+  let previews: Promise<void> = Promise.resolve();
+  // Moves on when the working directory does: what was started before is void.
+  let boundary = 0;
 
   /**
    * Converts the picture to `box` cells and asks for the redraw, unless the
@@ -268,14 +376,23 @@ export const register: Register = (on) => {
     io.redraw();
   }
 
+  /** Forgets a card, and removes the PNG the mod made for it. */
+  function dropThumb(io: Host, id: string) {
+    const png = thumbs.get(id)?.card?.png;
+    thumbs.delete(id);
+    if (png !== undefined) void io.run(["rm", "-f", png]);
+  }
+
   /**
    * Makes room for one more card: true while fewer than `MAX_THUMBS` are
-   * kept, or once the least recently drawn one has left the screen.
+   * kept, or once the least recently drawn one has left the screen. A card
+   * still being converted is never the one to go.
    */
-  function admitThumb(now: number): boolean {
+  function admitThumb(io: Host, now: number): boolean {
     if (thumbs.size < MAX_THUMBS) return true;
     let oldest: string | undefined;
     for (const [id, slot] of thumbs) {
+      if (slot.card === undefined) continue;
       if (oldest === undefined || slot.usedAt < thumbs.get(oldest)!.usedAt)
         oldest = id;
     }
@@ -284,46 +401,46 @@ export const register: Register = (on) => {
       now - thumbs.get(oldest)!.usedAt < THUMB_ACTIVE_MS
     )
       return false;
-    thumbs.delete(oldest);
+    dropThumb(io, oldest);
 
     return true;
   }
 
-  /** Measures a mentioned picture and draws its card, then asks for the redraw. */
-  async function sketch(
-    io: Host,
-    file: Located,
-    id: string,
-    maxColumns: number,
-  ) {
-    const slot = { thumb: { state: "pending" } as Thumb, usedAt: Date.now() };
+  /**
+   * Takes a card's place at once and queues its conversion behind the ones
+   * already asked for; asks for the redraw when it is drawn or given up.
+   */
+  function sketch(io: Host, file: Located, id: string, maxColumns: number) {
+    const slot: Slot = { usedAt: Date.now() };
     thumbs.set(id, slot);
-    let thumb: Thumb = { state: "failed" };
-    try {
-      const size = await measure(io, file.path, PREVIEW);
-      if (
-        size !== undefined &&
-        isBitmapFormat(size.format) &&
-        size.width * size.height <= PREVIEW_MAX_PIXELS
-      ) {
-        const box = fit(size, maxColumns, CARD_ROWS);
-        const { width, height } = size;
-        // A pixel terminal reads a PNG itself: the card needs no cells.
-        thumb =
-          io.isPixelTerminal && isReadablePng(file.path, size.format)
-            ? { state: "ready", width, height, ...box }
-            : {
-                state: "ready",
-                width,
-                height,
-                ...(await rasterize(io, file.path, box, PREVIEW)),
-              };
+    const started = boundary;
+    previews = previews.then(async () => {
+      let card: Card | undefined;
+      if (started === boundary) {
+        try {
+          card = await preview(io, file, maxColumns);
+        } catch {
+          // not a picture sips converts: the chip is dropped
+        }
       }
-    } catch {
-      // not a picture sips converts: the chip is dropped
-    }
-    slot.thumb = thumb;
-    io.redraw();
+      // The working directory moved on, or the place was given up, meanwhile.
+      if (started !== boundary || thumbs.get(id) !== slot) {
+        if (card?.png !== undefined) void io.run(["rm", "-f", card.png]);
+
+        return;
+      }
+      if (card === undefined) {
+        thumbs.delete(id);
+        failed.add(id);
+        for (const stale of failed) {
+          if (failed.size <= MAX_FAILED) break;
+          failed.delete(stale);
+        }
+      } else {
+        slot.card = card;
+      }
+      io.redraw();
+    });
   }
 
   on("session.start", async ($, e, next) => {
@@ -381,6 +498,27 @@ export const register: Register = (on) => {
     return next(e);
   });
 
+  // The previews' boundary is the working directory as it is now: when it
+  // changes, every card and lookup made under the old one is dropped, and
+  // none is made until the new one is resolved.
+  on("classic.CwdChanged", async (_$, e, next) => {
+    if (host !== undefined) {
+      const io = host;
+      boundary++;
+      io.root = undefined;
+      for (const id of [...thumbs.keys()]) dropThumb(io, id);
+      failed.clear();
+      const root = (await io.stat(e.new_cwd))?.realPath;
+      // Lookups that ran meanwhile found no directory to be inside of.
+      boundary++;
+      located.clear();
+      io.root = root;
+      io.redraw();
+    }
+
+    return next(e);
+  });
+
   on("command.run", { command: "img" }, async ($, e) => {
     if (host === undefined)
       return { text: "img: not ready, the session has not started" };
@@ -413,34 +551,15 @@ export const register: Register = (on) => {
       };
 
     const mode = request.mode ?? (host.isPixelTerminal ? "pixels" : "cells");
-    const picture: Shown = {
-      path,
-      name: baseName(path),
-      width: size.width,
-      height: size.height,
-      mtimeMs: found.mtimeMs,
+    const picture = await present(
+      host,
+      previous,
+      { path, mtimeMs: found.mtimeMs },
+      size,
       mode,
-    };
-    if (mode === "pixels") {
-      // The terminal reads a PNG by its absolute path; anything else is converted.
-      if (isReadablePng(path, size.format)) {
-        picture.png = path;
-      } else {
-        const out = host.tempPath("png");
-        if (!(await convert(host, path, out)))
-          return { text: `img: could not convert to PNG: ${target}` };
-        picture.png = out;
-        picture.isPngTemporary = true;
-      }
-    }
-    // Only a PNG this mod wrote is its to remove, never one it was shown.
-    if (
-      previous?.png !== undefined &&
-      previous.isPngTemporary === true &&
-      previous.png !== picture.png
-    ) {
-      void host.run(["rm", "-f", previous.png]);
-    }
+    );
+    if (picture === undefined)
+      return { text: `img: could not convert to PNG: ${target}` };
 
     await update($, shown, () => picture);
     await $.ui.open(paneRequest(picture, e.presentation.columns));
@@ -539,7 +658,10 @@ export const register: Register = (on) => {
       const now = Date.now();
       let entry = located.get(mention);
       if (entry === undefined || now - entry.at > LOCATE_TTL_MS) {
+        const asked = boundary;
         entry = { at: now, file: await locateMention(io, mention) };
+        // Looked up under a working directory that has since changed.
+        if (asked !== boundary) continue;
         located.delete(mention);
         if (located.size >= MAX_LOCATED) {
           for (const [key, old] of located) {
@@ -557,23 +679,24 @@ export const register: Register = (on) => {
       if (file === undefined) continue;
 
       const id = `${file.path}|${file.mtimeMs}|${maxColumns}`;
+      if (failed.has(id)) continue;
       const slot = thumbs.get(id);
       if (slot !== undefined) slot.usedAt = now;
       else if (e.props.onScreen !== null) {
         // No room among the cards on screen: this one waits, with no chip.
-        if (!admitThumb(now)) continue;
-        void sketch(io, file, id, maxColumns);
+        if (!admitThumb(io, now)) continue;
+        sketch(io, file, id, maxColumns);
       }
-      const thumb = slot?.thumb;
-      if (thumb?.state === "failed") continue;
+      const card = slot?.card;
 
       const index = chips.length;
       const name = baseName(file.path);
       const label = `▣ ${name}`;
-      const isReady = thumb?.state === "ready";
-      const width = isReady ? thumb.columns : 16;
+      const width = card === undefined ? 16 : card.columns;
       const caption = (
-        isReady ? `${name} · ${thumb.width}×${thumb.height}` : "Rendering…"
+        card === undefined
+          ? "Rendering…"
+          : `${name} · ${card.width}×${card.height}`
       )
         .slice(0, width)
         .padEnd(width);
@@ -585,47 +708,43 @@ export const register: Register = (on) => {
             dimColor
             label={label}
             onPress={async () => {
-              if (!isReady) return;
-              const picture: Shown = {
-                path: file.path,
-                name,
-                width: thumb.width,
-                height: thumb.height,
-                mtimeMs: file.mtimeMs,
-                mode: thumb.cells === undefined ? "pixels" : "cells",
-              };
-              if (thumb.cells === undefined) picture.png = file.path;
+              if (card === undefined) return;
+              // A click is the person's: the pane takes the file itself.
+              const picture = await present(
+                io,
+                await read($, shown),
+                file,
+                card,
+                io.isPixelTerminal ? "pixels" : "cells",
+              );
+              if (picture === undefined) return;
               await update($, shown, () => picture);
               await $.ui.open(paneRequest(picture, columns));
             }}
           />
           <Box
             position="absolute"
-            top={-((isReady ? thumb.rows + 1 : 1) + 2)}
+            top={-((card === undefined ? 1 : card.rows + 1) + 2)}
             left={0 - offset}
             display="none"
             hover={{ display: "flex" }}
             flexDirection="column"
             borderStyle="round"
           >
-            {isReady && thumb.cells !== undefined && (
+            {card?.cells !== undefined && (
               <Raster
                 key={`imgview-thumb-${index}`}
-                columns={thumb.columns}
-                rows={thumb.rows}
-                cells={thumb.cells}
+                columns={card.columns}
+                rows={card.rows}
+                cells={card.cells}
               />
             )}
-            {isReady && thumb.cells === undefined && (
+            {card?.png !== undefined && (
               <Image
                 key={`imgview-thumb-${index}`}
-                source={{
-                  file: file.path,
-                  format: "png",
-                  generation: Math.floor(file.mtimeMs),
-                }}
-                columns={thumb.columns}
-                rows={thumb.rows}
+                source={{ file: card.png, format: "png" }}
+                columns={card.columns}
+                rows={card.rows}
                 alt={name}
               />
             )}

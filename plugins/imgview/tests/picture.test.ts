@@ -297,21 +297,75 @@ describe("decodeBmp", () => {
     ).toThrow("a 1x5000 BMP");
   });
 
-  test("refuses masks with no room for them and pixels that start inside the header", () => {
-    const noRoom = bmpHeader({
+  test("refuses pixels that start inside the header or its masks", () => {
+    // Codex round 2, #6: a 108-byte header ends at 122, not at the masks' end.
+    const early = bmpHeader({
+      width: 1,
+      height: 1,
+      bits: 32,
+      dataOffset: 70,
+      headerSize: 108,
+      masks: true,
+    });
+    expect(() => decodeBmp(early)).toThrow("a truncated BMP");
+
+    const inMasks = bmpHeader({
+      width: 1,
+      height: 1,
+      bits: 32,
+      dataOffset: 62,
+      masks: true,
+    });
+    expect(() => decodeBmp(inMasks)).toThrow("a truncated BMP");
+
+    const inHeader = bmpHeader({
+      width: 1,
+      height: 1,
+      bits: 24,
+      dataOffset: 20,
+    });
+    expect(() => decodeBmp(inHeader)).toThrow("a truncated BMP");
+
+    // The shortest header with masks: pixels right after the three of them.
+    const snug = bmpHeader({
       width: 1,
       height: 1,
       bits: 32,
       dataOffset: 66,
-      headerSize: 108,
       masks: true,
     });
-    expect(() => decodeBmp(noRoom.subarray(0, 68))).toThrow(
-      "no room for its channel masks",
+    snug.set([0x33, 0x22, 0x11, 0x44], 66);
+    expect(pixel(decodeBmp(snug), 0, 0)).toEqual([0x11, 0x22, 0x33, 255]);
+  });
+
+  test("refuses a header no converter writes", () => {
+    const short = bmpHeader({
+      width: 1,
+      height: 1,
+      bits: 24,
+      dataOffset: 54,
+      headerSize: 12,
+    });
+    expect(() => decodeBmp(short)).toThrow(
+      "a BMP header of 12 bytes, 1 planes",
     );
 
-    const inside = bmpHeader({ width: 1, height: 1, bits: 24, dataOffset: 20 });
-    expect(() => decodeBmp(inside)).toThrow("a truncated BMP");
+    const planes = bmpHeader({ width: 1, height: 1, bits: 24, dataOffset: 54 });
+    planes[26] = 3;
+    expect(() => decodeBmp(planes)).toThrow(
+      "a BMP header of 40 bytes, 3 planes",
+    );
+
+    const masked24 = bmpHeader({
+      width: 1,
+      height: 1,
+      bits: 24,
+      dataOffset: 66,
+      masks: true,
+    });
+    expect(() => decodeBmp(masked24)).toThrow(
+      "a 24-bit BMP with channel masks",
+    );
   });
 
   test("refuses a file that is not a BMP, a palette BMP and a cut one", () => {
@@ -491,6 +545,21 @@ describe("findImagePaths", () => {
     expect(findImagePaths("shots/f(1).png and g(2)(3).png", 4)).toEqual([
       "shots/f(1).png",
       "g(2)(3).png",
+    ]);
+  });
+
+  test("takes a code span as written: its parentheses are the name's", () => {
+    // Codex round 2, #7.
+    expect(findImagePaths("`(a.png`", 4)).toEqual(["(a.png"]);
+    expect(findImagePaths("`(a.png)`", 4)).toEqual([]);
+    expect(findImagePaths("see `shots/b(1).png`.", 4)).toEqual([
+      "shots/b(1).png",
+    ]);
+    expect(
+      findImagePaths("run `sips -Z 64 c.png --out d.png` then (e.png)", 4),
+    ).toEqual(["c.png", "d.png", "e.png"]);
+    expect(findImagePaths("an unclosed ` before (f.png)", 4)).toEqual([
+      "f.png",
     ]);
   });
 

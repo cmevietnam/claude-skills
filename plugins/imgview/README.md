@@ -42,16 +42,19 @@ text is drawn by the engine, and a mod can add rows around it but cannot attach 
 to a word in it (`ui.render` on `AssistantMessage` wraps what `next(e)` drew).
 
 - A reply gets a chip for each of its first four image files (`MAX_CHIPS`): paths
-  written bare, in backticks, in a markdown link or as `file://`, ending in `.png`,
-  `.jpg`, `.jpeg`, `.gif`, `.webp`, `.heic`, `.bmp`, `.tif` or `.tiff`. A web address
-  gets none: nothing here fetches. A path with a space in it is not recognised.
+  written bare, in a code span, in a markdown link or as `file://`, ending in `.png`,
+  `.jpg`, `.jpeg`, `.gif`, `.webp`, `.heic`, `.bmp`, `.tif` or `.tiff`. A code span is
+  taken as written; in prose the parentheses around a path are the sentence's. A web
+  address gets none: nothing here fetches. A path with a space in it is not recognised.
 - The card holds at most 80 by 24 cells (`CARD_COLUMNS`, `CARD_ROWS`), fewer columns on
   a terminal narrower than 92. In `cells` mode that is a 160 by 48 pixel thumbnail.
 - The terminal applies a hover by itself and runs no hook for it, so the card cannot be
   made on demand: its picture is converted when the reply comes on screen.
-- The cells of 32 cards are kept (`MAX_THUMBS`). A card drawn in the last five seconds
-  is on screen and is not dropped for another, so with more than 32 pictures on screen
-  the extra mentions get no chip until one of the others scrolls away.
+- 32 cards are kept, drawn or still converting (`MAX_THUMBS`). A card drawn in the last
+  five seconds is on screen and is not dropped for another, and one still converting
+  never is, so with more than 32 pictures on screen the extra mentions get no chip
+  until one of the others scrolls away. A file no preview could draw is remembered
+  apart and holds no card's place.
 - Chips are drawn in the fullscreen layout only (`"tui": "fullscreen"`), on a terminal
   surface. A card that would rise past the top of the viewport is clipped there.
 
@@ -59,24 +62,41 @@ to a word in it (`ui.render` on `AssistantMessage` wraps what `next(e)` drew).
 
 A reply is the model's text, and a chip is drawn with no action of yours, so a hostile
 repository or an injected reply can name any path it likes. What that reaches is held
-to less than what `/img` takes (`locateMention` and `sketch` in `hooks/register.tsx`):
+to less than what `/img` takes (`locateMention`, `preview` and `sketch` in
+`hooks/register.tsx`):
 
-| A mention gets a chip only when                                   | Enforced by                                                    |
-| ----------------------------------------------------------------- | -------------------------------------------------------------- |
-| it lands inside the session's working directory, links followed   | `isInside(found.realPath, host.root)`, both resolved by `stat` |
-| the file is at most 20 MiB                                        | `PREVIEW_MAX_BYTES`, checked before any converter runs         |
-| `sips` names its real format a bitmap's, whatever the suffix says | `isBitmapFormat(size.format)`: no SVG, no PDF                  |
-| the picture is at most 100 megapixels                             | `PREVIEW_MAX_PIXELS`, checked before the conversion            |
+| A mention gets a chip only when                                 | Enforced by                                                                     |
+| --------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| it lands inside the session's working directory, links followed | `isInside(found.realPath, host.root)`; `host.root` follows `classic.CwdChanged` |
+| the file is at most 20 MiB                                      | `PREVIEW_MAX_BYTES`, on the file before anything runs and again on the copy     |
+| `sips` names the copy's real format a bitmap's                  | `isBitmapFormat(size.format)`: no SVG, no PDF, whatever the name says           |
+| the picture is at most 40 megapixels                            | `PREVIEW_MAX_PIXELS`, checked before the conversion                             |
 
-Each `sips` run for a chip is killed after five seconds (`PREVIEW_TIMEOUT_MS`), and
-ImageMagick is never run for one. So where `sips` is missing (Linux) there are no hover
-cards, only `/img`.
+How the conversion itself is held:
 
-This stops protecting at two edges. `sips` still parses the header of any file in the
-working directory with a bitmap's suffix to learn its format, and decodes those that
-pass: a hostile bitmap inside the repository you opened is decoded by ImageIO without a
-click. And `/img <path>` has none of these limits: a path you type is opened wherever it
-is, SVG and PDF included, with ImageMagick as the fallback.
+- `sips` never opens the path the reply named. `preview` copies the file to
+  `$TMPDIR/claude-imgview-*.snap` with `cp`, checks the copy, and measures and converts
+  the copy alone, so what was checked is what is decoded.
+- One preview is converted at a time (`previews` is a chain, not a pool): 32 mentions
+  mean 32 conversions in a row, never 32 decoders at once.
+- Each `cp` and `sips` run for a chip is killed after five seconds
+  (`PREVIEW_TIMEOUT_MS`), and ImageMagick is never run for one. So where `sips` is
+  missing (Linux) there are no hover cards, only `/img`.
+- On a terminal that draws pixels the card shows a small PNG the mod converted from the
+  copy, never the file the reply named.
+
+This stops protecting at three edges:
+
+1. `sips` still decodes, with no click, any bitmap in the working directory that passes
+   the table. A hostile bitmap inside the repository you opened reaches ImageIO.
+2. The check of where a path lands is made before the copy, and the engine gives a mod
+   no file handle to hold in between. A process already running as you that swaps the
+   file for a link at that moment, and swaps it back with the same modification time
+   before the mod looks again, gets the link's target copied, decoded and shown, within
+   the size, format and megapixel limits above.
+3. `/img <path>` has none of these limits: a path you type is opened wherever it is,
+   SVG and PDF included, with ImageMagick as the fallback. So is a chip you click: the
+   pane then takes the file itself.
 
 ## How it draws
 
@@ -108,12 +128,14 @@ the first alone:
    and PDF (first page); `sips --formats` lists the rest.
 2. `magick` (ImageMagick 7), for whatever sips cannot read, and on Linux.
 
-Each `/img`, and each chip, runs the converter once to measure the picture and, in
-`cells` mode, once per size to resize it to exactly the cells on screen. The resized file goes to
-`$TMPDIR/claude-imgview-*.bmp` and is removed once read. In `pixels` mode a PNG is handed
-to the terminal by its own path; any other format is first converted to
-`$TMPDIR/claude-imgview-*.png`, which is removed when the next `/img` replaces it; the
-last one of a session stays until the system clears `$TMPDIR`.
+Each `/img` runs the converter once to measure the picture and, in `cells` mode, once
+per pane size to resize it to exactly the cells on screen. The resized file goes to
+`$TMPDIR/claude-imgview-*.bmp` and is removed once read. In `pixels` mode a file `sips`
+names a PNG is handed to the terminal by its own path; any other is first converted to
+`$TMPDIR/claude-imgview-*.png`, which is removed when another picture replaces it in the
+pane. A chip's copy (`*.snap`) is removed as soon as its card is drawn, and a card's PNG
+when the card is dropped. What a session still holds when it ends stays until the system
+clears `$TMPDIR`.
 
 ## Limits
 
