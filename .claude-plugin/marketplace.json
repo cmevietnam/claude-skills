@@ -172,10 +172,13 @@
     },
     {
       "name": "imgview",
-      "source": "./plugins/imgview",
+      "source": {
+        "source": "github",
+        "repo": "hieuvo/claude-imgview"
+      },
       "displayName": "Image preview pane",
       "description": "Preview images inside Claude Code: hover the chip under a reply that names an image file in the working directory to pop its picture up, or open one in a pane with /img <path>. Pixels on kitty and Ghostty, colored block characters on every other terminal.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "author": {
         "name": "hieuvo"
       },
@@ -188,7 +191,9 @@
         "terminal",
         "screenshot",
         "mod"
-      ]
+      ],
+      "homepage": "https://github.com/hieuvo/claude-imgview",
+      "repository": "https://github.com/hieuvo/claude-imgview"
     }
   ]
 }
