@@ -80,11 +80,17 @@ function world(
   files: Record<string, Kind>,
   env: Record<string, string> = {},
   isWriting = true,
-  // A barrier every conversion waits at before it writes its file.
-  barrier?: Promise<void>,
+  // A barrier every conversion waits at before it writes its file: one, or
+  // whichever is up when the conversion comes to it.
+  barrier?: Promise<void> | (() => Promise<void> | undefined),
   extra: {
-    // Every name the mod picks for a copy is already taken by someone else.
+    // Every name the mod picks for a copy is already taken by someone else's
+    // file.
     isSquatted?: boolean;
+    // A pipe sits at every name the mod picks for a copy: the shell opens it.
+    isPipeAtCopy?: boolean;
+    // While this says so `rm` fails, and removes nothing.
+    rm?: { isFailing: boolean };
     // Looking at this path waits at this gate.
     statGate?: { path: string; gate: Promise<void> };
     // Looking at a copy of this file waits at this gate.
@@ -113,6 +119,8 @@ function world(
   const copies = new Map<string, string>();
   // Every copy ever made, kept after its removal for a test to trace.
   const everCopied = new Map<string, string>();
+  // The names a copy was to go to where something sat already: what sat there.
+  const occupied = new Map<string, "file" | "other">();
   // How many `sips` are running, and the most that ever ran at once.
   let running = 0;
   let peak = 0;
@@ -147,6 +155,18 @@ function world(
     };
     if (e.path === "/work" || e.path === "/other")
       return { value: { ...directory, realPath: e.path } };
+    const sitting = occupied.get(e.path);
+    if (sitting !== undefined) {
+      return {
+        value: {
+          kind: sitting,
+          size: 10,
+          mtimeMs: 9,
+          isLink: false,
+          realPath: e.path,
+        },
+      };
+    }
     const copied = copies.get(e.path);
     if (copied !== undefined && copied === extra.stuck?.copyOf)
       await extra.stuck.gate;
@@ -203,7 +223,17 @@ function world(
     });
     if (isCopy(e.argv)) {
       // Exit 3 where the name is taken, with what is there left as it was.
-      if (extra.isSquatted === true) return done("", 3);
+      if (extra.isSquatted === true) {
+        occupied.set(e.argv[5]!, "file");
+
+        return done("", 3);
+      }
+      // A pipe there is opened and written into: the shell has nothing to say.
+      if (extra.isPipeAtCopy === true) {
+        occupied.set(e.argv[5]!, "other");
+
+        return done();
+      }
       const name = nameAt(e.argv[4]!);
       if (name !== undefined) {
         copies.set(e.argv[5]!, name);
@@ -216,6 +246,7 @@ function world(
       );
     }
     if (tool === "rm") {
+      if (extra.rm?.isFailing === true) return done("", 1);
       for (const path of e.argv.slice(1)) copies.delete(path);
 
       return done();
@@ -246,7 +277,8 @@ function world(
             `  pixelHeight: ${isPicture ? side[1] : "<nil>"}\n`,
         );
       }
-      if (e.argv[1] === "-s") await barrier;
+      if (e.argv[1] === "-s")
+        await (typeof barrier === "function" ? barrier() : barrier);
       if (e.argv[1] === "-s" && isPicture) {
         const z = e.argv.indexOf("-z");
         const out = e.argv[e.argv.indexOf("--out") + 1]!;
@@ -682,8 +714,8 @@ test("converts nothing for a reply that is off screen", async ($, on) => {
 
   const ui = await reply($, "Saved shot.png.", { isOffScreen: true });
   expect(await ui.findAll({ type: "Button" })).toHaveLength(1);
-  expect(await ui.find({ type: "Raster" })).toBeUndefined();
-  expect(await ui.find({ type: "Text", text: /^Rendering…/ })).toBeDefined();
+  // No card is begun for it, and none is promised.
+  expect(await cards(ui)).toHaveLength(0);
   expect(runs).toHaveLength(0);
 });
 
@@ -963,7 +995,7 @@ test("converts a pane size once however the pane is resized meanwhile, and keeps
     expect(await ui.find({ type: "Text", text: "Rendering…" })).toBeDefined();
     await ui.unmount();
   }
-  expect(sizes()).toEqual(["80", "40"]);
+  expect(sizes()).toEqual(["80"]);
 
   release();
   const ui = await pane($, 40, 21);
@@ -971,6 +1003,73 @@ test("converts a pane size once however the pane is resized meanwhile, and keeps
     columns: 40,
     rows: 10,
   });
+  // The size in between was never the one the pane wanted once it could be
+  // converted.
+  expect(sizes()).toEqual(["80"]);
+});
+
+// Codex review, round 5, finding 5.
+test("converts one pane size at a time, and of the sizes asked for meanwhile only the last", async ($, on) => {
+  let release = () => {};
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const { runs, clock, peak } = world(
+    on,
+    { "shot.png": "image" },
+    {},
+    true,
+    barrier,
+  );
+  await start($);
+  await img($, "shot.png");
+  const sizes = () =>
+    runs.filter((argv) => argv[1] === "-s").map((argv) => argv[6]);
+
+  // 40 columns, then 20, then 30, the first conversion still running.
+  for (const columns of [40, 20, 30])
+    await (await pane($, columns, 21)).unmount();
+  expect(sizes()).toEqual(["80"]);
+
+  // It ends, for a size the pane has left: the one it wants now is next.
+  release();
+  await clock.settle();
+  expect(sizes()).toEqual(["80", "60"]);
+  expect(peak()).toBe(1);
+  const ui = await pane($, 30, 21);
+  expect((await ui.find({ type: "Raster" }))?.props).toMatchObject({
+    columns: 30,
+  });
+  expect(sizes()).toEqual(["80", "60"]);
+});
+
+test("converts nothing again for a size the pane came back to", async ($, on) => {
+  let gate: Promise<void> | undefined;
+  let release = () => {};
+  const { runs, clock } = world(
+    on,
+    { "shot.png": "image" },
+    {},
+    true,
+    () => gate,
+  );
+  await start($);
+  await img($, "shot.png");
+  const sizes = () =>
+    runs.filter((argv) => argv[1] === "-s").map((argv) => argv[6]);
+
+  // 40 columns is converted and drawn.
+  const first = await pane($, 40, 21);
+  expect(await first.find({ type: "Raster" })).toBeDefined();
+  await first.unmount();
+  // 20 columns is being converted when the pane goes back to 40.
+  gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await (await pane($, 20, 21)).unmount();
+  await (await pane($, 40, 21)).unmount();
+  release();
+  await clock.settle();
   expect(sizes()).toEqual(["80", "40"]);
 });
 
@@ -1190,31 +1289,50 @@ test(
       for (const name of names) files[name] = "image";
       replies.push(names.join(" "));
     }
-    world(on, files);
+    const { runs, origin } = world(on, files, { TERM: "xterm-kitty" });
     await start($);
-    const rasters = async (text: string, id: string, isOffScreen = false) => {
+    const images = async (text: string, id: string, isOffScreen = false) => {
       const ui = await reply($, text, { id, isOffScreen });
-      const count = (await ui.findAll({ type: "Raster" })).length;
+      const count = (await ui.findAll({ type: "Image" })).length;
       await ui.unmount();
 
       return count;
     };
+    /** The pictures whose card was dropped: the PNG made for it was removed. */
+    const dropped = () => {
+      const pictures = new Map(
+        runs
+          .filter((argv) => argv[1] === "-s" && argv[3] === "png")
+          .map((argv) => [argv.at(-1)!, origin(argv[7])]),
+      );
+
+      return runs
+        .filter((argv) => argv[0] === "rm")
+        .flatMap((argv) => argv.slice(2))
+        .filter((path) => pictures.has(path))
+        .map((path) => pictures.get(path));
+    };
 
     // 32 cards drawn, every reply on screen; the first reply's are the oldest.
     for (const [n, text] of replies.entries())
-      expect(await rasters(text, `reply-${n}`)).toBe(4);
+      expect(await images(text, `reply-${n}`)).toBe(4);
     // All in use: nothing gives way to a 33rd.
-    expect(await rasters("extra.png", "extra")).toBe(0);
+    expect(await images("extra.png", "extra")).toBe(0);
+    expect(dropped()).toEqual([]);
 
-    // Replies 1 and 0 scroll away, the later one first.
-    expect(await rasters(replies[1]!, "reply-1", true)).toBe(4);
-    expect(await rasters(replies[0]!, "reply-0", true)).toBe(4);
+    // Replies 1 and 0 scroll away, the later one first: no card is drawn off
+    // screen, and none is dropped for leaving it.
+    expect(await images(replies[1]!, "reply-1", true)).toBe(0);
+    expect(await images(replies[0]!, "reply-0", true)).toBe(0);
+    expect(dropped()).toEqual([]);
     // One card gives way, and it is the first reply's: asked for longest ago.
-    await rasters("extra.png", "extra");
-    expect(await rasters("extra.png", "extra")).toBe(1);
-    expect(await rasters(replies[0]!, "reply-0", true)).toBe(3);
-    expect(await rasters(replies[1]!, "reply-1", true)).toBe(4);
-    expect(await rasters(replies[7]!, "reply-7")).toBe(4);
+    await images("extra.png", "extra");
+    expect(await images("extra.png", "extra")).toBe(1);
+    expect(dropped()).toEqual(["/work/p0-0.png"]);
+    // The others are as they were: back on screen, they are drawn at once.
+    expect(await images(replies[1]!, "reply-1")).toBe(4);
+    expect(await images(replies[7]!, "reply-7")).toBe(4);
+    expect(dropped()).toEqual(["/work/p0-0.png"]);
   },
 );
 
@@ -1483,6 +1601,17 @@ test("makes no card where the terminal does not say what is on screen", async ($
   expect(await ui.findAll({ type: "Button" })).toHaveLength(1);
   expect(await cards(ui)).toHaveLength(0);
   expect(runs).toHaveLength(0);
+
+  // Nor is the card drawn there that a reply on screen has had made.
+  const shown = await reply($, "Saved shot.png.", { id: "reply-2" });
+  expect(await shown.findAll({ type: "Raster" })).toHaveLength(1);
+  const silent = await reply($, "Saved shot.png.", {
+    id: "reply-3",
+    isUnreported: true,
+  });
+  expect(await silent.findAll({ type: "Button" })).toHaveLength(1);
+  expect(await cards(silent)).toHaveLength(0);
+  expect(await silent.findAll({ type: "Raster" })).toHaveLength(0);
 });
 
 // Codex review, round 4, finding 2.
@@ -1892,3 +2021,354 @@ test("converts a waiting card once when the working directory moves to one that 
   expect(copied.filter((file) => file === "/work/sub/b.png")).toHaveLength(1);
   expect(copied.filter((file) => file === "/work/sub/a.png")).toHaveLength(2);
 });
+
+// Codex review, round 5, finding 1.
+test("lets a drawing of a reply that a later one has overtaken ask for no card", async ($, on) => {
+  let open = () => {};
+  const gate = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  const { runs, clock } = world(
+    on,
+    { "a.png": "image", "b.png": "image" },
+    {},
+    true,
+    undefined,
+    { statGate: { path: "/work/a.png", gate } },
+  );
+  await start($);
+
+  // Drawn naming a.png, the look at it unanswered; drawn again naming b.png.
+  const ui = await reply($, "Nothing yet.");
+  const onScreen = { first: 0, last: 1, of: 2 };
+  const older = ui.redraw({
+    text: "/work/a.png",
+    isFirstOfReply: true,
+    onScreen,
+  });
+  await clock.settle();
+  const newer = ui.redraw({
+    text: "/work/b.png",
+    isFirstOfReply: true,
+    onScreen,
+  });
+  await clock.settle();
+  open();
+  await older;
+  await newer;
+  await clock.settle();
+  // The later drawing's card is the reply's; the earlier one began none.
+  expect(runs.filter(isCopy).map((argv) => argv[4])).toEqual(["/work/b.png"]);
+});
+
+test("gives up the cards of a reply drawn again with no picture named, or on the main screen", async ($, on) => {
+  let release = () => {};
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const { runs, clock } = world(
+    on,
+    { "x.png": "image", "a.png": "image", "b.png": "image" },
+    {},
+    true,
+    barrier,
+  );
+  await start($);
+
+  // x is at the barrier; a's card and b's wait behind it.
+  await reply($, "x.png", { id: "x" });
+  const a = await reply($, "a.png", { id: "a" });
+  const b = await reply($, "b.png", { id: "b" });
+  // a is drawn again naming no picture, and b on the main screen.
+  await a.redraw({
+    text: "Never mind.",
+    isFirstOfReply: true,
+    onScreen: { first: 0, last: 1, of: 2 },
+  });
+  await b.unmount();
+  await reply($, "b.png", { id: "b", isFullscreen: false });
+
+  release();
+  await clock.settle();
+  expect(runs.filter(isCopy).map((argv) => argv[4])).toEqual(["/work/x.png"]);
+});
+
+// Codex review, round 5, finding 2.
+test(
+  "begins no card while a command of the one given up is still running",
+  { timeoutMs: 20000 },
+  async ($, on) => {
+    let open = () => {};
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    let release = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { runs, clock, peak } = world(
+      on,
+      { "hang.png": "image", "ok.png": "image" },
+      {},
+      true,
+      barrier,
+      { stuck: { copyOf: "hang.png", gate } },
+    );
+    await start($);
+
+    // The look at hang.png's copy answers after 28 seconds: its conversion
+    // is running when the 30 are up.
+    await reply($, "hang.png", { id: "hang" });
+    const waiting = await reply($, "ok.png", { id: "ok" });
+    await clock.advance(28000);
+    open();
+    await clock.settle();
+    expect(runs.filter((argv) => argv[1] === "-s")).toHaveLength(1);
+    await clock.advance(2000);
+    // Given up, its sips not yet ended: ok.png is not begun beside it.
+    expect(runs.filter(isCopy)).toHaveLength(1);
+
+    release();
+    await clock.settle();
+    expect(await waiting.findAll({ type: "Raster" })).toHaveLength(1);
+    expect(peak()).toBe(1);
+    // What the one given up had made is removed, each file once.
+    const copy = runs.filter(isCopy)[0]![5]!;
+    const bitmap = runs.find((argv) => argv[1] === "-s")!.at(-1)!;
+    const removalsOf = (path: string) =>
+      runs.filter((argv) => argv[0] === "rm" && argv.includes(path));
+    expect(removalsOf(copy)).toHaveLength(1);
+    expect(removalsOf(bitmap)).toHaveLength(1);
+  },
+);
+
+test(
+  "removes the files of a preview given up, though it never answers",
+  { timeoutMs: 20000 },
+  async ($, on) => {
+    const { runs, clock } = world(
+      on,
+      { "a.png": "image" },
+      {},
+      true,
+      undefined,
+      { readGate: new Promise<void>(() => {}) },
+    );
+    await start($);
+
+    // The copy is made and the bitmap written; reading it back never ends.
+    await reply($, "a.png");
+    await clock.advance(30000);
+    const copy = runs.find(isCopy)![5]!;
+    const bitmap = runs.find((argv) => argv[1] === "-s")!.at(-1)!;
+    const removed = () =>
+      runs.filter((argv) => argv[0] === "rm").flatMap((argv) => argv.slice(2));
+    expect(removed().sort()).toEqual([bitmap, copy].sort());
+    // Struck off as they went: a module loaded again finds nothing to remove.
+    await clock.advance(1000);
+    await start($);
+    expect(removed()).toHaveLength(2);
+  },
+);
+
+test(
+  "begins no more cards while eight given up have not answered, and begins them again once they have",
+  { timeoutMs: 30000 },
+  async ($, on) => {
+    let open = () => {};
+    const readGate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const files: Record<string, Kind> = {};
+    for (let n = 0; n < 11; n++) files[`h${n}.png`] = "image";
+    const { runs, clock } = world(on, files, {}, true, undefined, { readGate });
+    await start($);
+
+    // Nine cards asked for, each one's bitmap not read back in time.
+    for (let n = 0; n < 9; n++) await reply($, `h${n}.png`, { id: `r${n}` });
+    for (let n = 0; n < 8; n++) await clock.advance(30000);
+    expect(runs.filter(isCopy)).toHaveLength(8);
+    // The ninth is not begun however long it waits, and neither is a new one.
+    await clock.advance(60000);
+    const late = await reply($, "h9.png", { id: "r9" });
+    await clock.advance(60000);
+    expect(runs.filter(isCopy)).toHaveLength(8);
+    expect(await late.findAll({ type: "Button" })).toHaveLength(0);
+
+    // The eight answer at last: a card is begun again, and with the redraw
+    // it asks for so are the two that were refused. h1.png was the ninth:
+    // the card asked for last is converted first.
+    open();
+    await clock.settle();
+    await reply($, "h10.png", { id: "r10" });
+    await clock.settle();
+    expect(
+      runs
+        .filter(isCopy)
+        .slice(8)
+        .map((argv) => argv[4])
+        .sort(),
+    ).toEqual(["/work/h1.png", "/work/h10.png", "/work/h9.png"]);
+  },
+);
+
+// Codex review, round 5, finding 3.
+test("leaves a pipe that sat at the copy's name: not read as a copy, not removed, not written down", async ($, on) => {
+  const { runs, clock } = world(
+    on,
+    { "shot.png": "image" },
+    {},
+    true,
+    undefined,
+    { isPipeAtCopy: true },
+  );
+  await start($);
+
+  const ui = await reply($, "Saved shot.png.");
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
+  expect(runs.filter(isCopy)).toHaveLength(1);
+  expect(runs.filter((argv) => argv[0] !== "/bin/sh")).toEqual([]);
+  await clock.advance(1000);
+  await start($);
+  expect(runs.filter((argv) => argv[0] !== "/bin/sh")).toEqual([]);
+});
+
+// Codex review, round 5, finding 4.
+test("keeps a file written down until rm has removed it: a module loaded again removes it, once", async ($, on) => {
+  const rm = { isFailing: true };
+  const { runs, clock } = world(on, { "a.png": "image" }, {}, true, undefined, {
+    rm,
+  });
+  await start($);
+  const removedSince = (index: number) =>
+    runs
+      .slice(index)
+      .filter((argv) => argv[0] === "rm")
+      .flatMap((argv) => argv.slice(2));
+
+  // The card is drawn; rm removed neither the copy nor the bitmap.
+  const ui = await reply($, "a.png");
+  expect(await ui.findAll({ type: "Raster" })).toHaveLength(1);
+  await ui.unmount();
+  const copy = runs.find(isCopy)![5]!;
+  const bitmap = runs.find((argv) => argv[1] === "-s")!.at(-1)!;
+  expect(removedSince(0).sort()).toEqual([bitmap, copy].sort());
+
+  rm.isFailing = false;
+  const reloaded = runs.length;
+  await clock.advance(1000);
+  await start($);
+  expect(removedSince(reloaded).sort()).toEqual([bitmap, copy].sort());
+  // Gone now, and struck off: nothing is left for a third load.
+  const again = runs.length;
+  await clock.advance(1000);
+  await start($);
+  expect(removedSince(again)).toEqual([]);
+});
+
+test("keeps what a sweep could not remove written down for the next one", async ($, on) => {
+  const rm = { isFailing: false };
+  const { runs, clock } = world(
+    on,
+    { "a.png": "image" },
+    { TERM: "xterm-kitty" },
+    true,
+    undefined,
+    { rm },
+  );
+  await start($);
+  const ui = await reply($, "a.png");
+  const card = (await ui.find({ type: "Image" }))?.props.source as {
+    file: string;
+  };
+  await ui.unmount();
+
+  // The session ends, and rm fails: the card's PNG is still there.
+  rm.isFailing = true;
+  await $.session.end({
+    reason: "clear",
+    sessionId: "s-1",
+    resume: { id: "s-1" },
+  });
+  rm.isFailing = false;
+  const reloaded = runs.length;
+  await clock.advance(1000);
+  await start($);
+  expect(
+    runs
+      .slice(reloaded)
+      .filter((argv) => argv[0] === "rm")
+      .flatMap((argv) => argv.slice(2)),
+  ).toEqual([card.file]);
+});
+
+test(
+  "lets a drawing that a later one has overtaken drop no card to make room for its own",
+  { timeoutMs: 20000 },
+  async ($, on) => {
+    let open = () => {};
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const files: Record<string, Kind> = { "late.png": "image" };
+    const replies: string[] = [];
+    for (let n = 0; n < 8; n++) {
+      const names = [0, 1, 2, 3].map((k) => `p${n}-${k}.png`);
+      for (const name of names) files[name] = "image";
+      replies.push(names.join(" "));
+    }
+    const { runs, clock } = world(
+      on,
+      files,
+      { TERM: "xterm-kitty" },
+      true,
+      undefined,
+      { statGate: { path: "/work/late.png", gate } },
+    );
+    await start($);
+    const droppedPngs = () =>
+      runs
+        .filter((argv) => argv[0] === "rm")
+        .flatMap((argv) => argv.slice(2))
+        .filter((path) => path.endsWith(".png"));
+
+    // 32 cards kept, every reply scrolled away since: none is in use.
+    for (const [n, text] of replies.entries()) {
+      const shown = await reply($, text, { id: `reply-${n}` });
+      expect(await shown.findAll({ type: "Image" })).toHaveLength(4);
+      await shown.unmount();
+      const hidden = await reply($, text, {
+        id: `reply-${n}`,
+        isOffScreen: true,
+      });
+      await hidden.unmount();
+    }
+    expect(droppedPngs()).toEqual([]);
+
+    // Drawn naming late.png, the look at it unanswered; drawn again naming a
+    // picture whose card is kept.
+    const ui = await reply($, "Nothing yet.", { id: "z" });
+    const onScreen = { first: 0, last: 1, of: 2 };
+    const older = ui.redraw({
+      text: "/work/late.png",
+      isFirstOfReply: true,
+      onScreen,
+    });
+    await clock.settle();
+    const newer = ui.redraw({
+      text: "p7-3.png",
+      isFirstOfReply: true,
+      onScreen,
+    });
+    await clock.settle();
+    open();
+    await older;
+    await newer;
+    await clock.settle();
+    // The earlier drawing asked for nothing: no card gave way to late.png's.
+    expect(droppedPngs()).toEqual([]);
+    expect(runs.filter(isCopy).map((argv) => argv[4])).not.toContain(
+      "/work/late.png",
+    );
+  },
+);

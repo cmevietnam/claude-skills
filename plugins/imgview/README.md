@@ -58,14 +58,27 @@ to a word in it (`ui.render` on `AssistantMessage` wraps what `next(e)` drew).
   comes on screen and when it leaves (`e.props.onScreen`), and not in between, so the
   mod keeps the replies now on screen with the cards each one draws (`onScreen` in
   `hooks/register.tsx`) and reads no clock: a reply that sits still keeps its cards
-  however long a conversion takes. A reply that goes without being reported stops
-  holding its cards when the session ends (a `/clear` is one), or once 64 other replies
-  that name image files have been drawn on screen after it (`MAX_ON_SCREEN`).
+  however long a conversion takes. A reply stops holding its cards when it is drawn
+  again off screen, with no image file named, or outside the fullscreen layout
+  (`leave`). When two drawings of one reply overlap, the one begun last asks for the
+  cards and decides which the reply holds; the other asks for none (`isHolding`).
+- A card is drawn only by a drawing that holds it. A reply drawn off screen shows its
+  chips with no card behind them, and gets its cards when it comes back.
+- That record has three limits, because the engine names a reply and reports when it
+  scrolls away, and nothing else:
+  - A reply taken out of the transcript with no last drawing (a rewind, a compaction)
+    goes on holding its cards until the session ends (a `/clear` is one), or until 64
+    other replies that name image files have been drawn on screen after it
+    (`MAX_ON_SCREEN`). While 32 cards are held that way, new mentions get no chip.
+  - With more than 64 replies that name image files on screen at once, the one drawn
+    longest ago stops holding its cards though it is still there.
+  - Two terminals attached to one session are one record: a reply one of them reports
+    as gone stops holding its cards while the other may still show it.
 - Cards are converted one after another, the one asked for last first. One whose reply
   leaves the screen before its turn is given up, so what is on screen now does not wait
   behind what was (`pruneQueue` and `drain`).
 - Where the terminal does not say what is on screen (`onScreen` absent), the chips are
-  drawn and no card is made for them; a click still opens the pane.
+  drawn and no card is made or drawn for them; a click still opens the pane.
 - Chips are drawn in the fullscreen layout only (`"tui": "fullscreen"`), on a terminal
   surface. A card that would rise past the top of the viewport is clipped there.
 
@@ -88,10 +101,13 @@ How the conversion itself is held:
 - `sips` never opens the path the reply named. `preview` copies the file to a name under
   `$TMPDIR` that nobody can guess (`crypto.randomUUID()`). The copy is made by `/bin/sh`
   with noclobber set (`SNAPSHOT`: `set -C; { cat -- "$1" || exit 4; } >"$2" || exit 3`),
-  which creates it with `O_EXCL` or not at all: not over a file that is there, and not
-  through a link to a file or to nothing. When the name is taken (exit 3) the mod reads
-  nothing from it and removes nothing. Otherwise it checks the copy, looks at the
-  original again, and measures and converts the copy alone.
+  which opens a free name with `O_EXCL` and refuses a file that is there: no copy is
+  made over a file, or through a link to a file or to nothing. Exit 3 says the shell did
+  not open the name (it is taken, or `$TMPDIR` has no room or is gone), and then the mod
+  reads nothing there and removes nothing. After any other exit it looks at what is at
+  the name, and takes only a regular file as its copy (`copied?.kind !== "file"`):
+  that is written down, checked, and removed when the preview is done. The mod then
+  looks at the original again, and measures and converts the copy alone.
 - One preview is converted at a time (`drain` takes one job from `queue` and returns at
   once while another call is running): 32 mentions mean 32 conversions in a row, never
   32 decoders at once.
@@ -101,7 +117,14 @@ How the conversion itself is held:
 - A preview still unfinished after 30 seconds (`PREVIEW_DEADLINE_MS`) is given up, so
   the cards behind it are drawn. Its commands cannot take that long at five seconds
   each; a file system call that never answers can. The preview given up starts no
-  further command when that call does answer (`previewInTime`).
+  further command when that call does answer, and a command of its that is running
+  at the 30 seconds ends, at its own timeout, before the next card is begun
+  (`previewInTime`). The files it had written down are removed then; one it comes upon
+  later is removed as it is found.
+- With eight previews given up and still unanswered (`MAX_ABANDONED`), no new card is
+  begun, and a mention that has no card yet gets no chip, until one of them answers: a
+  mount that has stopped answering costs eight waiting previews, not one for every
+  mention.
 - On a terminal that draws pixels the card shows a small PNG the mod converted from the
   copy, never the file the reply named.
 - When the working directory changes, every card, lookup and waiting conversion made
@@ -127,8 +150,9 @@ This stops protecting at three edges:
    - Only the copy is created exclusively. `sips` writes its BMP or PNG to a fresh
      random name with no such guarantee, so a link put at that name in time is written
      through. And bash's noclobber opens a pipe or a device that sits at the copy's
-     name instead of refusing it; what is there is then no regular file, and is not
-     read.
+     name instead of refusing it: the file's bytes are written into it, for the five
+     seconds the shell is allowed at most. The mod then finds no regular file there,
+     reads nothing from it, and leaves it: not removed, not written down.
    - The mod removes its files by name (`rm -f`), so whatever that process has put at
      one of those names by then is what is removed.
 
@@ -170,26 +194,34 @@ the first alone:
 2. `magick` (ImageMagick 7), for whatever sips cannot read, and on Linux.
 
 Each `/img` runs the converter once to measure the picture and, in `cells` mode, once
-per pane size to resize it to exactly the cells on screen. The resized file goes to
-`$TMPDIR/claude-imgview-*.bmp` and is removed once read. In `pixels` mode a file `sips`
-names a PNG is handed to the terminal by its own path; any other is first converted to
-`$TMPDIR/claude-imgview-*.png`, which is removed when another picture replaces it in the
-pane. A chip's copy (`*.snap`) is removed as soon as its card is drawn, and a card's PNG
+per pane size to resize it to exactly the cells on screen: one size at a time, and of
+the sizes a resize passes through meanwhile only the last (`paint`). The resized file
+goes to `$TMPDIR/claude-imgview-*.bmp` and is removed once read. In `pixels` mode a
+file `sips` names a PNG is handed to the terminal by its own path; any other is first
+converted to `$TMPDIR/claude-imgview-*.png`, which is removed when another picture
+replaces it in the pane. A chip's copy (`*.snap`) is removed as soon as its card is drawn, and a card's PNG
 when the card is dropped.
 
 Every temporary file the mod makes is written down by its path until it is removed
 (`owned` in `hooks/register.tsx`), and that list is copied into the session's state
 (`imgview.temps`) a moment later, from a timer: the engine refuses a state write while a
 reply is being drawn, which is when most of these files are made. A name is written down
-only once a file was made there, so a name that turned out to be taken never is. When the
-session ends (`session.end`, in the short time the engine allows it), and when the module
-is loaded again in a running session, the files written down are removed by those exact
-paths (`sweep`), not by a name pattern. This is what can still be left behind:
+only once the mod has found a file there, so a name that turned out to be taken never
+is. A path is struck off once `rm` has exited 0 for it, not when `rm` is started
+(`remove`). When the session ends (`session.end`, in the short time the engine allows
+it), and when the module is loaded again in a running session, the files written down
+are removed by those exact paths (`sweep`), not by a name pattern. This is what can
+still be left behind:
 
 - The PNG the pane is showing, on purpose: a pane that outlives a `/clear` still needs
   it. It goes when another picture replaces it, or when the system clears `$TMPDIR`.
 - A file made in the last tenth of a second before the module was reloaded
   (`RECORD_DELAY_MS`), and the output of a conversion the reload cut short.
+- A file the mod never found: the copy, or a converter's output, when the look that
+  follows its writing never answers. Eight previews at most wait that way at a time.
+- A file `rm` could not remove, or one the sweep at `session.end` did not reach in the
+  time the engine allows. It stays written down and is removed when the module is next
+  loaded in that session; when the session is over by then, it is left.
 - Everything, when the process is killed with no `session.end`.
 
 ## Limits
@@ -224,4 +256,6 @@ as base64 in the test), so a change in either converter's output format shows up
 system, a faked shell and a faked `sips`: it asserts the exact command lines, not that a
 real picture reached a real screen. The `SNAPSHOT` line itself was run by hand against
 the `/bin/sh` of macOS 14.5 (bash 3.2): it copies to a free name and exits 3, writing
-nothing, on a file, a link to a file, a dangling link and a directory.
+nothing, on a file, a link to a file, a dangling link, a directory and a name under a
+directory that does not exist. On a device at the name (`/dev/null`) it exits 0, which
+is why the mod looks at what is there before calling it a copy.
