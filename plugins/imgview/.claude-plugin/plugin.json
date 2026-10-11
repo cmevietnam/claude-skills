@@ -1,0 +1,13 @@
+{
+  "name": "imgview",
+  "description": "Preview images inside Claude Code: hover the chip under a reply that names an image file in the working directory to pop its picture up, or open one in a pane with /img <path>. Pixels on kitty and Ghostty, colored block characters on every other terminal.",
+  "version": "0.1.0",
+  "author": {
+    "name": "hieuvo"
+  },
+  "homepage": "https://github.com/cmevietnam/claude-skills",
+  "repository": "https://github.com/cmevietnam/claude-skills",
+  "license": "MIT",
+  "keywords": ["image", "preview", "pane", "terminal", "screenshot", "mod"],
+  "types": "./types/index.d.ts"
+}

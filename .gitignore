@@ -3,3 +3,5 @@
 .env
 .env.local
 *.env.local
+# Type declarations the engine writes when it loads a mod from its folder
+plugins/*/.claude-plugin/types/

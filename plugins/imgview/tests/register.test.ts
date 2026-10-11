@@ -1,0 +1,2424 @@
+import { expect, mock, test } from "claude-code/testing";
+import type { On, RenderElement } from "claude-code";
+import type { Engine } from "claude-code/testing";
+
+import { toBase64 } from "../hooks/picture";
+
+/**
+ * What a path leads to in the fake file system. An `image` is 200 by 100 in
+ * the format its suffix names; the others are what a preview has to refuse.
+ */
+type Kind =
+  | "image"
+  | "text"
+  | "dir"
+  // A PDF whatever its suffix: sips names a file's real format.
+  | "pdf"
+  // A picture of 40000 by 40000 pixels.
+  | "huge"
+  // A picture file of 100 MiB.
+  | "heavy"
+  // A picture whose path lands outside the working directory.
+  | "link-out"
+  // A JPEG whatever its suffix.
+  | "jpeg"
+  // A picture the converter writes at another size than it was asked.
+  | "misconverted"
+  // A picture of 8000 by 6250 pixels: 50 megapixels.
+  | "large"
+  // A small picture that is 100 MiB by the time it is copied.
+  | "grows"
+  // A picture replaced by another once it has been looked up.
+  | "moved"
+  // A picture the copy fails on, though a file is left where it was to go.
+  | "uncopyable"
+  // A picture replaced by a pipe once it has been looked up.
+  | "piped";
+
+const FORMATS: Record<string, string> = {
+  png: "png",
+  jpg: "jpeg",
+  jpeg: "jpeg",
+  gif: "gif",
+  webp: "webp",
+  heic: "heic",
+  svg: "svg",
+};
+
+/** A solid orange 24-bit BMP, bottom row first, as a converter would write. */
+function bmp(width: number, height: number): string {
+  const stride = (width * 3 + 3) & ~3;
+  const bytes = new Uint8Array(54 + stride * height);
+  const view = new DataView(bytes.buffer);
+  bytes.set([0x42, 0x4d]);
+  view.setUint32(10, 54, true);
+  view.setUint32(14, 40, true);
+  view.setInt32(18, width, true);
+  view.setInt32(22, height, true);
+  view.setUint16(26, 1, true);
+  view.setUint16(28, 24, true);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++)
+      bytes.set([0x00, 0x88, 0xff], 54 + y * stride + x * 3);
+  }
+
+  return toBase64(bytes);
+}
+
+/** Whether a run is the shell copying a file to a name that must be free. */
+const isCopy = (argv: readonly string[]) =>
+  argv[0] === "/bin/sh" && argv[1] === "-c" && argv.length === 6;
+
+/**
+ * The host beneath the mod: the working directory `/work`, a file system of
+ * `files`, a shell that copies, a `sips` that measures and converts the
+ * pictures among them, and no ImageMagick. With `isWriting` false no
+ * converter's output ever appears.
+ */
+function world(
+  on: On,
+  files: Record<string, Kind>,
+  env: Record<string, string> = {},
+  isWriting = true,
+  // A barrier every conversion waits at before it writes its file: one, or
+  // whichever is up when the conversion comes to it.
+  barrier?: Promise<void> | (() => Promise<void> | undefined),
+  extra: {
+    // Every name the mod picks for a copy is already taken by someone else's
+    // file.
+    isSquatted?: boolean;
+    // A pipe sits at every name the mod picks for a copy: the shell opens it.
+    isPipeAtCopy?: boolean;
+    // While this says so `rm` fails, and removes nothing.
+    rm?: { isFailing: boolean };
+    // Looking at this path waits at this gate.
+    statGate?: { path: string; gate: Promise<void> };
+    // Looking at a copy of this file waits at this gate.
+    stuck?: { copyOf: string; gate: Promise<void> };
+    // Asking whether a PNG was written waits at this gate.
+    pngGate?: Promise<void>;
+    // Reading a converted bitmap waits at this gate.
+    readGate?: Promise<void>;
+    // When each of these files last changed, read at every look.
+    mtimes?: Record<string, number>;
+  } = {},
+) {
+  // The engine's clock, moved by the test alone.
+  const clock = mock.clock(on, { now: 1_700_000_000_000 });
+  const runs: string[][] = [];
+  // The timeout each run was given, beside `runs`.
+  const timeouts: (number | undefined)[] = [];
+  const opened: {
+    id: string;
+    title?: string;
+    rows?: number;
+    columns?: number;
+  }[] = [];
+  const written = new Map<string, string>();
+  // Copies the shell made: where each one is, and which file it is a copy of.
+  const copies = new Map<string, string>();
+  // Every copy ever made, kept after its removal for a test to trace.
+  const everCopied = new Map<string, string>();
+  // The names a copy was to go to where something sat already: what sat there.
+  const occupied = new Map<string, "file" | "other">();
+  // How many `sips` are running, and the most that ever ran at once.
+  let running = 0;
+  let peak = 0;
+  const realOf = (name: string) =>
+    files[name] === "link-out"
+      ? `/elsewhere/${name.split("/").pop()}`
+      : name.startsWith("/")
+        ? name
+        : `/work/${name}`;
+  /** The file a path is, itself or as a copy; undefined for any other path. */
+  const nameAt = (path: string) =>
+    copies.get(path) ??
+    Object.keys(files).find((name) => realOf(name) === path);
+  const sizeOf = (name: string) =>
+    files[name] === "heavy" ? 100 * 1024 * 1024 : 10;
+  // How often each file was looked at: a `moved` one changes after the first.
+  const looks = new Map<string, number>();
+
+  mock.env(on, {
+    HOME: "/home/me",
+    TMPDIR: "/tmp/t/",
+    TERM: "xterm-256color",
+    ...env,
+  });
+  on("fs.stat", async (_$, e) => {
+    if (extra.statGate?.path === e.path) await extra.statGate.gate;
+    const directory = {
+      kind: "dir" as const,
+      size: 0,
+      mtimeMs: 7,
+      isLink: false,
+    };
+    if (e.path === "/work" || e.path === "/other")
+      return { value: { ...directory, realPath: e.path } };
+    const sitting = occupied.get(e.path);
+    if (sitting !== undefined) {
+      return {
+        value: {
+          kind: sitting,
+          size: 10,
+          mtimeMs: 9,
+          isLink: false,
+          realPath: e.path,
+        },
+      };
+    }
+    const copied = copies.get(e.path);
+    if (copied !== undefined && copied === extra.stuck?.copyOf)
+      await extra.stuck.gate;
+    if (copied !== undefined) {
+      return {
+        value: {
+          kind: "file" as const,
+          size: files[copied] === "grows" ? 100 * 1024 * 1024 : sizeOf(copied),
+          mtimeMs: 9,
+          isLink: false,
+          realPath: e.path,
+        },
+      };
+    }
+    // The engine resolves a relative path under its working directory first.
+    const name = Object.keys(files).find(
+      (key) =>
+        e.path === key ||
+        e.path === realOf(key) ||
+        (!key.startsWith("/") && e.path.endsWith(`/${key}`)),
+    );
+    if (name === undefined) return { deny: "no such file" };
+    const kind = files[name];
+    if (kind === "dir")
+      return { value: { ...directory, realPath: realOf(name) } };
+    const seen = looks.get(name) ?? 0;
+    looks.set(name, seen + 1);
+
+    return {
+      value: {
+        kind:
+          kind === "piped" && seen > 0 ? ("other" as const) : ("file" as const),
+        size: sizeOf(name),
+        mtimeMs: extra.mtimes?.[name] ?? (kind === "moved" && seen > 0 ? 8 : 7),
+        isLink: kind === "link-out",
+        realPath: realOf(name),
+      },
+    };
+  });
+  on("process.run", async (_$, e) => {
+    runs.push([...e.argv]);
+    timeouts.push(e.init?.timeoutMs);
+    const tool = e.argv[0];
+    if (tool !== "sips" && tool !== "rm" && !isCopy(e.argv))
+      return { deny: "not installed" };
+    const done = (stdout = "", exitCode = 0) => ({
+      value: {
+        exitCode,
+        stdout,
+        stderr: "",
+        isStdoutTruncated: false,
+        isStderrTruncated: false,
+      },
+    });
+    if (isCopy(e.argv)) {
+      // Exit 3 where the name is taken, with what is there left as it was.
+      if (extra.isSquatted === true) {
+        occupied.set(e.argv[5]!, "file");
+
+        return done("", 3);
+      }
+      // A pipe there is opened and written into: the shell has nothing to say.
+      if (extra.isPipeAtCopy === true) {
+        occupied.set(e.argv[5]!, "other");
+
+        return done();
+      }
+      const name = nameAt(e.argv[4]!);
+      if (name !== undefined) {
+        copies.set(e.argv[5]!, name);
+        everCopied.set(e.argv[5]!, name);
+      }
+
+      return done(
+        "",
+        name !== undefined && files[name] === "uncopyable" ? 4 : 0,
+      );
+    }
+    if (tool === "rm") {
+      if (extra.rm?.isFailing === true) return done("", 1);
+      for (const path of e.argv.slice(1)) copies.delete(path);
+
+      return done();
+    }
+
+    running++;
+    peak = Math.max(peak, running);
+    try {
+      const source = e.argv.map(nameAt).find((name) => name !== undefined);
+      const kind = source === undefined ? undefined : files[source];
+      const isPicture = kind !== undefined && kind !== "text" && kind !== "dir";
+      if (e.argv[1] === "-g") {
+        const suffix = source?.split(".").pop() ?? "";
+        const format =
+          kind === "pdf" || kind === "jpeg"
+            ? kind
+            : (FORMATS[suffix] ?? suffix);
+        const side =
+          kind === "huge"
+            ? [40000, 40000]
+            : kind === "large"
+              ? [8000, 6250]
+              : [200, 100];
+
+        return done(
+          `${source}\n  format: ${format}\n` +
+            `  pixelWidth: ${isPicture ? side[0] : "<nil>"}\n` +
+            `  pixelHeight: ${isPicture ? side[1] : "<nil>"}\n`,
+        );
+      }
+      if (e.argv[1] === "-s")
+        await (typeof barrier === "function" ? barrier() : barrier);
+      if (e.argv[1] === "-s" && isPicture) {
+        const z = e.argv.indexOf("-z");
+        const out = e.argv[e.argv.indexOf("--out") + 1]!;
+        written.set(
+          out,
+          e.argv[3] === "png"
+            ? "png"
+            : bmp(
+                Number(e.argv[z + 2]) + (kind === "misconverted" ? 2 : 0),
+                Number(e.argv[z + 1]),
+              ),
+        );
+      }
+
+      return done();
+    } finally {
+      running--;
+    }
+  });
+  on("fs.exists", async (_$, e) => {
+    if (e.path.endsWith(".png")) await extra.pngGate;
+
+    return { value: isWriting && written.has(e.path) };
+  });
+  on("session.start", (_$, e) => ({ cwd: e.cwd }));
+  on("session.end", (_$, e) => ({ sessionId: e.sessionId }));
+  on("command.register", (_$, e) => ({ value: { command: e.name } }));
+  on("fs.read", async (_$, e) => {
+    await extra.readGate;
+
+    return { value: { base64: written.get(e.path) ?? "" } };
+  });
+  // The engine's own drawing of a reply, which the mod wraps.
+  on("ui.render", { component: "AssistantMessage" }, ($, e) => {
+    const { Text } = $.ui.resolve(e);
+
+    return h(Text, {}, "ENGINE ROW") as RenderElement;
+  });
+  // Whether the pane is up: opened, and not closed by the test since.
+  const pane = { isUp: false };
+  on("ui.open", (_$, e) => {
+    opened.push(e);
+    pane.isUp = true;
+
+    return { value: { isPlaced: true as const } };
+  });
+  on("ui.panes", () => ({
+    value: pane.isUp
+      ? [
+          {
+            id: "imgview",
+            title: "imgview",
+            isShown: true,
+            isFocused: false,
+            isPlaced: true,
+          },
+        ]
+      : [],
+  }));
+
+  return {
+    /** The person closes the pane. */
+    close: () => {
+      pane.isUp = false;
+    },
+    clock,
+    runs,
+    timeouts,
+    opened,
+    /** The most `sips` that ran at once. */
+    peak: () => peak,
+    /** The file a run's path names, a copy traced back to what it copies. */
+    origin: (path: string | undefined) => {
+      const name =
+        path === undefined ? undefined : (everCopied.get(path) ?? nameAt(path));
+
+      return name === undefined ? path : realOf(name);
+    },
+  };
+}
+
+async function start($: Engine) {
+  await $.session.start({
+    cwd: "/work",
+    surface: "terminal",
+    isInteractive: true,
+  });
+}
+
+function img($: Engine, args: string) {
+  return $.command.run({
+    command: "img",
+    args,
+    origin: { kind: "composer" },
+    presentation: { isFullscreen: true, columns: 160 },
+  });
+}
+
+function pane($: Engine, bodyColumns: number, bodyRows: number) {
+  return $.ui.mount({
+    plugin: "imgview",
+    surface: "terminal",
+    component: "Pane",
+    requestId: "imgview",
+    props: {
+      title: "imgview",
+      isFocused: false,
+      bodyColumns,
+      placement: "dock",
+      scroll: { offset: 0, bodyRows },
+      view: {},
+    },
+    viewport: { columns: 160, rows: 50, isFullscreen: true },
+  });
+}
+
+test("says how to use it when given no path and nothing is shown", async ($, on) => {
+  const { opened, runs } = world(on, {});
+  await start($);
+
+  expect((await img($, "")).text).toBe(
+    "Usage: /img [--cells|--pixels] <image path>",
+  );
+  expect(opened).toHaveLength(0);
+  expect(runs).toHaveLength(0);
+});
+
+test("draws a picture as half-block cells on a terminal without graphics", async ($, on) => {
+  const { opened, runs } = world(
+    on,
+    { "shot.png": "image" },
+    { TERM_PROGRAM: "iTerm.app" },
+  );
+  await start($);
+
+  expect((await img($, "shot.png")).text).toBe("shot.png · 200×100 · cells");
+  expect(opened).toHaveLength(1);
+  expect(opened[0]).toMatchObject({ id: "imgview", title: "shot.png" });
+
+  const ui = await pane($, 40, 21);
+  const raster = await ui.find({ type: "Raster" });
+  // 200x100 in 40 columns: 40 cells by 10, each two pixels wide and tall.
+  expect(raster?.props).toMatchObject({ columns: 40, rows: 10 });
+  expect(String(raster?.props.cells)).toHaveLength(40 * 10 * 12 * (4 / 3));
+  expect(
+    await ui.find({ type: "Text", text: "shot.png · 200×100" }),
+  ).toBeDefined();
+  expect(await ui.find({ type: "Image" })).toBeUndefined();
+
+  const convert = runs.find((argv) => argv[1] === "-s");
+  expect(convert?.slice(0, 8)).toEqual([
+    "sips",
+    "-s",
+    "format",
+    "bmp",
+    "-z",
+    "20",
+    "80",
+    "/work/shot.png",
+  ]);
+  expect(convert?.[9]).toMatch(/^\/tmp\/t\/claude-imgview-[0-9a-f-]{36}\.bmp$/);
+  // The converted file is read once and removed.
+  expect(runs).toContainEqual(["rm", "-f", convert![9]!]);
+});
+
+test("converts once for a size and again when the pane's size changes", async ($, on) => {
+  const { runs } = world(on, { "shot.png": "image" });
+  await start($);
+  await img($, "shot.png");
+  const conversions = () => runs.filter((argv) => argv[1] === "-s").length;
+
+  await (await pane($, 40, 21)).unmount();
+  await (await pane($, 40, 21)).unmount();
+  expect(conversions()).toBe(1);
+
+  const ui = await pane($, 80, 11);
+  expect((await ui.find({ type: "Raster" }))?.props).toMatchObject({
+    columns: 40,
+    rows: 10,
+  });
+  expect(conversions()).toBe(1);
+  await ui.unmount();
+
+  const narrow = await pane($, 20, 11);
+  expect((await narrow.find({ type: "Raster" }))?.props).toMatchObject({
+    columns: 20,
+    rows: 5,
+  });
+  expect(conversions()).toBe(2);
+});
+
+test("hands a PNG to a terminal that draws pixels, by its absolute path", async ($, on) => {
+  const { runs } = world(on, { "shot.png": "image" }, { TERM: "xterm-kitty" });
+  await start($);
+
+  expect((await img($, "shot.png")).text).toBe("shot.png · 200×100 · pixels");
+  const ui = await pane($, 40, 21);
+  const image = await ui.find({ type: "Image" });
+  expect(image?.props).toMatchObject({
+    columns: 40,
+    rows: 10,
+    source: { file: "/work/shot.png", format: "png", generation: 7 },
+  });
+  expect(await ui.find({ type: "Raster" })).toBeUndefined();
+  expect(runs.filter((argv) => argv[1] === "-s")).toHaveLength(0);
+});
+
+test("converts a picture that is not a PNG before a pixel terminal reads it", async ($, on) => {
+  const { runs } = world(
+    on,
+    { "/photos/cat.jpg": "image" },
+    { TERM_PROGRAM: "ghostty" },
+  );
+  await start($);
+  await img($, "/photos/cat.jpg");
+
+  const ui = await pane($, 40, 21);
+  const source = (await ui.find({ type: "Image" }))?.props.source as {
+    file: string;
+  };
+  expect(source.file).toMatch(/^\/tmp\/t\/claude-imgview-[0-9a-f-]{36}\.png$/);
+  expect(runs).toContainEqual([
+    "sips",
+    "-s",
+    "format",
+    "png",
+    "/photos/cat.jpg",
+    "--out",
+    source.file,
+  ]);
+});
+
+test("draws cells under tmux, which passes no pixels through", async ($, on) => {
+  world(
+    on,
+    { "shot.png": "image" },
+    { TERM: "xterm-kitty", TMUX: "/tmp/tmux-501/default,1,0" },
+  );
+  await start($);
+
+  expect((await img($, "shot.png")).text).toBe("shot.png · 200×100 · cells");
+});
+
+test("takes the mode a flag names over the terminal's, and re-draws the shown picture with it", async ($, on) => {
+  world(on, { "shot.png": "image" }, { TERM: "xterm-kitty" });
+  await start($);
+
+  expect((await img($, "--cells shot.png")).text).toBe(
+    "shot.png · 200×100 · cells",
+  );
+  const ui = await pane($, 40, 21);
+  expect(await ui.find({ type: "Raster" })).toBeDefined();
+
+  // The open pane follows: the same drawing now holds the Image.
+  expect((await img($, "--pixels")).text).toBe("shot.png · 200×100 · pixels");
+  expect(await ui.find({ type: "Image" })).toBeDefined();
+  expect(await ui.find({ type: "Raster" })).toBeUndefined();
+});
+
+test("finds a path under the home directory, with a mention mark, or with spaces", async ($, on) => {
+  world(on, {
+    "/home/me/a.png": "image",
+    "docs/b.png": "image",
+    "/tmp/my shot.png": "image",
+  });
+  await start($);
+
+  expect((await img($, "~/a.png")).text).toBe("a.png · 200×100 · cells");
+  expect((await img($, "@docs/b.png")).text).toBe("b.png · 200×100 · cells");
+  expect((await img($, "/tmp/my\\ shot.png")).text).toBe(
+    "my shot.png · 200×100 · cells",
+  );
+});
+
+test("names what it could not show, and opens nothing", async ($, on) => {
+  const { opened } = world(on, { "notes.txt": "text", shots: "dir" });
+  await start($);
+
+  expect((await img($, "gone.png")).text).toBe("img: no such file: gone.png");
+  expect((await img($, "shots")).text).toBe("img: not a file: shots");
+  expect((await img($, "notes.txt")).text).toBe(
+    "img: not an image sips or ImageMagick can read: notes.txt",
+  );
+  expect(opened).toHaveLength(0);
+});
+
+test("says why in the pane when no converter can paint the picture", async ($, on) => {
+  const { runs } = world(on, { "shot.png": "image" }, {}, false);
+  await start($);
+  await img($, "shot.png");
+
+  const ui = await pane($, 40, 21);
+  expect(await ui.find({ type: "Raster" })).toBeUndefined();
+  expect(
+    await ui.find({
+      type: "Text",
+      text: /neither sips nor ImageMagick could convert it/,
+    }),
+  ).toBeDefined();
+  expect(
+    runs.some((argv) => argv[0] === "magick" && argv.includes("80x20!")),
+  ).toBe(true);
+});
+
+test("tells a surface that is not a terminal that it draws there only", async ($, on) => {
+  world(on, { "shot.png": "image" });
+  await start($);
+  await img($, "shot.png");
+
+  const ui = await $.ui.mount({
+    plugin: "imgview",
+    surface: "desktop",
+    component: "Pane",
+    requestId: "imgview",
+    props: {
+      title: "imgview",
+      isFocused: false,
+      bodyColumns: 40,
+      placement: "dock",
+      scroll: { offset: 0, bodyRows: 21 },
+      view: {},
+    },
+  });
+  expect(await ui.find({ type: "Text", text: /terminal only/ })).toBeDefined();
+});
+
+function reply(
+  $: Engine,
+  text: string,
+  where: {
+    columns?: number;
+    isFullscreen?: boolean;
+    isOffScreen?: boolean;
+    // The surface says nothing of what is on screen.
+    isUnreported?: boolean;
+    id?: string;
+  } = {},
+) {
+  return $.ui.mount({
+    plugin: "imgview",
+    surface: "terminal",
+    component: "AssistantMessage",
+    requestId: where.id ?? "reply-1",
+    props: {
+      text,
+      isFirstOfReply: true,
+      ...(where.isUnreported
+        ? {}
+        : {
+            onScreen: where.isOffScreen ? null : { first: 0, last: 1, of: 2 },
+          }),
+    },
+    viewport: {
+      columns: where.columns ?? 120,
+      rows: 50,
+      isFullscreen: where.isFullscreen ?? true,
+    },
+  });
+}
+
+type Node = {
+  type?: string;
+  props?: Record<string, unknown>;
+  hover?: unknown;
+  children?: unknown;
+};
+
+/**
+ * The hidden boxes of a drawing, the cards a hover reveals: each one's props
+ * with the `hover` the tree carries beside them.
+ */
+async function cards(ui: Awaited<ReturnType<typeof reply>>) {
+  const found: Record<string, unknown>[] = [];
+  const walk = (node: unknown) => {
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (typeof node !== "object" || node === null) return;
+    const { props, hover, children } = node as Node;
+    if (props?.display === "none") found.push({ ...props, hover });
+    walk(children);
+  };
+  walk(await ui.drawn());
+
+  return found;
+}
+
+test("draws a chip under a reply that names an image file, with its picture in a hidden card", async ($, on) => {
+  const { runs, origin } = world(on, {
+    "shot.png": "image",
+    "notes.txt": "text",
+  });
+  await start($);
+
+  const ui = await reply(
+    $,
+    "Saved the chart to `shot.png`; notes in notes.txt.",
+  );
+  expect(await ui.find({ type: "Text", text: "ENGINE ROW" })).toBeDefined();
+  const chips = await ui.findAll({ type: "Button" });
+  expect(chips.map((chip) => chip.props.label)).toEqual(["▣ shot.png"]);
+
+  // 200x100 in a card of at most 80 by 24 cells: 80 by 20.
+  expect((await ui.find({ type: "Raster" }))?.props).toMatchObject({
+    columns: 80,
+    rows: 20,
+  });
+  const convert = runs.find((argv) => argv[1] === "-s");
+  expect(convert?.slice(4, 7)).toEqual(["-z", "40", "160"]);
+  expect(origin(convert?.[7])).toBe("/work/shot.png");
+
+  // The card sits over the rows above the chip, shown by the hover alone.
+  const [card, ...others] = await cards(ui);
+  expect(others).toHaveLength(0);
+  expect(card).toMatchObject({
+    position: "absolute",
+    top: -23,
+    left: 0,
+    hover: { display: "flex" },
+  });
+  expect(
+    await ui.find({ type: "Text", text: /^shot\.png · 200×100 +$/ }),
+  ).toBeDefined();
+});
+
+test("leaves a reply as the engine drew it when it names no image that exists", async ($, on) => {
+  const { runs } = world(on, { "fake.png": "text" });
+  await start($);
+
+  const plain = await reply($, "Nothing to see in main.ts or gone.png.");
+  expect(await plain.drawn()).toMatchObject({ type: "Text" });
+  expect(runs).toHaveLength(0);
+  await plain.unmount();
+
+  // A file named like a picture that no converter reads loses its chip.
+  const fake = await reply($, "See fake.png.");
+  expect(await fake.findAll({ type: "Button" })).toHaveLength(0);
+  expect(await fake.find({ type: "Text", text: "ENGINE ROW" })).toBeDefined();
+  // sips could not read it, and nothing else is asked.
+  expect(runs.filter((argv) => argv[0] === "magick")).toEqual([]);
+});
+
+test("draws no chip on the main screen, which reports no pointer", async ($, on) => {
+  const { runs } = world(on, { "shot.png": "image" });
+  await start($);
+
+  const ui = await reply($, "Saved shot.png.", { isFullscreen: false });
+  expect(await ui.drawn()).toMatchObject({ type: "Text" });
+  expect(runs).toHaveLength(0);
+});
+
+test("converts nothing for a reply that is off screen", async ($, on) => {
+  const { runs } = world(on, { "shot.png": "image" });
+  await start($);
+
+  const ui = await reply($, "Saved shot.png.", { isOffScreen: true });
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(1);
+  // No card is begun for it, and none is promised.
+  expect(await cards(ui)).toHaveLength(0);
+  expect(runs).toHaveLength(0);
+});
+
+test("opens the pane on the picture when its chip is clicked", async ($, on) => {
+  const { opened } = world(on, { "shot.png": "image" });
+  await start($);
+
+  const ui = await reply($, "Saved shot.png.");
+  await ui.press({ key: "imgview-open-0" });
+  expect(opened).toHaveLength(1);
+  expect(opened[0]).toMatchObject({ id: "imgview", title: "shot.png" });
+
+  const shownPane = await pane($, 40, 21);
+  expect((await shownPane.find({ type: "Raster" }))?.props).toMatchObject({
+    columns: 40,
+    rows: 10,
+  });
+});
+
+test("hands a pixel terminal a small PNG of its own making in the card, never the file the reply named", async ($, on) => {
+  const { runs, origin } = world(
+    on,
+    { "shot.png": "image", "cat.jpg": "image" },
+    { TERM: "xterm-kitty" },
+  );
+  await start($);
+
+  const ui = await reply($, "Compare shot.png with cat.jpg.");
+  const images = await ui.findAll({ type: "Image" });
+  expect(images).toHaveLength(2);
+  expect(await ui.findAll({ type: "Raster" })).toHaveLength(0);
+  for (const image of images) {
+    expect(image.props).toMatchObject({ columns: 80, rows: 20 });
+    const source = image.props.source as { file: string; format: string };
+    expect(source.format).toBe("png");
+    expect(source.file).toMatch(
+      /^\/tmp\/t\/claude-imgview-[0-9a-f-]{36}\.png$/,
+    );
+  }
+
+  // 80 by 20 cells at 10 by 20 pixels a cell, converted from the copy.
+  const conversions = runs.filter((argv) => argv[1] === "-s");
+  expect(conversions.map((argv) => argv.slice(2, 7))).toEqual([
+    ["format", "png", "-z", "400", "800"],
+    ["format", "png", "-z", "400", "800"],
+  ]);
+  expect(conversions.map((argv) => origin(argv[7]))).toEqual([
+    "/work/shot.png",
+    "/work/cat.jpg",
+  ]);
+});
+
+test("draws four chips at most, and keeps every card at the row's left edge", async ($, on) => {
+  world(on, {
+    "a.png": "image",
+    "b.png": "image",
+    "c.png": "image",
+    "d.png": "image",
+    "e.png": "image",
+  });
+  await start($);
+
+  const ui = await reply($, "a.png b.png c.png d.png e.png");
+  const chips = await ui.findAll({ type: "Button" });
+  expect(chips.map((chip) => chip.props.label)).toEqual([
+    "▣ a.png",
+    "▣ b.png",
+    "▣ c.png",
+    "▣ d.png",
+  ]);
+  // Each chip is seven cells and a gap of two past the one before it.
+  expect((await cards(ui)).map((card) => card.left)).toEqual([0, -9, -18, -27]);
+});
+
+test("fits the card to a narrow terminal", async ($, on) => {
+  world(on, { "shot.png": "image" });
+  await start($);
+
+  const ui = await reply($, "Saved shot.png.", { columns: 40 });
+  expect((await ui.find({ type: "Raster" }))?.props).toMatchObject({
+    columns: 28,
+    rows: 7,
+  });
+});
+
+// Codex review, round 1, finding 1.
+test("removes the PNG it converted when another picture replaces it, and never a picture of the person's", async ($, on) => {
+  const { runs } = world(
+    on,
+    {
+      "/home/me/claude-imgview-family.png": "image",
+      "/photos/cat.jpg": "image",
+      "shot.png": "image",
+    },
+    { TERM: "xterm-kitty" },
+  );
+  await start($);
+  const removed = () =>
+    runs.filter((argv) => argv[0] === "rm").map((argv) => argv[2]);
+
+  // Shown as it is: the terminal reads the person's own file.
+  await img($, "/home/me/claude-imgview-family.png");
+  // A JPEG is converted to a temporary PNG first.
+  await img($, "/photos/cat.jpg");
+  expect(removed()).toEqual([]);
+
+  await img($, "shot.png");
+  expect(removed()).toHaveLength(1);
+  expect(removed()[0]).toMatch(/^\/tmp\/t\/claude-imgview-[0-9a-f-]{36}\.png$/);
+});
+
+// Codex review, round 1, finding 2: what a reply names is looked at with no
+// action of the person's, so only a bitmap inside the working directory is.
+test("previews no file outside the working directory, by its path or through a link", async ($, on) => {
+  const { runs } = world(on, {
+    "/etc/outside.png": "image",
+    "/home/me/mine.png": "image",
+    "escape.png": "link-out",
+  });
+  await start($);
+
+  const ui = await reply($, "See /etc/outside.png, ~/mine.png and escape.png.");
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
+  expect(await ui.drawn()).toMatchObject({ type: "Text" });
+  expect(runs).toHaveLength(0);
+});
+
+test("previews bitmaps only: no SVG by its suffix, no PDF by its content", async ($, on) => {
+  const { runs } = world(on, { "logo.svg": "image", "scan.png": "pdf" });
+  await start($);
+
+  const ui = await reply($, "See logo.svg and scan.png.");
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
+  // The SVG is never opened; the PDF is asked its format and no more.
+  expect(runs.filter((argv) => argv.includes("/work/logo.svg"))).toEqual([]);
+  expect(runs.filter((argv) => argv[1] === "-s")).toEqual([]);
+});
+
+test("previews no file too heavy and no picture too large", async ($, on) => {
+  const { runs } = world(on, { "heavy.png": "heavy", "huge.png": "huge" });
+  await start($);
+
+  const ui = await reply($, "See heavy.png and huge.png.");
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
+  expect(runs.filter((argv) => argv.includes("/work/heavy.png"))).toEqual([]);
+  expect(runs.filter((argv) => argv[1] === "-s")).toEqual([]);
+});
+
+test("gives a mentioned file to sips alone, under a short timeout", async ($, on) => {
+  // No converter's output appears: /img would go on to ImageMagick here.
+  const { runs, timeouts } = world(on, { "shot.png": "image" }, {}, false);
+  await start($);
+
+  const ui = await reply($, "Saved shot.png.");
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
+  expect(runs.length).toBeGreaterThan(0);
+  expect(runs.filter((argv) => argv[0] === "magick")).toEqual([]);
+  for (const [index, argv] of runs.entries()) {
+    if (argv[0] === "sips") expect(timeouts[index]).toBeLessThanOrEqual(5000);
+  }
+});
+
+// Codex review, round 1, finding 3.
+test(
+  "settles with more cards on screen than it keeps: none is converted twice",
+  { timeoutMs: 20000 },
+  async ($, on) => {
+    const files: Record<string, Kind> = {};
+    const replies: string[] = [];
+    for (let n = 0; n < 9; n++) {
+      const names = [0, 1, 2, 3].map((k) => `p${n}-${k}.png`);
+      for (const name of names) files[name] = "image";
+      replies.push(names.join(" "));
+    }
+    const { runs, origin } = world(on, files);
+    await start($);
+
+    // 36 pictures on screen at once, four more than are kept.
+    const drawings = [];
+    for (const [n, text] of replies.entries()) {
+      drawings.push(await reply($, text, { id: `reply-${n}` }));
+    }
+    const conversions = runs
+      .filter((argv) => argv[1] === "-s")
+      .map((argv) => origin(argv[7]));
+    expect(new Set(conversions).size).toBe(conversions.length);
+    expect(conversions.length).toBeLessThanOrEqual(32);
+
+    let chips = 0;
+    for (const ui of drawings)
+      chips += (await ui.findAll({ type: "Raster" })).length;
+    expect(chips).toBe(32);
+  },
+);
+
+// Codex review, round 1, findings 6, 7 and 10.
+test("hands the terminal a PNG by its content, not its suffix", async ($, on) => {
+  const { runs } = world(
+    on,
+    { "renamed.png": "jpeg" },
+    { TERM: "xterm-kitty" },
+  );
+  await start($);
+
+  // /img: converted first, as any JPEG is.
+  await img($, "renamed.png");
+  const shownPane = await pane($, 40, 21);
+  const source = (await shownPane.find({ type: "Image" }))?.props.source as {
+    file: string;
+  };
+  expect(source.file).toMatch(/^\/tmp\/t\/claude-imgview-[0-9a-f-]{36}\.png$/);
+  expect(runs).toContainEqual([
+    "sips",
+    "-s",
+    "format",
+    "png",
+    "/work/renamed.png",
+    "--out",
+    source.file,
+  ]);
+
+  // The hover card: a PNG the mod converted, never the file itself.
+  const ui = await reply($, "Saved renamed.png.");
+  const card = (await ui.find({ type: "Image" }))?.props.source as {
+    file: string;
+  };
+  expect(card.file).toMatch(/^\/tmp\/t\/claude-imgview-[0-9a-f-]{36}\.png$/);
+  expect(card.file).not.toBe(source.file);
+});
+
+for (const variable of ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]) {
+  test(`draws cells across ssh (${variable}), where the terminal cannot read this machine's files`, async ($, on) => {
+    world(
+      on,
+      { "shot.png": "image" },
+      { TERM: "xterm-kitty", [variable]: "10.0.0.2 51022 10.0.0.9 22" },
+    );
+    await start($);
+
+    expect((await img($, "shot.png")).text).toBe("shot.png · 200×100 · cells");
+    const ui = await reply($, "Saved shot.png.");
+    expect(await ui.find({ type: "Image" })).toBeUndefined();
+    expect(await ui.findAll({ type: "Raster" })).toHaveLength(1);
+  });
+}
+
+test("refuses a conversion that came back another size than asked", async ($, on) => {
+  world(on, { "odd.png": "misconverted" });
+  await start($);
+  await img($, "odd.png");
+
+  const ui = await pane($, 40, 21);
+  expect(await ui.find({ type: "Raster" })).toBeUndefined();
+  expect(
+    await ui.find({
+      type: "Text",
+      text: /the converter wrote 82x20, not 80x20/,
+    }),
+  ).toBeDefined();
+});
+
+// Codex review, round 1, finding 4.
+test("converts a pane size once however the pane is resized meanwhile, and keeps the size last asked", async ($, on) => {
+  let release = () => {};
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const { runs } = world(on, { "shot.png": "image" }, {}, true, barrier);
+  await start($);
+  await img($, "shot.png");
+  const sizes = () =>
+    runs.filter((argv) => argv[1] === "-s").map((argv) => argv[6]);
+
+  // 40 columns, then 20, then 40 again, each before any conversion ends.
+  for (const columns of [40, 20, 40]) {
+    const ui = await pane($, columns, 21);
+    expect(await ui.find({ type: "Text", text: "Rendering…" })).toBeDefined();
+    await ui.unmount();
+  }
+  expect(sizes()).toEqual(["80"]);
+
+  release();
+  const ui = await pane($, 40, 21);
+  expect((await ui.find({ type: "Raster" }))?.props).toMatchObject({
+    columns: 40,
+    rows: 10,
+  });
+  // The size in between was never the one the pane wanted once it could be
+  // converted.
+  expect(sizes()).toEqual(["80"]);
+});
+
+// Codex review, round 5, finding 5.
+test("converts one pane size at a time, and of the sizes asked for meanwhile only the last", async ($, on) => {
+  let release = () => {};
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const { runs, clock, peak } = world(
+    on,
+    { "shot.png": "image" },
+    {},
+    true,
+    barrier,
+  );
+  await start($);
+  await img($, "shot.png");
+  const sizes = () =>
+    runs.filter((argv) => argv[1] === "-s").map((argv) => argv[6]);
+
+  // 40 columns, then 20, then 30, the first conversion still running.
+  for (const columns of [40, 20, 30])
+    await (await pane($, columns, 21)).unmount();
+  expect(sizes()).toEqual(["80"]);
+
+  // It ends, for a size the pane has left: the one it wants now is next.
+  release();
+  await clock.settle();
+  expect(sizes()).toEqual(["80", "60"]);
+  expect(peak()).toBe(1);
+  const ui = await pane($, 30, 21);
+  expect((await ui.find({ type: "Raster" }))?.props).toMatchObject({
+    columns: 30,
+  });
+  expect(sizes()).toEqual(["80", "60"]);
+});
+
+test("converts nothing again for a size the pane came back to", async ($, on) => {
+  let gate: Promise<void> | undefined;
+  let release = () => {};
+  const { runs, clock } = world(
+    on,
+    { "shot.png": "image" },
+    {},
+    true,
+    () => gate,
+  );
+  await start($);
+  await img($, "shot.png");
+  const sizes = () =>
+    runs.filter((argv) => argv[1] === "-s").map((argv) => argv[6]);
+
+  // 40 columns is converted and drawn.
+  const first = await pane($, 40, 21);
+  expect(await first.find({ type: "Raster" })).toBeDefined();
+  await first.unmount();
+  // 20 columns is being converted when the pane goes back to 40.
+  gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await (await pane($, 20, 21)).unmount();
+  await (await pane($, 40, 21)).unmount();
+  release();
+  await clock.settle();
+  expect(sizes()).toEqual(["80", "40"]);
+});
+
+// Codex review, round 2, finding 1.
+test("converts one mentioned picture at a time", async ($, on) => {
+  let release = () => {};
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const { peak } = world(
+    on,
+    { "a.png": "image", "b.png": "image", "c.png": "image" },
+    {},
+    true,
+    barrier,
+  );
+  await start($);
+
+  // Three cards wanted at once, the first conversion held at the barrier.
+  const ui = await reply($, "a.png b.png c.png");
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(3);
+  expect(peak()).toBe(1);
+
+  release();
+  await ui.unmount();
+  const after = await reply($, "a.png b.png c.png");
+  expect(await after.findAll({ type: "Raster" })).toHaveLength(3);
+  expect(peak()).toBe(1);
+});
+
+test("previews no picture over 40 megapixels", async ($, on) => {
+  const { runs } = world(on, { "large.png": "large" });
+  await start($);
+
+  const ui = await reply($, "See large.png.");
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
+  expect(runs.filter((argv) => argv[1] === "-s")).toEqual([]);
+});
+
+// Codex review, round 2, finding 2.
+test("decodes a copy of a mentioned file, checked again, never the path the reply named", async ($, on) => {
+  const { runs, timeouts } = world(on, { "shot.png": "image" });
+  await start($);
+
+  const ui = await reply($, "Saved shot.png.");
+  expect(await ui.findAll({ type: "Raster" })).toHaveLength(1);
+
+  // The shell's noclobber makes the copy only at a name that was free.
+  const copy = runs.find(isCopy);
+  expect(copy?.slice(0, 5)).toEqual([
+    "/bin/sh",
+    "-c",
+    'set -C; { cat -- "$1" || exit 4; } >"$2" || exit 3',
+    "sh",
+    "/work/shot.png",
+  ]);
+  expect(copy?.[5]).toMatch(/^\/tmp\/t\/claude-imgview-[0-9a-f-]{36}\.snap$/);
+  expect(timeouts[runs.indexOf(copy!)]).toBe(5000);
+  // sips is only ever given the copy, and the copy is removed afterwards.
+  const sips = runs.filter((argv) => argv[0] === "sips");
+  expect(sips.length).toBeGreaterThan(1);
+  for (const argv of sips) {
+    expect(argv).toContain(copy![5]);
+    expect(argv).not.toContain("/work/shot.png");
+  }
+  expect(runs).toContainEqual(["rm", "-f", copy![5]!]);
+});
+
+test("previews no file that grew or was swapped between the look and the copy", async ($, on) => {
+  const { runs } = world(on, { "grows.png": "grows", "moved.png": "moved" });
+  await start($);
+
+  const ui = await reply($, "See grows.png and moved.png.");
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
+  expect(runs.filter(isCopy)).toHaveLength(2);
+  expect(runs.filter((argv) => argv[0] === "sips")).toEqual([]);
+});
+
+// Codex review, round 2, finding 3.
+test("moves the previews' boundary with the working directory", async ($, on) => {
+  world(on, { "a.png": "image", "/other/b.png": "image" });
+  on("classic.CwdChanged", () => ({}));
+  await start($);
+  const labels = async (ui: Awaited<ReturnType<typeof reply>>) =>
+    (await ui.findAll({ type: "Button" })).map((chip) => chip.props.label);
+
+  const before = await reply($, "/work/a.png and /other/b.png");
+  expect(await labels(before)).toEqual(["▣ a.png"]);
+  await before.unmount();
+
+  await $.classic.CwdChanged({ old_cwd: "/work", new_cwd: "/other" });
+  const after = await reply($, "/work/a.png and /other/b.png");
+  expect(await labels(after)).toEqual(["▣ b.png"]);
+  expect(await after.findAll({ type: "Raster" })).toHaveLength(1);
+});
+
+// Codex review, round 2, finding 4.
+test(
+  "gives a picture its card though 32 files that are no pictures are on screen",
+  { timeoutMs: 20000 },
+  async ($, on) => {
+    const files: Record<string, Kind> = { "real.png": "image" };
+    const replies: string[] = [];
+    for (let n = 0; n < 8; n++) {
+      const names = [0, 1, 2, 3].map((k) => `junk${n}-${k}.png`);
+      for (const name of names) files[name] = "text";
+      replies.push(names.join(" "));
+    }
+    world(on, files);
+    await start($);
+
+    for (const [n, text] of replies.entries()) {
+      const ui = await reply($, text, { id: `reply-${n}` });
+      expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
+    }
+    const ui = await reply($, "real.png", { id: "reply-real" });
+    expect(await ui.findAll({ type: "Raster" })).toHaveLength(1);
+  },
+);
+
+// Codex review, round 2, finding 5.
+test("removes the PNG it converted when a chip's picture replaces it in the pane", async ($, on) => {
+  const { runs, opened } = world(
+    on,
+    { "/photos/cat.jpg": "image", "shot.png": "image" },
+    { TERM: "xterm-kitty" },
+  );
+  await start($);
+  await img($, "/photos/cat.jpg");
+  const converted = runs.find((argv) => argv[1] === "-s")!.at(-1)!;
+  expect(converted).toMatch(/\.png$/);
+
+  const ui = await reply($, "Saved shot.png.");
+  await ui.press({ key: "imgview-open-0" });
+  expect(opened).toHaveLength(2);
+  expect(runs).toContainEqual(["rm", "-f", converted]);
+  // The pane now shows the PNG the reply named, as the person's click asked.
+  const shownPane = await pane($, 40, 21);
+  expect((await shownPane.find({ type: "Image" }))?.props.source).toMatchObject(
+    {
+      file: "/work/shot.png",
+    },
+  );
+});
+
+test("drops the cards of the directory it left, and the PNGs it made for them", async ($, on) => {
+  const { runs } = world(on, { "a.png": "image" }, { TERM: "xterm-kitty" });
+  on("classic.CwdChanged", () => ({}));
+  await start($);
+
+  const ui = await reply($, "a.png");
+  const card = (await ui.find({ type: "Image" }))?.props.source as {
+    file: string;
+  };
+  expect(runs).not.toContainEqual(["rm", "-f", card.file]);
+
+  await $.classic.CwdChanged({ old_cwd: "/work", new_cwd: "/other" });
+  expect(runs).toContainEqual(["rm", "-f", card.file]);
+});
+
+// Codex review, round 3, finding 1.
+test(
+  "gives up the cards that scrolled away while they waited, and draws the one on screen next",
+  { timeoutMs: 20000 },
+  async ($, on) => {
+    let release = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const files: Record<string, Kind> = { "new.png": "image" };
+    const olds: string[] = [];
+    for (let n = 0; n < 2; n++) {
+      const names = [0, 1, 2, 3].map((k) => `old${n}-${k}.png`);
+      for (const name of names) files[name] = "image";
+      olds.push(names.join(" "));
+    }
+    const { runs, clock } = world(on, files, {}, true, barrier);
+    await start($);
+
+    // Eight cards asked for: the first is at the barrier, seven wait behind it.
+    for (const [n, text] of olds.entries()) {
+      const ui = await reply($, text, { id: `old-${n}` });
+      await ui.unmount();
+    }
+    // They scroll away: the engine draws each again, as off screen.
+    for (const [n, text] of olds.entries()) {
+      const hidden = await reply($, text, {
+        id: `old-${n}`,
+        isOffScreen: true,
+      });
+      await hidden.unmount();
+    }
+    const ui = await reply($, "new.png", { id: "new" });
+    expect(await ui.find({ type: "Text", text: /^Rendering…/ })).toBeDefined();
+
+    release();
+    await clock.settle();
+    await ui.unmount();
+    const after = await reply($, "new.png", { id: "new" });
+    expect(await after.findAll({ type: "Raster" })).toHaveLength(1);
+    // The one already under way, then the one on screen: none of the seven.
+    expect(runs.filter(isCopy).map((argv) => argv[4])).toEqual([
+      "/work/old0-0.png",
+      "/work/new.png",
+    ]);
+  },
+);
+
+test(
+  "drops the card asked for longest ago once it is off screen, and none a reply on screen is using",
+  { timeoutMs: 20000 },
+  async ($, on) => {
+    const files: Record<string, Kind> = { "extra.png": "image" };
+    const replies: string[] = [];
+    for (let n = 0; n < 8; n++) {
+      const names = [0, 1, 2, 3].map((k) => `p${n}-${k}.png`);
+      for (const name of names) files[name] = "image";
+      replies.push(names.join(" "));
+    }
+    const { runs, origin } = world(on, files, { TERM: "xterm-kitty" });
+    await start($);
+    const images = async (text: string, id: string, isOffScreen = false) => {
+      const ui = await reply($, text, { id, isOffScreen });
+      const count = (await ui.findAll({ type: "Image" })).length;
+      await ui.unmount();
+
+      return count;
+    };
+    /** The pictures whose card was dropped: the PNG made for it was removed. */
+    const dropped = () => {
+      const pictures = new Map(
+        runs
+          .filter((argv) => argv[1] === "-s" && argv[3] === "png")
+          .map((argv) => [argv.at(-1)!, origin(argv[7])]),
+      );
+
+      return runs
+        .filter((argv) => argv[0] === "rm")
+        .flatMap((argv) => argv.slice(2))
+        .filter((path) => pictures.has(path))
+        .map((path) => pictures.get(path));
+    };
+
+    // 32 cards drawn, every reply on screen; the first reply's are the oldest.
+    for (const [n, text] of replies.entries())
+      expect(await images(text, `reply-${n}`)).toBe(4);
+    // All in use: nothing gives way to a 33rd.
+    expect(await images("extra.png", "extra")).toBe(0);
+    expect(dropped()).toEqual([]);
+
+    // Replies 1 and 0 scroll away, the later one first: no card is drawn off
+    // screen, and none is dropped for leaving it.
+    expect(await images(replies[1]!, "reply-1", true)).toBe(0);
+    expect(await images(replies[0]!, "reply-0", true)).toBe(0);
+    expect(dropped()).toEqual([]);
+    // One card gives way, and it is the first reply's: asked for longest ago.
+    await images("extra.png", "extra");
+    expect(await images("extra.png", "extra")).toBe(1);
+    expect(dropped()).toEqual(["/work/p0-0.png"]);
+    // The others are as they were: back on screen, they are drawn at once.
+    expect(await images(replies[1]!, "reply-1")).toBe(4);
+    expect(await images(replies[7]!, "reply-7")).toBe(4);
+    expect(dropped()).toEqual(["/work/p0-0.png"]);
+  },
+);
+
+// Codex review, round 3, finding 2.
+test("starts nothing for a reply drawn while a new working directory is being resolved", async ($, on) => {
+  let open = () => {};
+  const gate = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  const { clock } = world(
+    on,
+    { sub: "dir", "sub/a.png": "image" },
+    {},
+    true,
+    undefined,
+    { statGate: { path: "/work/sub", gate } },
+  );
+  on("classic.CwdChanged", () => ({}));
+  await start($);
+
+  const before = await reply($, "/work/sub/a.png");
+  expect(await before.findAll({ type: "Raster" })).toHaveLength(1);
+  await before.unmount();
+
+  const changing = $.classic.CwdChanged({
+    old_cwd: "/work",
+    new_cwd: "/work/sub",
+  });
+  await clock.settle();
+  // Drawn again before the new directory is known: no chip, nothing begun.
+  const during = await reply($, "/work/sub/a.png");
+  expect(await during.findAll({ type: "Button" })).toHaveLength(0);
+  await during.unmount();
+
+  open();
+  await changing;
+  const after = await reply($, "/work/sub/a.png");
+  expect(await after.findAll({ type: "Raster" })).toHaveLength(1);
+});
+
+test("keeps the working directory changed to last, whichever is resolved last", async ($, on) => {
+  let open = () => {};
+  const gate = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  const { clock } = world(
+    on,
+    { sub: "dir", "sub/a.png": "image", "/other/b.png": "image" },
+    {},
+    true,
+    undefined,
+    { statGate: { path: "/work/sub", gate } },
+  );
+  on("classic.CwdChanged", () => ({}));
+  await start($);
+
+  const first = $.classic.CwdChanged({
+    old_cwd: "/work",
+    new_cwd: "/work/sub",
+  });
+  await clock.settle();
+  await $.classic.CwdChanged({ old_cwd: "/work/sub", new_cwd: "/other" });
+  // The first change's directory is resolved only now, after the second's.
+  open();
+  await first;
+
+  const ui = await reply($, "/work/sub/a.png and /other/b.png");
+  expect(
+    (await ui.findAll({ type: "Button" })).map((chip) => chip.props.label),
+  ).toEqual(["▣ b.png"]);
+});
+
+// Codex review, round 3, finding 3.
+test("opens a clicked chip's file as it is now, not as it was when the card was drawn", async ($, on) => {
+  const files: Record<string, Kind> = { "shot.png": "image" };
+  const { runs } = world(on, files, { TERM: "xterm-kitty" });
+  await start($);
+  const ui = await reply($, "Saved shot.png.");
+  expect(await ui.findAll({ type: "Image" })).toHaveLength(1);
+
+  // Rebuilt as a JPEG under the same name before the click.
+  files["shot.png"] = "jpeg";
+  await ui.press({ key: "imgview-open-0" });
+
+  const shownPane = await pane($, 40, 21);
+  const source = (await shownPane.find({ type: "Image" }))?.props.source as {
+    file: string;
+  };
+  expect(source.file).toMatch(/^\/tmp\/t\/claude-imgview-[0-9a-f-]{36}\.png$/);
+  expect(runs).toContainEqual([
+    "sips",
+    "-s",
+    "format",
+    "png",
+    "/work/shot.png",
+    "--out",
+    source.file,
+  ]);
+});
+
+// Codex review, round 3, finding 4.
+test("removes every PNG it converted but the one shown, when two chips are clicked at once", async ($, on) => {
+  let release = () => {};
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const { runs, clock } = world(
+    on,
+    { "a.jpg": "image", "b.jpg": "image" },
+    { TERM: "xterm-kitty" },
+    true,
+    barrier,
+  );
+  await start($);
+  const ui = await reply($, "a.jpg b.jpg");
+
+  // Both clicks land before either conversion ends.
+  const presses = Promise.all([
+    ui.press({ key: "imgview-open-0" }),
+    ui.press({ key: "imgview-open-1" }),
+  ]);
+  await clock.settle();
+  release();
+  await presses;
+
+  // The pane's own conversions are the ones with no size: a card's has one.
+  const made = runs
+    .filter((argv) => argv[3] === "png" && !argv.includes("-z"))
+    .map((argv) => argv.at(-1)!);
+  expect(made).toHaveLength(2);
+  const shownPane = await pane($, 40, 21);
+  const source = (await shownPane.find({ type: "Image" }))?.props.source as {
+    file: string;
+  };
+  expect(made).toContain(source.file);
+  const removed = runs
+    .filter((argv) => argv[0] === "rm")
+    .map((argv) => argv[2]);
+  for (const png of made) {
+    if (png !== source.file) expect(removed).toContain(png);
+  }
+  expect(removed).not.toContain(source.file);
+});
+
+// Codex review, round 3, finding 5.
+test("decodes no copy that was not made whole, or of a file turned pipe, and removes what was left", async ($, on) => {
+  const { runs } = world(on, { "odd.png": "uncopyable", "pipe.png": "piped" });
+  await start($);
+
+  const ui = await reply($, "odd.png and pipe.png");
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
+  const copies = runs.filter(isCopy);
+  expect(copies).toHaveLength(2);
+  expect(runs.filter((argv) => argv[0] === "sips")).toEqual([]);
+  for (const copy of copies)
+    expect(runs).toContainEqual(["rm", "-f", copy[5]!]);
+});
+
+test("names its temporary files so that no two can be guessed or collide", async ($, on) => {
+  const { runs } = world(on, { "a.png": "image", "b.png": "image" });
+  await start($);
+  await reply($, "a.png b.png");
+
+  const copies = runs.filter(isCopy).map((argv) => argv[5]!);
+  expect(copies).toHaveLength(2);
+  expect(new Set(copies).size).toBe(2);
+  for (const copy of copies)
+    expect(copy).toMatch(
+      /^\/tmp\/t\/claude-imgview-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.snap$/,
+    );
+});
+
+// Codex review, round 4, finding 6: both wait from the same drawing, at the
+// same instant.
+test("converts the waiting card asked for last first", async ($, on) => {
+  let release = () => {};
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const { runs, clock } = world(
+    on,
+    { "x.png": "image", "y.png": "image", "z.png": "image" },
+    {},
+    true,
+    barrier,
+  );
+  await start($);
+
+  // x is at the barrier; one reply asks for y and then z behind it.
+  await reply($, "x.png", { id: "x" });
+  await reply($, "y.png z.png", { id: "yz" });
+
+  release();
+  await clock.settle();
+  expect(runs.filter(isCopy).map((argv) => argv[4])).toEqual([
+    "/work/x.png",
+    "/work/z.png",
+    "/work/y.png",
+  ]);
+});
+
+test("converts none of the cards still waiting when the working directory changes", async ($, on) => {
+  let release = () => {};
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const { runs, clock } = world(
+    on,
+    { "a.png": "image", "b.png": "image" },
+    {},
+    true,
+    barrier,
+  );
+  on("classic.CwdChanged", () => ({}));
+  await start($);
+
+  // a is at the barrier, b waits behind it.
+  await reply($, "a.png b.png");
+  await $.classic.CwdChanged({ old_cwd: "/work", new_cwd: "/other" });
+  release();
+  await clock.settle();
+  expect(runs.filter(isCopy).map((argv) => argv[4])).toEqual(["/work/a.png"]);
+});
+
+// Codex review, round 4, finding 1.
+test(
+  "keeps the turn of a card whose reply stays on screen, however long ago it was drawn",
+  { timeoutMs: 20000 },
+  async ($, on) => {
+    let release = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { runs, clock } = world(
+      on,
+      { "a.png": "image", "b.png": "image", "c.png": "image" },
+      {},
+      true,
+      barrier,
+    );
+    await start($);
+
+    // a is at the barrier and b waits; neither reply is drawn again.
+    await reply($, "a.png", { id: "a" });
+    await reply($, "b.png", { id: "b" });
+    // Twenty seconds on another reply asks for a card: b still has its turn.
+    await clock.advance(20000);
+    await reply($, "c.png", { id: "c" });
+
+    release();
+    await clock.settle();
+    expect(runs.filter(isCopy).map((argv) => argv[4])).toEqual([
+      "/work/a.png",
+      "/work/c.png",
+      "/work/b.png",
+    ]);
+  },
+);
+
+test("makes no card where the terminal does not say what is on screen", async ($, on) => {
+  const { runs } = world(on, { "shot.png": "image" });
+  await start($);
+
+  const ui = await reply($, "Saved shot.png.", { isUnreported: true });
+  // The chip is there to click; no card is begun, and none is promised.
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(1);
+  expect(await cards(ui)).toHaveLength(0);
+  expect(runs).toHaveLength(0);
+
+  // Nor is the card drawn there that a reply on screen has had made.
+  const shown = await reply($, "Saved shot.png.", { id: "reply-2" });
+  expect(await shown.findAll({ type: "Raster" })).toHaveLength(1);
+  const silent = await reply($, "Saved shot.png.", {
+    id: "reply-3",
+    isUnreported: true,
+  });
+  expect(await silent.findAll({ type: "Button" })).toHaveLength(1);
+  expect(await cards(silent)).toHaveLength(0);
+  expect(await silent.findAll({ type: "Raster" })).toHaveLength(0);
+});
+
+// Codex review, round 4, finding 2.
+test(
+  "gives up a preview that never answers, draws the one behind it, and runs nothing more for the one given up",
+  { timeoutMs: 20000 },
+  async ($, on) => {
+    let open = () => {};
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const { runs, clock, origin, peak } = world(
+      on,
+      { "hang.png": "image", "ok.png": "image" },
+      {},
+      true,
+      undefined,
+      { stuck: { copyOf: "hang.png", gate } },
+    );
+    await start($);
+
+    // The look at hang.png's copy does not answer; ok.png waits behind it.
+    const hung = await reply($, "hang.png", { id: "hang" });
+    const waiting = await reply($, "ok.png", { id: "ok" });
+    await clock.advance(29000);
+    expect(runs.filter(isCopy)).toHaveLength(1);
+
+    await clock.advance(1000);
+    expect(await waiting.findAll({ type: "Raster" })).toHaveLength(1);
+    expect(await hung.findAll({ type: "Button" })).toHaveLength(0);
+
+    // The look answers at last: nothing is converted for it, side by side
+    // with another or alone, and its copy is removed.
+    open();
+    await clock.settle();
+    const converted = runs
+      .filter((argv) => argv[0] === "sips")
+      .map((argv) => origin(argv.find((part) => part.endsWith(".snap"))));
+    expect(converted).not.toContain("/work/hang.png");
+    expect(converted).toContain("/work/ok.png");
+    expect(peak()).toBe(1);
+    const copy = runs.filter(isCopy)[0]![5]!;
+    expect(runs).toContainEqual(["rm", "-f", copy]);
+  },
+);
+
+// Codex review, round 4, finding 3.
+test("leaves a name that is already taken as it is: nothing read from it, nothing removed", async ($, on) => {
+  const { runs, clock } = world(
+    on,
+    { "shot.png": "image" },
+    {},
+    true,
+    undefined,
+    {
+      isSquatted: true,
+    },
+  );
+  await start($);
+
+  const ui = await reply($, "Saved shot.png.");
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
+  expect(runs.filter(isCopy)).toHaveLength(1);
+  expect(runs.filter((argv) => argv[0] !== "/bin/sh")).toEqual([]);
+  // Not when the module is loaded again either: the name was never the mod's.
+  await clock.advance(1000);
+  await start($);
+  expect(runs.filter((argv) => argv[0] !== "/bin/sh")).toEqual([]);
+});
+
+// Codex review, round 4, finding 4.
+test("takes the old directory's cards off the screen at once, before the new one is known", async ($, on) => {
+  let open = () => {};
+  const gate = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  const { clock } = world(
+    on,
+    { sub: "dir", "sub/a.png": "image" },
+    {},
+    true,
+    undefined,
+    { statGate: { path: "/work/sub", gate } },
+  );
+  on("classic.CwdChanged", () => ({}));
+  await start($);
+
+  // The reply stays where it is, drawn with its card.
+  const ui = await reply($, "/work/sub/a.png");
+  expect(await ui.findAll({ type: "Raster" })).toHaveLength(1);
+
+  const changing = $.classic.CwdChanged({
+    old_cwd: "/work",
+    new_cwd: "/work/sub",
+  });
+  await clock.settle();
+  // The new directory is not known yet: the chip and its card are gone.
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
+  expect(await ui.findAll({ type: "Raster" })).toHaveLength(0);
+
+  open();
+  await changing;
+  await clock.settle();
+  expect(await ui.findAll({ type: "Raster" })).toHaveLength(1);
+});
+
+// Codex review, round 4, finding 5.
+test("removes the files a module loaded before left behind, and keeps the PNG the pane shows", async ($, on) => {
+  const { runs, clock } = world(
+    on,
+    { "/photos/cat.jpg": "image", "a.png": "image" },
+    { TERM: "xterm-kitty" },
+  );
+  await start($);
+  await img($, "/photos/cat.jpg");
+  const shownPng = runs.find((argv) => argv[1] === "-s")!.at(-1)!;
+  const ui = await reply($, "a.png");
+  const card = (await ui.find({ type: "Image" }))?.props.source as {
+    file: string;
+  };
+  const removed = () =>
+    runs.filter((argv) => argv[0] === "rm").flatMap((argv) => argv.slice(2));
+  expect(removed()).not.toContain(card.file);
+  await ui.unmount();
+
+  // The module is loaded again: the session starts for it once more, with
+  // the record of its files, written a moment behind them, to go by.
+  await clock.advance(1000);
+  await start($);
+  expect(removed()).toContain(card.file);
+  expect(removed()).not.toContain(shownPng);
+  // It keeps no card of the one before: the reply gets a file of its own.
+  const again = await reply($, "a.png");
+  const anew = (await again.find({ type: "Image" }))?.props.source as {
+    file: string;
+  };
+  expect(anew.file).not.toBe(card.file);
+  // The pane still shows its picture, from the PNG that was kept.
+  const shownPane = await pane($, 40, 21);
+  expect((await shownPane.find({ type: "Image" }))?.props.source).toMatchObject(
+    { file: shownPng },
+  );
+});
+
+test("removes its cards' files when the session ends, and draws them anew after", async ($, on) => {
+  const { runs } = world(on, { "a.png": "image" }, { TERM: "xterm-kitty" });
+  await start($);
+  const ui = await reply($, "a.png");
+  const card = (await ui.find({ type: "Image" }))?.props.source as {
+    file: string;
+  };
+  await ui.unmount();
+
+  await $.session.end({
+    reason: "clear",
+    sessionId: "s-1",
+    resume: { id: "s-1" },
+  });
+  expect(
+    runs.filter((argv) => argv[0] === "rm").flatMap((argv) => argv.slice(2)),
+  ).toContain(card.file);
+
+  // A reply of the next conversation gets a card of its own, not that file.
+  const after = await reply($, "a.png");
+  const next = (await after.find({ type: "Image" }))?.props.source as {
+    file: string;
+  };
+  expect(next.file).not.toBe(card.file);
+});
+
+test("writes down only the files it has not removed: nothing is removed twice", async ($, on) => {
+  const { runs, clock } = world(on, { "a.png": "image", "fake.png": "text" });
+  await start($);
+  const ui = await reply($, "a.png and fake.png");
+  expect(await ui.findAll({ type: "Raster" })).toHaveLength(1);
+  await ui.unmount();
+
+  // Each copy and each bitmap written was removed as it was done with.
+  const before = runs.filter((argv) => argv[0] === "rm").length;
+  expect(before).toBeGreaterThan(0);
+  await clock.advance(1000);
+  await start($);
+  expect(runs.filter((argv) => argv[0] === "rm")).toHaveLength(before);
+});
+
+test("writes down no path where nothing was written", async ($, on) => {
+  // No converter's output ever appears: each name picked stays unused.
+  const { runs, clock } = world(
+    on,
+    { "/photos/cat.jpg": "image", "a.png": "image" },
+    { TERM: "xterm-kitty" },
+    false,
+  );
+  await start($);
+  expect((await img($, "/photos/cat.jpg")).text).toMatch(/could not convert/);
+  const ui = await reply($, "a.png");
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
+  await ui.unmount();
+
+  // Only the copy was made, and removed: three names were picked for nothing.
+  const removals = () => runs.filter((argv) => argv[0] === "rm");
+  expect(removals()).toHaveLength(1);
+  await clock.advance(1000);
+  await start($);
+  expect(removals()).toHaveLength(1);
+});
+
+test(
+  "removes the PNG of a card that came too late to be drawn",
+  { timeoutMs: 20000 },
+  async ($, on) => {
+    let open = () => {};
+    const pngGate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const { runs, clock } = world(
+      on,
+      { "slow.png": "image" },
+      { TERM: "xterm-kitty" },
+      true,
+      undefined,
+      { pngGate },
+    );
+    await start($);
+
+    // The PNG is written, and the look for it does not answer in time.
+    const ui = await reply($, "slow.png");
+    await clock.advance(30000);
+    expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
+    const png = runs.find((argv) => argv[1] === "-s")!.at(-1)!;
+    expect(png).toMatch(/\.png$/);
+    expect(runs).not.toContainEqual(["rm", "-f", png]);
+
+    open();
+    await clock.settle();
+    expect(runs).toContainEqual(["rm", "-f", png]);
+    expect(await ui.findAll({ type: "Image" })).toHaveLength(0);
+  },
+);
+
+// Codex review, round 4, finding 1: a cleared transcript's replies leave
+// without the engine saying so.
+test(
+  "forgets the replies that left the screen without a word, once more than a screen holds came after",
+  { timeoutMs: 30000 },
+  async ($, on) => {
+    const files: Record<string, Kind> = { "extra.png": "image" };
+    const replies: string[] = [];
+    for (let n = 0; n < 8; n++) {
+      const names = [0, 1, 2, 3].map((k) => `p${n}-${k}.png`);
+      for (const name of names) files[name] = "image";
+      replies.push(names.join(" "));
+    }
+    for (let n = 0; n < 64; n++) files[`junk${n}.png`] = "text";
+    world(on, files);
+    await start($);
+    const rasters = async (text: string, id: string) => {
+      const ui = await reply($, text, { id });
+      const count = (await ui.findAll({ type: "Raster" })).length;
+      await ui.unmount();
+
+      return count;
+    };
+
+    // 32 cards, every one in use by a reply never said to leave.
+    for (const [n, text] of replies.entries())
+      expect(await rasters(text, `reply-${n}`)).toBe(4);
+    expect(await rasters("extra.png", "extra")).toBe(0);
+
+    // 64 replies later those nine are taken to be gone, and a card gives way.
+    for (let n = 0; n < 64; n++) await rasters(`junk${n}.png`, `junk-${n}`);
+    await rasters("extra.png", "extra");
+    expect(await rasters("extra.png", "extra")).toBe(1);
+  },
+);
+
+test("removes the PNG of a card whose directory was left while it was converted", async ($, on) => {
+  let release = () => {};
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const { runs, clock } = world(
+    on,
+    { "a.png": "image" },
+    { TERM: "xterm-kitty" },
+    true,
+    barrier,
+  );
+  on("classic.CwdChanged", () => ({}));
+  await start($);
+
+  // The card's PNG is at the barrier when the working directory changes.
+  const ui = await reply($, "a.png");
+  await $.classic.CwdChanged({ old_cwd: "/work", new_cwd: "/other" });
+  release();
+  await clock.settle();
+
+  const png = runs.find((argv) => argv[1] === "-s")!.at(-1)!;
+  expect(png).toMatch(/\.png$/);
+  expect(runs).toContainEqual(["rm", "-f", png]);
+  expect(await ui.findAll({ type: "Image" })).toHaveLength(0);
+});
+
+test("removes the copy and the bitmap of a preview cut short when the module is loaded again", async ($, on) => {
+  const { runs, clock } = world(on, { "a.png": "image" }, {}, true, undefined, {
+    readGate: new Promise<void>(() => {}),
+  });
+  await start($);
+
+  // The copy is made and the bitmap written; reading it back never ends.
+  await reply($, "a.png");
+  await clock.advance(1000);
+  const copy = runs.find(isCopy)![5]!;
+  const bitmap = runs.find((argv) => argv[1] === "-s")!.at(-1)!;
+  expect(bitmap).toMatch(/\.bmp$/);
+  expect(runs.filter((argv) => argv[0] === "rm")).toEqual([]);
+
+  await start($);
+  const removed = runs
+    .filter((argv) => argv[0] === "rm")
+    .flatMap((argv) => argv.slice(2));
+  expect(removed).toContain(copy);
+  expect(removed).toContain(bitmap);
+});
+
+test("holds a card only for as long as its reply draws it: a file written again leaves the old card's turn", async ($, on) => {
+  let release = () => {};
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const mtimes: Record<string, number> = {};
+  const { runs, clock } = world(
+    on,
+    { "x.png": "image", "a.png": "image" },
+    {},
+    true,
+    barrier,
+    { mtimes },
+  );
+  await start($);
+
+  // x is at the barrier, and a's card waits behind it.
+  await reply($, "x.png", { id: "x" });
+  const first = await reply($, "a.png", { id: "a" });
+  await first.unmount();
+  // a.png is written again, and the reply drawn again: it draws another card.
+  mtimes["a.png"] = 11;
+  await clock.advance(2001);
+  await reply($, "a.png", { id: "a" });
+
+  release();
+  await clock.settle();
+  // One copy of a.png, for the card the reply draws now.
+  expect(runs.filter(isCopy).map((argv) => argv[4])).toEqual([
+    "/work/x.png",
+    "/work/a.png",
+  ]);
+});
+
+test("starts no card for a reply that left the screen while its file was looked up", async ($, on) => {
+  let open = () => {};
+  const gate = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  const { runs, clock } = world(on, { "a.png": "image" }, {}, true, undefined, {
+    statGate: { path: "/work/a.png", gate },
+  });
+  await start($);
+
+  // Drawn on screen, then off it, the look at the file still unanswered.
+  const ui = await reply($, "Nothing yet.");
+  const props = { text: "/work/a.png", isFirstOfReply: true };
+  const shown = ui.redraw({ ...props, onScreen: { first: 0, last: 1, of: 2 } });
+  await clock.settle();
+  const hidden = ui.redraw({ ...props, onScreen: null });
+  await clock.settle();
+  open();
+  await shown;
+  await hidden;
+  await clock.settle();
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(1);
+  expect(runs).toHaveLength(0);
+});
+
+test("converts a waiting card once when the working directory moves to one that still holds its file", async ($, on) => {
+  let release = () => {};
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const { runs, clock } = world(
+    on,
+    { sub: "dir", "sub/a.png": "image", "sub/b.png": "image" },
+    {},
+    true,
+    barrier,
+  );
+  on("classic.CwdChanged", () => ({}));
+  await start($);
+
+  // a is at the barrier, b waits; the reply stays on screen across the move.
+  await reply($, "/work/sub/a.png /work/sub/b.png");
+  await $.classic.CwdChanged({ old_cwd: "/work", new_cwd: "/work/sub" });
+  release();
+  await clock.settle();
+  // b's turn under the old directory went with it: it is copied once, anew.
+  const copied = runs.filter(isCopy).map((argv) => argv[4]);
+  expect(copied.filter((file) => file === "/work/sub/b.png")).toHaveLength(1);
+  expect(copied.filter((file) => file === "/work/sub/a.png")).toHaveLength(2);
+});
+
+// Codex review, round 5, finding 1.
+test("lets a drawing of a reply that a later one has overtaken ask for no card", async ($, on) => {
+  let open = () => {};
+  const gate = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  const { runs, clock } = world(
+    on,
+    { "a.png": "image", "b.png": "image" },
+    {},
+    true,
+    undefined,
+    { statGate: { path: "/work/a.png", gate } },
+  );
+  await start($);
+
+  // Drawn naming a.png, the look at it unanswered; drawn again naming b.png.
+  const ui = await reply($, "Nothing yet.");
+  const onScreen = { first: 0, last: 1, of: 2 };
+  const older = ui.redraw({
+    text: "/work/a.png",
+    isFirstOfReply: true,
+    onScreen,
+  });
+  await clock.settle();
+  const newer = ui.redraw({
+    text: "/work/b.png",
+    isFirstOfReply: true,
+    onScreen,
+  });
+  await clock.settle();
+  open();
+  await older;
+  await newer;
+  await clock.settle();
+  // The later drawing's card is the reply's; the earlier one began none.
+  expect(runs.filter(isCopy).map((argv) => argv[4])).toEqual(["/work/b.png"]);
+});
+
+test("gives up the cards of a reply drawn again with no picture named, or on the main screen", async ($, on) => {
+  let release = () => {};
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const { runs, clock } = world(
+    on,
+    { "x.png": "image", "a.png": "image", "b.png": "image" },
+    {},
+    true,
+    barrier,
+  );
+  await start($);
+
+  // x is at the barrier; a's card and b's wait behind it.
+  await reply($, "x.png", { id: "x" });
+  const a = await reply($, "a.png", { id: "a" });
+  const b = await reply($, "b.png", { id: "b" });
+  // a is drawn again naming no picture, and b on the main screen.
+  await a.redraw({
+    text: "Never mind.",
+    isFirstOfReply: true,
+    onScreen: { first: 0, last: 1, of: 2 },
+  });
+  await b.unmount();
+  await reply($, "b.png", { id: "b", isFullscreen: false });
+
+  release();
+  await clock.settle();
+  expect(runs.filter(isCopy).map((argv) => argv[4])).toEqual(["/work/x.png"]);
+});
+
+// Codex review, round 5, finding 2.
+test(
+  "begins no card while a command of the one given up is still running",
+  { timeoutMs: 20000 },
+  async ($, on) => {
+    let open = () => {};
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    let release = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { runs, clock, peak } = world(
+      on,
+      { "hang.png": "image", "ok.png": "image" },
+      {},
+      true,
+      barrier,
+      { stuck: { copyOf: "hang.png", gate } },
+    );
+    await start($);
+
+    // The look at hang.png's copy answers after 28 seconds: its conversion
+    // is running when the 30 are up.
+    await reply($, "hang.png", { id: "hang" });
+    const waiting = await reply($, "ok.png", { id: "ok" });
+    await clock.advance(28000);
+    open();
+    await clock.settle();
+    expect(runs.filter((argv) => argv[1] === "-s")).toHaveLength(1);
+    await clock.advance(2000);
+    // Given up, its sips not yet ended: ok.png is not begun beside it.
+    expect(runs.filter(isCopy)).toHaveLength(1);
+
+    release();
+    await clock.settle();
+    expect(await waiting.findAll({ type: "Raster" })).toHaveLength(1);
+    expect(peak()).toBe(1);
+    // What the one given up had made is removed, each file once.
+    const copy = runs.filter(isCopy)[0]![5]!;
+    const bitmap = runs.find((argv) => argv[1] === "-s")!.at(-1)!;
+    const removalsOf = (path: string) =>
+      runs.filter((argv) => argv[0] === "rm" && argv.includes(path));
+    expect(removalsOf(copy)).toHaveLength(1);
+    expect(removalsOf(bitmap)).toHaveLength(1);
+  },
+);
+
+test(
+  "removes the files of a preview given up, though it never answers",
+  { timeoutMs: 20000 },
+  async ($, on) => {
+    const { runs, clock } = world(
+      on,
+      { "a.png": "image" },
+      {},
+      true,
+      undefined,
+      { readGate: new Promise<void>(() => {}) },
+    );
+    await start($);
+
+    // The copy is made and the bitmap written; reading it back never ends.
+    await reply($, "a.png");
+    await clock.advance(30000);
+    const copy = runs.find(isCopy)![5]!;
+    const bitmap = runs.find((argv) => argv[1] === "-s")!.at(-1)!;
+    const removed = () =>
+      runs.filter((argv) => argv[0] === "rm").flatMap((argv) => argv.slice(2));
+    expect(removed().sort()).toEqual([bitmap, copy].sort());
+    // Struck off as they went: a module loaded again finds nothing to remove.
+    await clock.advance(1000);
+    await start($);
+    expect(removed()).toHaveLength(2);
+  },
+);
+
+test(
+  "begins no more cards while eight given up have not answered, and begins them again once they have",
+  { timeoutMs: 30000 },
+  async ($, on) => {
+    let open = () => {};
+    const readGate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const files: Record<string, Kind> = {};
+    for (let n = 0; n < 11; n++) files[`h${n}.png`] = "image";
+    const { runs, clock } = world(on, files, {}, true, undefined, { readGate });
+    await start($);
+
+    // Nine cards asked for, each one's bitmap not read back in time.
+    for (let n = 0; n < 9; n++) await reply($, `h${n}.png`, { id: `r${n}` });
+    for (let n = 0; n < 8; n++) await clock.advance(30000);
+    expect(runs.filter(isCopy)).toHaveLength(8);
+    // The ninth is not begun however long it waits, and neither is a new one.
+    await clock.advance(60000);
+    const late = await reply($, "h9.png", { id: "r9" });
+    await clock.advance(60000);
+    expect(runs.filter(isCopy)).toHaveLength(8);
+    expect(await late.findAll({ type: "Button" })).toHaveLength(0);
+
+    // The eight answer at last: a card is begun again, and with the redraw
+    // it asks for so are the two that were refused. h1.png was the ninth:
+    // the card asked for last is converted first.
+    open();
+    await clock.settle();
+    await reply($, "h10.png", { id: "r10" });
+    await clock.settle();
+    expect(
+      runs
+        .filter(isCopy)
+        .slice(8)
+        .map((argv) => argv[4])
+        .sort(),
+    ).toEqual(["/work/h1.png", "/work/h10.png", "/work/h9.png"]);
+  },
+);
+
+// Codex review, round 5, finding 3.
+test("leaves a pipe that sat at the copy's name: not read as a copy, not removed, not written down", async ($, on) => {
+  const { runs, clock } = world(
+    on,
+    { "shot.png": "image" },
+    {},
+    true,
+    undefined,
+    { isPipeAtCopy: true },
+  );
+  await start($);
+
+  const ui = await reply($, "Saved shot.png.");
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
+  expect(runs.filter(isCopy)).toHaveLength(1);
+  expect(runs.filter((argv) => argv[0] !== "/bin/sh")).toEqual([]);
+  await clock.advance(1000);
+  await start($);
+  expect(runs.filter((argv) => argv[0] !== "/bin/sh")).toEqual([]);
+});
+
+// Codex review, round 5, finding 4.
+test("keeps a file written down until rm has removed it: a module loaded again removes it, once", async ($, on) => {
+  const rm = { isFailing: true };
+  const { runs, clock } = world(on, { "a.png": "image" }, {}, true, undefined, {
+    rm,
+  });
+  await start($);
+  const removedSince = (index: number) =>
+    runs
+      .slice(index)
+      .filter((argv) => argv[0] === "rm")
+      .flatMap((argv) => argv.slice(2));
+
+  // The card is drawn; rm removed neither the copy nor the bitmap.
+  const ui = await reply($, "a.png");
+  expect(await ui.findAll({ type: "Raster" })).toHaveLength(1);
+  await ui.unmount();
+  const copy = runs.find(isCopy)![5]!;
+  const bitmap = runs.find((argv) => argv[1] === "-s")!.at(-1)!;
+  expect(removedSince(0).sort()).toEqual([bitmap, copy].sort());
+
+  rm.isFailing = false;
+  const reloaded = runs.length;
+  await clock.advance(1000);
+  await start($);
+  expect(removedSince(reloaded).sort()).toEqual([bitmap, copy].sort());
+  // Gone now, and struck off: nothing is left for a third load.
+  const again = runs.length;
+  await clock.advance(1000);
+  await start($);
+  expect(removedSince(again)).toEqual([]);
+});
+
+test("keeps what a sweep could not remove written down for the next one", async ($, on) => {
+  const rm = { isFailing: false };
+  const { runs, clock } = world(
+    on,
+    { "a.png": "image" },
+    { TERM: "xterm-kitty" },
+    true,
+    undefined,
+    { rm },
+  );
+  await start($);
+  const ui = await reply($, "a.png");
+  const card = (await ui.find({ type: "Image" }))?.props.source as {
+    file: string;
+  };
+  await ui.unmount();
+
+  // The session ends, and rm fails: the card's PNG is still there.
+  rm.isFailing = true;
+  await $.session.end({
+    reason: "clear",
+    sessionId: "s-1",
+    resume: { id: "s-1" },
+  });
+  rm.isFailing = false;
+  const reloaded = runs.length;
+  await clock.advance(1000);
+  await start($);
+  expect(
+    runs
+      .slice(reloaded)
+      .filter((argv) => argv[0] === "rm")
+      .flatMap((argv) => argv.slice(2)),
+  ).toEqual([card.file]);
+});
+
+test(
+  "lets a drawing that a later one has overtaken drop no card to make room for its own",
+  { timeoutMs: 20000 },
+  async ($, on) => {
+    let open = () => {};
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const files: Record<string, Kind> = { "late.png": "image" };
+    const replies: string[] = [];
+    for (let n = 0; n < 8; n++) {
+      const names = [0, 1, 2, 3].map((k) => `p${n}-${k}.png`);
+      for (const name of names) files[name] = "image";
+      replies.push(names.join(" "));
+    }
+    const { runs, clock } = world(
+      on,
+      files,
+      { TERM: "xterm-kitty" },
+      true,
+      undefined,
+      { statGate: { path: "/work/late.png", gate } },
+    );
+    await start($);
+    const droppedPngs = () =>
+      runs
+        .filter((argv) => argv[0] === "rm")
+        .flatMap((argv) => argv.slice(2))
+        .filter((path) => path.endsWith(".png"));
+
+    // 32 cards kept, every reply scrolled away since: none is in use.
+    for (const [n, text] of replies.entries()) {
+      const shown = await reply($, text, { id: `reply-${n}` });
+      expect(await shown.findAll({ type: "Image" })).toHaveLength(4);
+      await shown.unmount();
+      const hidden = await reply($, text, {
+        id: `reply-${n}`,
+        isOffScreen: true,
+      });
+      await hidden.unmount();
+    }
+    expect(droppedPngs()).toEqual([]);
+
+    // Drawn naming late.png, the look at it unanswered; drawn again naming a
+    // picture whose card is kept.
+    const ui = await reply($, "Nothing yet.", { id: "z" });
+    const onScreen = { first: 0, last: 1, of: 2 };
+    const older = ui.redraw({
+      text: "/work/late.png",
+      isFirstOfReply: true,
+      onScreen,
+    });
+    await clock.settle();
+    const newer = ui.redraw({
+      text: "p7-3.png",
+      isFirstOfReply: true,
+      onScreen,
+    });
+    await clock.settle();
+    open();
+    await older;
+    await newer;
+    await clock.settle();
+    // The earlier drawing asked for nothing: no card gave way to late.png's.
+    expect(droppedPngs()).toEqual([]);
+    expect(runs.filter(isCopy).map((argv) => argv[4])).not.toContain(
+      "/work/late.png",
+    );
+  },
+);
+
+// Reported from a live terminal: every click on a chip gave the pane another
+// width. The dock narrows the conversation, whose width the next click read.
+test("asks the dock for the width the pane was opened at, for as long as it is up", async ($, on) => {
+  const { opened, close } = world(on, { "a.png": "image", "b.png": "image" });
+  await start($);
+  const press = async (text: string, columns: number) => {
+    const ui = await reply($, text, { columns });
+    await ui.press({ key: "imgview-open-0" });
+    await ui.unmount();
+  };
+
+  // Opened from a conversation 200 columns wide: 45 in a hundred of them.
+  await press("a.png", 200);
+  expect(opened.at(-1)?.columns).toBe(90);
+  // The pane docks and the conversation is 108 columns: the same width is
+  // asked for, by a chip and by the command alike.
+  await press("b.png", 108);
+  expect(opened.at(-1)?.columns).toBe(90);
+  await press("a.png", 108);
+  expect(opened.at(-1)?.columns).toBe(90);
+  await img($, "b.png");
+  expect(opened.at(-1)?.columns).toBe(90);
+  expect(opened).toHaveLength(4);
+
+  // Closed, and opened again from a narrower terminal: its width counts anew.
+  close();
+  await press("a.png", 120);
+  expect(opened.at(-1)?.columns).toBe(54);
+});
