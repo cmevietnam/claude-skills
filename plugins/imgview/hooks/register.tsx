@@ -36,20 +36,38 @@ const CARD_CELL_PIXELS = { width: 10, height: 20 };
 const LOCATE_TTL_MS = 2000;
 const MAX_LOCATED = 128;
 // This many cards are kept, drawn or waiting to be. One a reply on screen
-// asked for in the last while is in use: a drawn one is not dropped for
-// another, and a waiting one keeps its turn. Past the limit a new card waits
-// with no chip. A picture that could not be drawn is remembered apart.
+// draws is in use: a drawn one is not dropped for another, and a waiting one
+// keeps its turn. Past the limit a new card waits with no chip. A picture
+// that could not be drawn is remembered apart.
 const MAX_THUMBS = 32;
-const THUMB_ACTIVE_MS = 5000;
 const MAX_FAILED = 128;
+// The replies remembered as on screen. The engine says when one leaves it;
+// this bounds those that went without a word, as a cleared transcript's do.
+const MAX_ON_SCREEN = 64;
 // What a reply names is converted with no action of the person's, so it is
 // held to less than what `/img` takes: a file this small, a picture of this
 // many pixels, `sips` alone, this long, and one conversion at a time.
 const PREVIEW_MAX_BYTES = 20 * 1024 * 1024;
 const PREVIEW_MAX_PIXELS = 40_000_000;
 const PREVIEW_TIMEOUT_MS = 5000;
+// More than a preview's commands take at their timeouts, one after another:
+// only a file system call that never answers lasts this long, and then the
+// card is given up so that the ones behind it are drawn.
+const PREVIEW_DEADLINE_MS = 30_000;
+// Copies $1 to $2 under the shell's noclobber, which refuses a file that is
+// there and opens with O_EXCL where none is: the copy is made only at a name
+// that was free, never over a file and never through a link to one or to
+// nothing. Exit 3 says the name was taken, and then nothing was written.
+const SNAPSHOT = 'set -C; { cat -- "$1" || exit 4; } >"$2" || exit 3';
+const SNAPSHOT_NAME_TAKEN = 3;
 
 const shown = atom({ plugin: "imgview", key: "shown" } as const, null);
+// Every temporary file the mod has made and not yet removed, by its path:
+// kept with the session, so a module loaded again knows what the last left.
+const temps = atom({ plugin: "imgview", key: "temps" } as const, []);
+// How far behind the files that record is written: a drawing may write no
+// state, so the record is never written from where a file is made.
+const RECORD_DELAY_MS = 100;
 
 type Cells = { columns: number; rows: number; cells: string };
 
@@ -76,8 +94,18 @@ type Card = Measured & {
   png?: string;
 };
 
-/** A card's place among those kept: no `card` yet while it waits its turn. */
-type Slot = { card?: Card; usedAt: number };
+/**
+ * A card's place among those kept: no `card` yet while it waits its turn.
+ * `askedAt` orders the cards by when a reply on screen last asked for each:
+ * a count, not a time, so no two are equal.
+ */
+type Slot = { card?: Card; askedAt: number };
+
+/**
+ * A reply on screen: the cards its drawing asks for, and how many drawings
+ * of it have begun.
+ */
+type Reply = { cards: Set<string>; draws: number };
 
 /** A card waiting to be converted, under the working directory it was asked in. */
 type Job = {
@@ -122,9 +150,18 @@ type Host = {
   readBytes: (path: string) => Promise<string>;
   /** A fresh path under the temporary directory, its name not guessable. */
   tempPath: (suffix: "bmp" | "png" | "snap") => string;
+  /** Writes a path down as a file the mod made, its own to remove. */
+  keep: (path: string) => void;
+  /** Removes a file the mod made, and strikes its path off. */
+  remove: (path: string) => void;
+  /**
+   * Removes every file written down but the PNG the pane shows: what a
+   * module loaded before, or a session that ended, left behind.
+   */
+  sweep: () => Promise<void>;
   redraw: () => void;
-  /** The engine's clock, milliseconds since the epoch. */
-  now: () => Promise<number>;
+  /** Calls `fn` once after `ms` milliseconds on the engine's clock. */
+  after: (ms: number, fn: () => void) => { cancel: () => void };
   home: string | undefined;
   /**
    * Where the session's working directory lands, kept up as it changes;
@@ -202,8 +239,13 @@ async function rasterize(
         : "neither sips nor ImageMagick could convert it",
     );
   }
-  const base64 = await host.readBytes(out);
-  void host.run(["rm", "-f", out]);
+  host.keep(out);
+  let base64: string;
+  try {
+    base64 = await host.readBytes(out);
+  } finally {
+    host.remove(out);
+  }
   const bitmap = decodeBmp(fromBase64(base64));
   if (bitmap.width !== size.width || bitmap.height !== size.height) {
     throw new Error(
@@ -243,10 +285,17 @@ async function preview(
   maxColumns: number,
 ): Promise<Card | undefined> {
   const copy = host.tempPath("snap");
-  // A name nobody could guess is free: one that is taken is not the mod's.
-  if (await host.exists(copy)) return undefined;
+  let isCopyMine = false;
   try {
-    const copying = await host.run(["cp", file.path, copy], PREVIEW_TIMEOUT_MS);
+    const copying = await host.run(
+      ["/bin/sh", "-c", SNAPSHOT, "sh", file.path, copy],
+      PREVIEW_TIMEOUT_MS,
+    );
+    // What is at a name that was taken is not the mod's to read or remove.
+    if (copying?.exitCode === SNAPSHOT_NAME_TAKEN) return undefined;
+    // Made whole, in part, or cut short at the timeout: taken as the mod's.
+    isCopyMine = true;
+    host.keep(copy);
     if (copying?.exitCode !== 0) return undefined;
     const copied = await host.stat(copy);
     if (copied?.kind !== "file" || copied.size > PREVIEW_MAX_BYTES)
@@ -277,13 +326,16 @@ async function preview(
         width: box.columns * CARD_CELL_PIXELS.width,
         height: box.rows * CARD_CELL_PIXELS.height,
       };
-      if (await convert(host, copy, png, pixels, PREVIEW))
+      if (await convert(host, copy, png, pixels, PREVIEW)) {
+        host.keep(png);
+
         return { ...size, ...box, png };
+      }
     }
 
     return { ...size, ...(await rasterize(host, copy, box, PREVIEW)) };
   } finally {
-    void host.run(["rm", "-f", copy]);
+    if (isCopyMine) host.remove(copy);
   }
 }
 
@@ -323,6 +375,7 @@ async function present(
     } else {
       const out = host.tempPath("png");
       if (!(await convert(host, file.path, out))) return undefined;
+      host.keep(out);
       picture.png = out;
       picture.isPngTemporary = true;
     }
@@ -332,7 +385,7 @@ async function present(
     previous.isPngTemporary === true &&
     previous.png !== picture.png
   ) {
-    void host.run(["rm", "-f", previous.png]);
+    host.remove(previous.png);
   }
 
   return picture;
@@ -364,7 +417,16 @@ export const register: Register = (on) => {
   // The pane's conversions in flight, and the one its last drawing asked for.
   const painting = new Set<string>();
   let wanted: string | undefined;
+  // The temporary files the mod has made and not removed: what the session's
+  // record is written from.
+  const owned = new Set<string>();
   const thumbs = new Map<string, Slot>();
+  // Counts up each time a reply on screen asks for a card.
+  let asked = 0;
+  // The replies on screen by the engine's id for each, the one drawn longest
+  // ago first. The engine draws a reply again as it comes on screen and as it
+  // leaves, and not in between: a reply is on screen until it is said to go.
+  const onScreen = new Map<string, Reply>();
   // Pictures no preview could draw, oldest first: they hold no card's place.
   const failed = new Set<string>();
   const located = new Map<string, { at: number; file: Located | undefined }>();
@@ -411,17 +473,46 @@ export const register: Register = (on) => {
   function dropThumb(io: Host, id: string) {
     const png = thumbs.get(id)?.card?.png;
     thumbs.delete(id);
-    if (png !== undefined) void io.run(["rm", "-f", png]);
+    if (png !== undefined) io.remove(png);
+  }
+
+  /** Forgets every card and every reply, with no file removed. */
+  function forgetCards() {
+    thumbs.clear();
+    queue.length = 0;
+    onScreen.clear();
+  }
+
+  /** Notes a reply as on screen, the one drawn last of them. */
+  function enter(requestId: string): Reply {
+    const reply = onScreen.get(requestId) ?? { cards: new Set(), draws: 0 };
+    onScreen.delete(requestId);
+    onScreen.set(requestId, reply);
+    for (const stale of onScreen.keys()) {
+      if (onScreen.size <= MAX_ON_SCREEN) break;
+      onScreen.delete(stale);
+    }
+
+    return reply;
+  }
+
+  /** Whether a reply on screen draws this card. */
+  function isInUse(id: string): boolean {
+    for (const reply of onScreen.values()) {
+      if (reply.cards.has(id)) return true;
+    }
+
+    return false;
   }
 
   /**
-   * Gives up the waiting cards no reply on screen has asked for in the last
-   * while: they scrolled away before their turn came.
+   * Gives up the waiting cards no reply on screen draws: they scrolled away
+   * before their turn came.
    */
-  function pruneQueue(now: number) {
+  function pruneQueue() {
     for (let i = queue.length - 1; i >= 0; i--) {
       const job = queue[i]!;
-      if (now - job.slot.usedAt < THUMB_ACTIVE_MS) continue;
+      if (isInUse(job.id)) continue;
       queue.splice(i, 1);
       if (thumbs.get(job.id) === job.slot) thumbs.delete(job.id);
     }
@@ -429,26 +520,57 @@ export const register: Register = (on) => {
 
   /**
    * Makes room for one more card: true while fewer than `MAX_THUMBS` are
-   * kept, or once the least recently drawn one has left the screen. The card
-   * being converted is never the one to go.
+   * kept, or once one that is drawn is on screen no longer, and then the one
+   * asked for longest ago goes. The card being converted is never the one.
    */
-  function admitThumb(io: Host, now: number): boolean {
-    pruneQueue(now);
+  function admitThumb(io: Host): boolean {
+    pruneQueue();
     if (thumbs.size < MAX_THUMBS) return true;
     let oldest: string | undefined;
     for (const [id, slot] of thumbs) {
-      if (slot.card === undefined) continue;
-      if (oldest === undefined || slot.usedAt < thumbs.get(oldest)!.usedAt)
+      if (slot.card === undefined || isInUse(id)) continue;
+      if (oldest === undefined || slot.askedAt < thumbs.get(oldest)!.askedAt)
         oldest = id;
     }
-    if (
-      oldest === undefined ||
-      now - thumbs.get(oldest)!.usedAt < THUMB_ACTIVE_MS
-    )
-      return false;
+    if (oldest === undefined) return false;
     dropThumb(io, oldest);
 
     return true;
+  }
+
+  /**
+   * A job's card, or undefined when it has none or was not drawn in time: a
+   * call that never answers must not hold up the cards behind it.
+   */
+  function previewInTime(io: Host, job: Job): Promise<Card | undefined> {
+    return new Promise((resolve) => {
+      let isLate = false;
+      // Once given up, the preview starts no command: the next card's
+      // conversion is the only one running. Its own files are still removed.
+      const bound: Host = {
+        ...io,
+        run: async (argv, timeoutMs) =>
+          isLate ? undefined : io.run(argv, timeoutMs),
+      };
+      const deadline = io.after(PREVIEW_DEADLINE_MS, () => {
+        isLate = true;
+        resolve(undefined);
+      });
+      preview(bound, job.file, job.maxColumns).then(
+        (card) => {
+          deadline.cancel();
+          // Too late to be a card: the PNG made for it has no place.
+          if (isLate && card?.png !== undefined) io.remove(card.png);
+          // Of no effect once the deadline has answered.
+          resolve(card);
+        },
+        () => {
+          // not a picture sips converts: the chip is dropped
+          deadline.cancel();
+          resolve(undefined);
+        },
+      );
+    });
   }
 
   /**
@@ -460,23 +582,18 @@ export const register: Register = (on) => {
     isPreviewing = true;
     try {
       for (;;) {
-        pruneQueue(await io.now());
+        pruneQueue();
         let next = -1;
         for (let i = 0; i < queue.length; i++) {
-          if (next < 0 || queue[i]!.slot.usedAt > queue[next]!.slot.usedAt)
+          if (next < 0 || queue[i]!.slot.askedAt > queue[next]!.slot.askedAt)
             next = i;
         }
         if (next < 0) return;
         const job = queue.splice(next, 1)[0]!;
-        let card: Card | undefined;
-        try {
-          card = await preview(io, job.file, job.maxColumns);
-        } catch {
-          // not a picture sips converts: the chip is dropped
-        }
+        const card = await previewInTime(io, job);
         // The working directory moved on meanwhile, and took the place with it.
         if (job.boundary !== boundary || thumbs.get(job.id) !== job.slot) {
-          if (card?.png !== undefined) void io.run(["rm", "-f", card.png]);
+          if (card?.png !== undefined) io.remove(card.png);
         } else if (card === undefined) {
           thumbs.delete(job.id);
           failed.add(job.id);
@@ -495,14 +612,8 @@ export const register: Register = (on) => {
   }
 
   /** Takes a card's place at once and puts its conversion in the queue. */
-  function sketch(
-    io: Host,
-    file: Located,
-    id: string,
-    maxColumns: number,
-    now: number,
-  ) {
-    const slot: Slot = { usedAt: now };
+  function sketch(io: Host, file: Located, id: string, maxColumns: number) {
+    const slot: Slot = { askedAt: ++asked };
     thumbs.set(id, slot);
     queue.push({ id, file, maxColumns, slot, boundary });
     void drain(io);
@@ -516,17 +627,34 @@ export const register: Register = (on) => {
     } catch {
       // no working directory to hold previews to: none is drawn
     }
+    const run: Host["run"] = async (argv, timeoutMs) => {
+      try {
+        return await $.process.run(
+          argv,
+          timeoutMs === undefined ? undefined : { timeoutMs },
+        );
+      } catch {
+        return undefined;
+      }
+    };
+    // The record follows `owned` a moment behind, from a timer of its own.
+    let isRecordDue = false;
+    const writeRecord = async () => {
+      isRecordDue = false;
+      try {
+        await update($, temps, () => [...owned]);
+      } catch {
+        // Refused while a reply was being drawn: once more, a moment later.
+        record();
+      }
+    };
+    const record = () => {
+      if (isRecordDue) return;
+      isRecordDue = true;
+      $.clock.after(RECORD_DELAY_MS, () => void writeRecord());
+    };
     host = {
-      run: async (argv, timeoutMs) => {
-        try {
-          return await $.process.run(
-            argv,
-            timeoutMs === undefined ? undefined : { timeoutMs },
-          );
-        } catch {
-          return undefined;
-        }
-      },
+      run,
       exists: (path) => $.fs.exists(path),
       stat: async (path) => {
         try {
@@ -539,8 +667,26 @@ export const register: Register = (on) => {
         (await $.fs.read(path, { as: "bytes" })).base64,
       tempPath: (suffix) =>
         `${dir}/${TEMP_PREFIX}${crypto.randomUUID()}.${suffix}`,
+      keep: (path) => {
+        owned.add(path);
+        record();
+      },
+      remove: (path) => {
+        void run(["rm", "-f", path]);
+        owned.delete(path);
+        record();
+      },
+      sweep: async () => {
+        const pane = await read($, shown);
+        const kept = pane?.isPngTemporary === true ? pane.png : undefined;
+        const left = [...owned].filter((path) => path !== kept);
+        owned.clear();
+        if (kept !== undefined) owned.add(kept);
+        if (left.length > 0) await run(["rm", "-f", ...left]);
+        await writeRecord();
+      },
       redraw: () => $.ui.invalidate("ui.render"),
-      now: () => $.clock.now(),
+      after: (ms, fn) => $.clock.after(ms, fn),
       home: await $.env.get("HOME"),
       root,
       isPixelTerminal:
@@ -553,6 +699,12 @@ export const register: Register = (on) => {
           (await $.env.get("TERM_PROGRAM"))?.toLowerCase() === "ghostty" ||
           (await $.env.get("KITTY_WINDOW_ID")) !== undefined),
     };
+    // A module loaded again starts with no card: the files the last one made
+    // for its own go, each by the path it was written down under.
+    owned.clear();
+    for (const path of await read($, temps)) owned.add(path);
+    forgetCards();
+    await host.sweep();
     await $.command.register({
       name: "img",
       description: "Preview an image in a pane",
@@ -572,14 +724,29 @@ export const register: Register = (on) => {
       io.root = undefined;
       for (const id of [...thumbs.keys()]) dropThumb(io, id);
       queue.length = 0;
+      onScreen.clear();
       failed.clear();
       located.clear();
+      // The cards on screen are the old directory's: they go now, not when
+      // the new one is known.
+      io.redraw();
       const root = (await io.stat(e.new_cwd))?.realPath;
       // A later change owns the root now: this one's answer is stale.
       if (mine === boundary) {
         io.root = root;
         io.redraw();
       }
+    }
+
+    return next(e);
+  });
+
+  // The session's replies go with it, and their cards with them. The PNG the
+  // pane shows stays: after a `/clear` the pane is still there to show it.
+  on("session.end", async (_$, e, next) => {
+    if (host !== undefined) {
+      forgetCards();
+      await host.sweep();
     }
 
     return next(e);
@@ -722,7 +889,16 @@ export const register: Register = (on) => {
 
     const { Box, Button, Image, Raster, Text } = $.ui.resolve(e);
     const io = host;
-    const isOnScreen = e.props.onScreen !== null;
+    // Where the terminal does not say what is on screen, nothing is taken to
+    // be: the chips are drawn, and no card is made for them.
+    const visibility = e.props.onScreen;
+    const reply =
+      visibility === undefined || visibility === null
+        ? undefined
+        : enter(e.requestId);
+    if (reply === undefined && onScreen.delete(e.requestId)) pruneQueue();
+    const draw = reply === undefined ? 0 : ++reply.draws;
+    const cards = new Set<string>();
     const columns = e.viewport.columns;
     const maxColumns = Math.max(16, Math.min(CARD_COLUMNS, columns - 12));
     const chips = [];
@@ -756,13 +932,14 @@ export const register: Register = (on) => {
       const id = `${file.path}|${file.mtimeMs}|${maxColumns}`;
       if (failed.has(id)) continue;
       const slot = thumbs.get(id);
-      if (slot !== undefined) {
-        // Only a reply on screen keeps a card in use.
-        if (isOnScreen) slot.usedAt = now;
-      } else if (isOnScreen) {
+      // Only a reply still on screen asks for a card, or keeps one in use.
+      if (reply !== undefined && onScreen.get(e.requestId) === reply) {
         // No room among the cards on screen: this one waits, with no chip.
-        if (!admitThumb(io, now)) continue;
-        sketch(io, file, id, maxColumns, now);
+        if (slot === undefined && !admitThumb(io)) continue;
+        reply.cards.add(id);
+        cards.add(id);
+        if (slot !== undefined) slot.askedAt = ++asked;
+        else sketch(io, file, id, maxColumns);
       }
       const card = slot?.card;
 
@@ -813,38 +990,47 @@ export const register: Register = (on) => {
               await $.ui.open(paneRequest(picture, columns));
             }}
           />
-          <Box
-            position="absolute"
-            top={-((card === undefined ? 1 : card.rows + 1) + 2)}
-            left={0 - offset}
-            display="none"
-            hover={{ display: "flex" }}
-            flexDirection="column"
-            borderStyle="round"
-          >
-            {card?.cells !== undefined && (
-              <Raster
-                key={`imgview-thumb-${index}`}
-                columns={card.columns}
-                rows={card.rows}
-                cells={card.cells}
-              />
-            )}
-            {card?.png !== undefined && (
-              <Image
-                key={`imgview-thumb-${index}`}
-                source={{ file: card.png, format: "png" }}
-                columns={card.columns}
-                rows={card.rows}
-                alt={name}
-              />
-            )}
-            <Text dimColor>{caption}</Text>
-          </Box>
+          {(card !== undefined || visibility !== undefined) && (
+            <Box
+              position="absolute"
+              top={-((card === undefined ? 1 : card.rows + 1) + 2)}
+              left={0 - offset}
+              display="none"
+              hover={{ display: "flex" }}
+              flexDirection="column"
+              borderStyle="round"
+            >
+              {card?.cells !== undefined && (
+                <Raster
+                  key={`imgview-thumb-${index}`}
+                  columns={card.columns}
+                  rows={card.rows}
+                  cells={card.cells}
+                />
+              )}
+              {card?.png !== undefined && (
+                <Image
+                  key={`imgview-thumb-${index}`}
+                  source={{ file: card.png, format: "png" }}
+                  columns={card.columns}
+                  rows={card.rows}
+                  alt={name}
+                />
+              )}
+              <Text dimColor>{caption}</Text>
+            </Box>
+          )}
         </Box>,
       );
       offset += label.length + 2;
     }
+    // The drawing of a reply begun last says which cards the reply draws now.
+    if (
+      reply !== undefined &&
+      reply.draws === draw &&
+      onScreen.get(e.requestId) === reply
+    )
+      reply.cards = cards;
     if (chips.length === 0) return row;
 
     return (

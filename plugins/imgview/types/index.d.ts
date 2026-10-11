@@ -20,6 +20,10 @@ export type Shown = {
 
 declare module "claude-code" {
   interface PluginState {
-    imgview: { shown: Shown | null };
+    imgview: {
+      shown: Shown | null;
+      /** The temporary files the mod made and has not removed, by path. */
+      temps: readonly string[];
+    };
   }
 }

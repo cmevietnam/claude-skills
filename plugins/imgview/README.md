@@ -50,14 +50,22 @@ to a word in it (`ui.render` on `AssistantMessage` wraps what `next(e)` drew).
   a terminal narrower than 92. In `cells` mode that is a 160 by 48 pixel thumbnail.
 - The terminal applies a hover by itself and runs no hook for it, so the card cannot be
   made on demand: its picture is converted when the reply comes on screen.
-- 32 cards are kept, drawn or waiting their turn (`MAX_THUMBS`). A card a reply on
-  screen asked for in the last five seconds is in use: a drawn one is not dropped for
-  another, so with more than 32 pictures on screen the extra mentions get no chip
-  until one of the others scrolls away. A file no preview could draw is remembered
-  apart and holds no card's place.
-- Cards are converted one after another, the one asked for last first. One that scrolls
-  off screen before its turn is given up, so what is on screen now does not wait behind
-  what was (`pruneQueue` and `drain` in `hooks/register.tsx`).
+- 32 cards are kept, drawn or waiting their turn (`MAX_THUMBS`). A card that a reply on
+  screen draws is in use: a drawn one is not dropped for another, so with more than 32
+  pictures on screen the extra mentions get no chip until one of the others scrolls
+  away. A file no preview could draw is remembered apart and holds no card's place.
+- What is on screen is what the engine says is. It draws a reply again when the reply
+  comes on screen and when it leaves (`e.props.onScreen`), and not in between, so the
+  mod keeps the replies now on screen with the cards each one draws (`onScreen` in
+  `hooks/register.tsx`) and reads no clock: a reply that sits still keeps its cards
+  however long a conversion takes. A reply that goes without being reported stops
+  holding its cards when the session ends (a `/clear` is one), or once 64 other replies
+  that name image files have been drawn on screen after it (`MAX_ON_SCREEN`).
+- Cards are converted one after another, the one asked for last first. One whose reply
+  leaves the screen before its turn is given up, so what is on screen now does not wait
+  behind what was (`pruneQueue` and `drain`).
+- Where the terminal does not say what is on screen (`onScreen` absent), the chips are
+  drawn and no card is made for them; a click still opens the pane.
 - Chips are drawn in the fullscreen layout only (`"tui": "fullscreen"`), on a terminal
   surface. A card that would rise past the top of the viewport is clipped there.
 
@@ -77,21 +85,28 @@ to less than what `/img` takes (`locateMention`, `preview` and `sketch` in
 
 How the conversion itself is held:
 
-- `sips` never opens the path the reply named. `preview` copies the file with `cp` to a
-  name under `$TMPDIR` that nobody can guess (`crypto.randomUUID()`), gives up if that
-  name is taken or `cp` does not exit 0, checks the copy, looks at the original again,
-  and measures and converts the copy alone.
+- `sips` never opens the path the reply named. `preview` copies the file to a name under
+  `$TMPDIR` that nobody can guess (`crypto.randomUUID()`). The copy is made by `/bin/sh`
+  with noclobber set (`SNAPSHOT`: `set -C; { cat -- "$1" || exit 4; } >"$2" || exit 3`),
+  which creates it with `O_EXCL` or not at all: not over a file that is there, and not
+  through a link to a file or to nothing. When the name is taken (exit 3) the mod reads
+  nothing from it and removes nothing. Otherwise it checks the copy, looks at the
+  original again, and measures and converts the copy alone.
 - One preview is converted at a time (`drain` takes one job from `queue` and returns at
   once while another call is running): 32 mentions mean 32 conversions in a row, never
   32 decoders at once.
-- Each `cp` and `sips` run for a chip is killed after five seconds
+- Each shell and `sips` run for a chip is killed after five seconds
   (`PREVIEW_TIMEOUT_MS`), and ImageMagick is never run for one. So where `sips` is
   missing (Linux) there are no hover cards, only `/img`.
+- A preview still unfinished after 30 seconds (`PREVIEW_DEADLINE_MS`) is given up, so
+  the cards behind it are drawn. Its commands cannot take that long at five seconds
+  each; a file system call that never answers can. The preview given up starts no
+  further command when that call does answer (`previewInTime`).
 - On a terminal that draws pixels the card shows a small PNG the mod converted from the
   copy, never the file the reply named.
 - When the working directory changes, every card, lookup and waiting conversion made
-  under the old one is dropped before anything else happens, and nothing is previewed
-  until the new directory is resolved.
+  under the old one is dropped and the chips on screen are redrawn without them, before
+  anything else happens. Nothing is previewed until the new directory is resolved.
 
 This stops protecting at three edges:
 
@@ -99,14 +114,27 @@ This stops protecting at three edges:
    the table. A hostile bitmap inside the repository you opened reaches ImageIO.
 2. The engine gives a mod paths, not file handles, so nothing here can hold a file still
    between two steps. A process already running as you can swap the file for a link, a
-   pipe or a larger file after the mod has looked at it and before `cp` opens it. The
-   mod looks again after the copy and gives up if the path then lands elsewhere, is no
-   regular file, or has another modification time; a swap undone in time, with the same
-   modification time, gets the other file copied, decoded and shown, within the size,
-   format and megapixel limits above. A pipe holds `cp` for the five seconds it is
-   allowed; a huge file is copied for as long before the size check drops it. The same
-   process could as well replace the copy itself: its name is not guessable, but it can
-   be read from the process list while `cp` and `sips` run.
+   pipe or a larger file after the mod has looked at it and before the shell opens it.
+   The mod looks again after the copy and gives up if the path then lands elsewhere, is
+   no regular file, or has another modification time; a swap undone in time, with the
+   same modification time, gets the other file copied, decoded and shown, within the
+   size, format and megapixel limits above. A pipe holds the copy for the five seconds
+   it is allowed; a huge file is copied for as long before the size check drops it.
+
+   The same process can act on the mod's temporary names too. They are not guessable,
+   but they can be read from the process list while the shell and `sips` run:
+   - It can replace the copy once it is made, and that file is then what is decoded.
+   - Only the copy is created exclusively. `sips` writes its BMP or PNG to a fresh
+     random name with no such guarantee, so a link put at that name in time is written
+     through. And bash's noclobber opens a pipe or a device that sits at the copy's
+     name instead of refusing it; what is there is then no regular file, and is not
+     read.
+   - The mod removes its files by name (`rm -f`), so whatever that process has put at
+     one of those names by then is what is removed.
+
+   A process that can do any of this runs as you, and could write or remove those files
+   itself.
+
 3. `/img <path>` has none of these limits: a path you type is opened wherever it is,
    SVG and PDF included, with ImageMagick as the fallback. So is a chip you click: the
    pane then takes the file itself, measured again as it is at the click.
@@ -147,8 +175,22 @@ per pane size to resize it to exactly the cells on screen. The resized file goes
 names a PNG is handed to the terminal by its own path; any other is first converted to
 `$TMPDIR/claude-imgview-*.png`, which is removed when another picture replaces it in the
 pane. A chip's copy (`*.snap`) is removed as soon as its card is drawn, and a card's PNG
-when the card is dropped. What a session still holds when it ends stays until the system
-clears `$TMPDIR`.
+when the card is dropped.
+
+Every temporary file the mod makes is written down by its path until it is removed
+(`owned` in `hooks/register.tsx`), and that list is copied into the session's state
+(`imgview.temps`) a moment later, from a timer: the engine refuses a state write while a
+reply is being drawn, which is when most of these files are made. A name is written down
+only once a file was made there, so a name that turned out to be taken never is. When the
+session ends (`session.end`, in the short time the engine allows it), and when the module
+is loaded again in a running session, the files written down are removed by those exact
+paths (`sweep`), not by a name pattern. This is what can still be left behind:
+
+- The PNG the pane is showing, on purpose: a pane that outlives a `/clear` still needs
+  it. It goes when another picture replaces it, or when the system clears `$TMPDIR`.
+- A file made in the last tenth of a second before the module was reloaded
+  (`RECORD_DELAY_MS`), and the output of a conversion the reload cut short.
+- Everything, when the process is killed with no `session.end`.
 
 ## Limits
 
@@ -178,6 +220,8 @@ mod from this folder; that directory is ignored by git.
 
 `tests/picture.test.ts` decodes BMP files that the real `sips` and `magick` wrote (kept
 as base64 in the test), so a change in either converter's output format shows up there.
-`tests/register.test.ts` drives `/img` and the pane against a faked file system and a
-faked `sips`: it asserts the exact command lines, not that a real picture reached a real
-screen.
+`tests/register.test.ts` drives `/img`, the pane and the chips against a faked file
+system, a faked shell and a faked `sips`: it asserts the exact command lines, not that a
+real picture reached a real screen. The `SNAPSHOT` line itself was run by hand against
+the `/bin/sh` of macOS 14.5 (bash 3.2): it copies to a free name and exits 3, writing
+nothing, on a file, a link to a file, a dangling link and a directory.
