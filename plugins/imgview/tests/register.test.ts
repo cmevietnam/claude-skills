@@ -317,13 +317,33 @@ function world(
 
     return h(Text, {}, "ENGINE ROW") as RenderElement;
   });
+  // Whether the pane is up: opened, and not closed by the test since.
+  const pane = { isUp: false };
   on("ui.open", (_$, e) => {
     opened.push(e);
+    pane.isUp = true;
 
     return { value: { isPlaced: true as const } };
   });
+  on("ui.panes", () => ({
+    value: pane.isUp
+      ? [
+          {
+            id: "imgview",
+            title: "imgview",
+            isShown: true,
+            isFocused: false,
+            isPlaced: true,
+          },
+        ]
+      : [],
+  }));
 
   return {
+    /** The person closes the pane. */
+    close: () => {
+      pane.isUp = false;
+    },
     clock,
     runs,
     timeouts,
@@ -2372,3 +2392,33 @@ test(
     );
   },
 );
+
+// Reported from a live terminal: every click on a chip gave the pane another
+// width. The dock narrows the conversation, whose width the next click read.
+test("asks the dock for the width the pane was opened at, for as long as it is up", async ($, on) => {
+  const { opened, close } = world(on, { "a.png": "image", "b.png": "image" });
+  await start($);
+  const press = async (text: string, columns: number) => {
+    const ui = await reply($, text, { columns });
+    await ui.press({ key: "imgview-open-0" });
+    await ui.unmount();
+  };
+
+  // Opened from a conversation 200 columns wide: 45 in a hundred of them.
+  await press("a.png", 200);
+  expect(opened.at(-1)?.columns).toBe(90);
+  // The pane docks and the conversation is 108 columns: the same width is
+  // asked for, by a chip and by the command alike.
+  await press("b.png", 108);
+  expect(opened.at(-1)?.columns).toBe(90);
+  await press("a.png", 108);
+  expect(opened.at(-1)?.columns).toBe(90);
+  await img($, "b.png");
+  expect(opened.at(-1)?.columns).toBe(90);
+  expect(opened).toHaveLength(4);
+
+  // Closed, and opened again from a narrower terminal: its width counts anew.
+  close();
+  await press("a.png", 120);
+  expect(opened.at(-1)?.columns).toBe(54);
+});

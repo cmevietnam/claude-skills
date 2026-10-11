@@ -30,6 +30,11 @@ reload, and at user scope in every session started after.
 Escape at an idle, empty prompt closes the pane (`closeOnEscape` in
 `hooks/register.tsx`); so does the pane's own close mark.
 
+Docked, the pane asks for 45 in a hundred of the width it is opened from, between 40
+and 100 columns, and keeps asking for that same width for as long as it is up
+(`dockColumns`): a docked pane narrows the conversation, so a share taken anew at every
+click would give every picture another width. A width you drag the dock to wins.
+
 This plugin is a _mod_: a hooks module the engine loads (`hooks/hooks.json` names
 `register.tsx`), not a skill. It puts no skill text and no tool in the model's context.
 The slash command is the person's; its one-line answer (`login.png · 1280×720 · cells`)

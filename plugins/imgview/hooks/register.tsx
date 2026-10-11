@@ -456,6 +456,18 @@ export const register: Register = (on) => {
   // The pane's picture is replaced by one caller at a time, so each one sees
   // the picture it really replaces.
   let replacing: Promise<unknown> = Promise.resolve();
+  // The width the dock was asked for when the pane was opened, kept for as
+  // long as the pane is up. A docked pane narrows the conversation, so a share
+  // of the conversation's width taken anew at every open never comes to rest.
+  let dockColumns: number | undefined;
+
+  /** What the pane asks of the layout for a picture, up already or not. */
+  function sized(picture: Shown, columns: number, isUp: boolean) {
+    const request = paneRequest(picture, columns);
+    if (!isUp || dockColumns === undefined) dockColumns = request.columns;
+
+    return { ...request, columns: dockColumns };
+  }
 
   function oneAtATime<T>(work: () => Promise<T>): Promise<T> {
     const done = replacing.then(work, work);
@@ -871,7 +883,8 @@ export const register: Register = (on) => {
     });
     if (picture === undefined)
       return { text: `img: could not convert to PNG: ${target}` };
-    await $.ui.open(paneRequest(picture, e.presentation.columns));
+    const isUp = (await $.ui.panes()).some((pane) => pane.id === PANE);
+    await $.ui.open(sized(picture, e.presentation.columns, isUp));
 
     return {
       text: `${picture.name} · ${picture.width}×${picture.height} · ${mode}`,
@@ -1067,7 +1080,10 @@ export const register: Register = (on) => {
                 return replacement;
               });
               if (picture === undefined) return;
-              await $.ui.open(paneRequest(picture, columns));
+              const isUp = (await $.ui.panes()).some(
+                (pane) => pane.id === PANE,
+              );
+              await $.ui.open(sized(picture, columns, isUp));
             }}
           />
           {isHolding && (
