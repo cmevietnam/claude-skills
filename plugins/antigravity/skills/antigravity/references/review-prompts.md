@@ -114,10 +114,10 @@ git diff main...HEAD > "$S/diff.txt"     # committed only — omits uncommitted 
 
 cat "$S/preamble.txt" "$S/instructions.txt" "$S/diff.txt" > "$S/prompt.txt"
 
-agy-review --out "$S/flash" "$S/prompt.txt"        # gemini-3.8-flash, effort high
+agy-review --out "$S/argon" "$S/prompt.txt"        # gemini-4-argon, effort high
 ```
 
-With no `--model`, `agy-review` uses the pinned default, `gemini-3.8-flash` at
+With no `--model`, `agy-review` uses the pinned default, `gemini-4-argon` at
 `--effort high`, and prints it on its `model:` line. The effort on the summary line can be
 lower if the retry ladder stepped it down; attribute the findings to that one.
 
@@ -205,7 +205,7 @@ and exits 0, so a failed run is indistinguishable from a quiet one.
 
 ## Choosing the model
 
-Start with the default: `gemini-3.8-flash` at `--effort high`. **Never use
+Start with the default: `gemini-4-argon` at `--effort high`. **Never use
 `gemini-3.1-pro`**, not even for subtle concurrency, cross-module invariants or
 cryptographic logic. It is banned, and `agy-review` refuses it. For those, add a Claude
 reviewer (below) instead.

@@ -44,11 +44,15 @@ build; a consumer Gemini Pro subscription does not change it. Full record in
 (`--effort low|medium|high`) and serves Claude and GPT-OSS models next to Gemini, so a
 two-reviewer diff is one flag.
 
-## The default model: `gemini-3.8-flash`, effort high
+## The default model: `gemini-4-argon`, effort high
 
-With no `--model`, `agy-review` reviews with `gemini-3.8-flash` at `--effort high`. The
-default is pinned in `bin/agy-review` (`DEFAULT_MODEL`). A newer Flash is adopted by
+With no `--model`, `agy-review` reviews with `gemini-4-argon` at `--effort high`. The
+default is pinned in `bin/agy-review` (`DEFAULT_MODEL`). A newer model is adopted by
 editing that line, never automatically. `--model <id>` picks a different reviewer.
+
+`agy` offers Argon to Google AI Ultra and eligible Gemini Enterprise accounts only. On any
+other account the default fails with `agy`'s `invalid model selection`; pass
+`--model gemini-3.8-flash`, the previous default, to review there.
 
 `gemini-3.1-pro` is banned. `--model gemini-3.1-pro[-high|-low]` exits 2 before `agy`
 runs, and no guidance in this plugin suggests it. For a harder review or a second opinion,
@@ -108,8 +112,9 @@ Then sign in **from a real terminal** — `agy` opens a TUI and there is no head
 sign-in (`bubbletea: could not open TTY`), so Claude Code's `!` prefix cannot do it.
 Headless runs afterwards reuse the cached credentials.
 
-Verified against **agy 1.1.27**; the skill says what was checked and when. `agy`
-self-updates in the background, so re-verify after a gap.
+Verified against **agy 1.1.27**, with the default model re-checked on agy 1.3.4; the
+skill says what was checked and when. `agy` self-updates in the background, so re-verify
+after a gap.
 
 ## Read
 
