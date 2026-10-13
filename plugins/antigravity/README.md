@@ -56,7 +56,7 @@ other account the default fails with `agy`'s `invalid model selection`; pass
 
 `gemini-3.1-pro` is banned. `--model gemini-3.1-pro[-high|-low]` exits 2 before `agy`
 runs, and no guidance in this plugin suggests it. For a harder review or a second opinion,
-use a Claude id such as `claude-opus-4-6-thinking`.
+use a Claude id such as `claude-opus-5-5`, which `agy-review` also runs at `--effort high`.
 
 ## A run that overruns the output budget is not thrown away
 

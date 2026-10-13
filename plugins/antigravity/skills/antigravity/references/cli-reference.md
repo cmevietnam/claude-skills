@@ -234,7 +234,23 @@ Argon follows the same rule (agy 1.3.4): `--model gemini-4-argon --effort high` 
 `--effort medium` both returned `SUCCESS`, and `--model gemini-4-argon-low --effort high`
 failed with `--model gemini-4-argon-low conflicts with --effort=high`.
 
-Some models refuse `--effort` outright rather than conflicting with it:
+The Claude and GPT-OSS ids follow it as well (agy 1.3.4):
+
+```
+$ agy -p "..." --model claude-opus-5-5 --effort high       -> SUCCESS
+$ agy -p "..." --model claude-sonnet-5-5 --effort medium   -> SUCCESS
+$ agy -p "..." --model claude-opus-5-5                     -> SUCCESS (agy picks the level)
+$ agy -p "..." --model gpt-oss-120b --effort medium        -> SUCCESS
+$ agy -p "..." --model claude-opus-5-5-low --effort high
+{"status":"ERROR","error":"invalid model selection (--model \"claude-opus-5-5-low\"
+ --effort \"high\"): --model claude-opus-5-5-low conflicts with --effort=high"}
+$ agy -p "..." --model gpt-oss-120b-medium --effort high
+{"status":"ERROR","error":"invalid model selection (--model \"gpt-oss-120b-medium\"
+ --effort \"high\"): --model gpt-oss-120b-medium conflicts with --effort=high"}
+```
+
+That was not always so. On agy 1.1.27 the Claude ids refused `--effort` outright rather
+than conflicting with it, and `claude-sonnet-4-6` carried no suffix and still rejected it:
 
 ```
 $ agy -p "..." --model claude-sonnet-4-6 --effort high
@@ -242,13 +258,14 @@ $ agy -p "..." --model claude-sonnet-4-6 --effort high
  --effort \"high\"): --effort is not supported for model \"claude-sonnet-4-6\""}
 ```
 
-So the rule is narrower than "unsuffixed ids take `--effort`": only **unsuffixed
-`gemini-*`** ids do. A suffixed id conflicts, and every Claude id refuses outright —
-`claude-sonnet-4-6` carries no suffix and still rejects it.
+Those ids are gone from the listing, and the same wording is now what an unknown id gets
+when `--effort` is passed (see the end of this section).
 
-`agy-review` applies its **default** effort under exactly that rule, and forwards an
-**explicit** `--effort` unconditionally, including to models that will reject it, so
-`agy`'s own error reaches you instead of being silently dropped.
+`agy-review` applies its **default** effort to an unsuffixed `gemini-*` or `claude-*` id
+only. Any other family gets no flag and `agy` picks the level, so a model that takes no
+effort still runs. It forwards an **explicit** `--effort` unconditionally, including to
+ids that will reject it, so `agy`'s own error reaches you instead of being silently
+dropped.
 
 It is also why its pinned default is the **unsuffixed** `gemini-4-argon`: every id the
 listing offers carries a suffix, and pinning `gemini-4-argon-high` would turn the default
@@ -269,7 +286,8 @@ An unknown model is **never silently substituted**: exit 1 and `"status":"ERROR"
 
 - without `--effort`: `model gemini-9-nope is not recognized as a known model or custom
   model in settings`, followed by `Available models:` and the full list of labels;
-- with `--effort high`, which is how `agy-review` runs an unsuffixed `gemini-*` id: only
+- with `--effort high`, which is how `agy-review` runs an unsuffixed `gemini-*` or
+  `claude-*` id: only
   `--effort is not supported for model "gemini-9-nope"`, and no list.
 
 ## Sessions

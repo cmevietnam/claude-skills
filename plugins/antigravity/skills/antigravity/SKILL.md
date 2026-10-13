@@ -14,9 +14,9 @@ Gemini CLI path entirely: Google closed `gemini-cli` to personal Google accounts
 points them here (`references/why-not-gemini-cli.md`).
 
 Verified against **agy 1.1.27** (2026-09-05) by running every command below; the model
-list was re-checked on agy 1.2.11 (2026-09-25), and the default model and the model list
-again on agy 1.3.4 (2026-10-14). Re-verify after an upgrade — `agy` self-updates in the
-background, so the version can move under you.
+list was re-checked on agy 1.2.11 (2026-09-25), and the default model, the model list and
+the effort rules again on agy 1.3.4 (2026-10-14). Re-verify after an upgrade — `agy`
+self-updates in the background, so the version can move under you.
 
 ## Hard rule: present, then stop
 
@@ -72,7 +72,7 @@ a non-`SUCCESS` status, any `denied_actions`, or an empty/whitespace response �
 tells you where the raw `out.json` and `err.txt` are. Confirmed against the live CLI: a
 prompt that triggers an auto-deny gives `agy` exit 0 / SUCCESS and `agy-review` exit 1.
 
-`scripts/test-agy-review.sh` has 144 checks, 15 of them meta-tests that deliberately make
+`scripts/test-agy-review.sh` has 157 checks, 15 of them meta-tests that deliberately make
 each assertion helper fail — because a test that cannot go red proves nothing.
 
 Do not substitute `jq -r '.response // "failed"'`: on a zero-byte file `jq` prints
@@ -148,9 +148,10 @@ model:      gemini-4-argon (default), effort high
 **That line is what you attribute the findings to** — not "the default", and not the id
 you expected. A fallback says so in the same place.
 
-Its **default** effort is applied only to an unsuffixed `gemini-*` id, since every other
-id rejects `--effort`. An **explicit** `--effort` is always forwarded, so `agy`'s own error
-surfaces instead of being silently dropped — meaning
+Its **default** effort is applied only to an unsuffixed `gemini-*` or `claude-*` id: a
+suffixed id carries its own level and conflicts with the flag, and any other family is
+left for `agy` to pick the level. An **explicit** `--effort` is always forwarded, so
+`agy`'s own error surfaces instead of being silently dropped — meaning
 `agy-review --model gemini-3.8-flash-high --effort high` still fails, by design.
 
 `--disable-slash-commands` matters: a diff containing a line that starts with `/` would
@@ -189,8 +190,8 @@ is the user's standing instruction. `agy-review` enforces it: `--model gemini-3.
 `-high`, `-low`, in any letter case, exits 2 before `agy` runs.
 
 When a harder review or a second opinion is wanted, use a Claude id
-(`claude-opus-4-6-thinking`). When calling `agy` directly (the follow-ups under
-Sessions), do not choose a Pro model either.
+(`--model claude-opus-5-5`, which runs at `--effort high`). When calling `agy` directly
+(the follow-ups under Sessions), do not choose a Pro model either.
 
 - `--model <id>` pins a different reviewer. Use it when a second opinion needs a specific
   model.
@@ -209,32 +210,42 @@ Ultra account) it lists:
 
 The listing of 2026-09-25 (agy 1.2.11) also had `gemini-3.7-flash-*`, `gemini-3.6-flash-*`,
 `gemini-3.1-pro-high` / `-low` (**banned**: never use, `agy-review` refuses it) and
-`claude-sonnet-4-6` / `claude-opus-4-6-thinking`. None of those is listed any more. The
-Claude examples in this plugin still name `claude-opus-4-6-thinking` and have not been
-re-run against the 5.5 ids: read the id off `agy models` before using one.
+`claude-sonnet-4-6` / `claude-opus-4-6-thinking`. None of those is listed any more:
+`--model claude-opus-4-6-thinking` now fails as an unknown model.
 
-Effort is either **baked into the model id** (`gemini-3.8-flash-high`) or passed separately
-against the base name (`--model gemini-3.8-flash --effort high`). Both at once is an error,
-and so is `--effort` on a model that does not take it:
+Effort is either **baked into the model id** (`gemini-4-argon-high`) or passed separately
+against the base name (`--model gemini-4-argon --effort high`). Both at once is an error.
+Verified on agy 1.3.4 for all three families:
 
 ```
---model gemini-3.8-flash-low --effort high  → conflicts with --effort=high
---model claude-sonnet-4-6    --effort high  → --effort is not supported for model "claude-sonnet-4-6"
+--model gemini-4-argon-low   --effort high    → conflicts with --effort=high
+--model claude-opus-5-5-low  --effort high    → conflicts with --effort=high
+--model gpt-oss-120b-medium  --effort high    → conflicts with --effort=high
+--model claude-opus-5-5      --effort high    → SUCCESS
+--model claude-sonnet-5-5    --effort medium  → SUCCESS
+--model gpt-oss-120b         --effort medium  → SUCCESS
+--model claude-opus-5-5                       → SUCCESS (agy picks the level)
 ```
+
+The Claude ids of agy 1.1.27 refused `--effort` outright (`--effort is not supported for
+model "claude-sonnet-4-6"`); the 5.5 ids take it like a Gemini id does.
 
 `agy-review` handles this: given no explicit `--effort` it applies the default only to an
-unsuffixed `gemini-*` id, and passes an explicit one straight through so `agy`'s own error
-surfaces rather than being swallowed. It is also why the pinned default is the base id:
-`gemini-4-argon-high` would make the default effort an error.
+unsuffixed `gemini-*` or `claude-*` id, and passes an explicit one straight through so
+`agy`'s own error surfaces rather than being swallowed. It is also why the pinned default
+is the base id: `gemini-4-argon-high` would make the default effort an error. So
+`--model claude-opus-5-5` runs at `--effort high` and is stepped down on an output-limit
+failure, while `--model claude-opus-5-5-high` runs once at the level in its id and reports
+`effort=n/a`.
 
 An unknown model is never silently substituted: exit 1 and `"status":"ERROR"`. On agy
 1.3.4 the model list is in `.error` only when `agy` is called without `--effort`. Through
-`agy-review`, an unsuffixed `gemini-*` id carries `--effort`, and `.error` is then just
-`--effort is not supported for model "<id>"`, with no list: that wording means "unknown
-id" as often as it means "this model takes no effort".
+`agy-review`, an unsuffixed `gemini-*` or `claude-*` id carries `--effort`, and `.error`
+is then just `--effort is not supported for model "<id>"`, with no list: that wording
+means "unknown id" as often as it means "this model takes no effort".
 
 When the user wants a real second opinion on security-sensitive code, prefer
-`claude-opus-4-6-thinking` or run two models and diff their findings.
+`claude-opus-5-5` or run two models and diff their findings.
 
 ## Letting it read the repo (only when needed)
 

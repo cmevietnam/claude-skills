@@ -182,7 +182,7 @@ What this costs, and it is not nothing:
   hides that no reviewer saw the whole change.
 
 The other way to keep the effort is a model with a different budget: a Claude id such as
-`claude-opus-4-6-thinking`. Never `gemini-3.1-pro`, which is banned and which
+`claude-opus-5-5`. Never `gemini-3.1-pro`, which is banned and which
 `agy-review` refuses. That changes the reviewer, so it is a
 second opinion rather than the same review — which on security-sensitive code you wanted
 anyway.
@@ -211,7 +211,7 @@ cryptographic logic. It is banned, and `agy-review` refuses it. For those, add a
 reviewer (below) instead.
 
 For a genuine second opinion — a different training run, different blind spots — use
-`claude-opus-4-6-thinking`. On security-sensitive code run both and diff the findings
-instead of merging them.
+`--model claude-opus-5-5`, which `agy-review` runs at `--effort high` like the default.
+On security-sensitive code run both and diff the findings instead of merging them.
 
 Say which model and effort produced which findings when reporting.
