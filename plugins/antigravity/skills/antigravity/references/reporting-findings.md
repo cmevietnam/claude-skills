@@ -103,6 +103,6 @@ Then `AskUserQuestion` on which findings to act on. Not before.
 ## Two reviewers beat one
 
 `agy` serves Gemini, Claude and GPT-OSS models from one binary, so a second opinion costs
-one more flag: run `gemini-3.8-flash-high` and `claude-opus-4-6-thinking` over the same
+one more flag: run the default and `--model claude-opus-5-5` over the same
 prompt and diff their findings rather than merging them. On security-sensitive code, do
 this by default — each reviewer's blind spot tends to be the other's headline finding.

@@ -523,31 +523,51 @@ argv_equals "suffixed id: full argv, no --effort anywhere" \
   "-p" "$PROMPT_ARG" "--model" "gemini-3.8-flash-high" \
   "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m"
 
-# a Claude id must NOT get --effort (agy: "--effort is not supported for model ...")
-expect_pass "claude model runs" "$GOOD_STDOUT" \
-  --agy "$STUB" --model claude-opus-4-6-thinking --out "$TMP/run3" "$TMP/prompt.txt"
-argv_equals "claude id: full argv, no --effort anywhere" \
-  "-p" "$PROMPT_ARG" "--model" "claude-opus-4-6-thinking" \
+# A Claude base id takes --effort exactly like a Gemini one (agy 1.3.4:
+# `--model claude-opus-5-5 --effort high` runs), so it gets the default effort too.
+expect_pass "claude base id runs" "$GOOD_STDOUT" \
+  --agy "$STUB" --model claude-opus-5-5 --out "$TMP/run3" "$TMP/prompt.txt"
+argv_equals "claude base id: full argv, with the default effort" \
+  "-p" "$PROMPT_ARG" "--model" "claude-opus-5-5" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
+  "--effort" "high"
+expect_stderr "claude base id: the model line names the effort" \
+  "model:      claude-opus-5-5 (explicit --model), effort high"
+
+# ...and a suffixed Claude id must NOT (agy: "conflicts with --effort=high")
+expect_pass "suffixed claude id runs" "$GOOD_STDOUT" \
+  --agy "$STUB" --model claude-opus-5-5-high --out "$TMP/run3b" "$TMP/prompt.txt"
+argv_equals "suffixed claude id: full argv, no --effort anywhere" \
+  "-p" "$PROMPT_ARG" "--model" "claude-opus-5-5-high" \
   "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m"
 
-# an explicit --effort is passed through even for a model that will reject it,
+# An id from a family the wrapper has no rule for gets no --effort: agy picks the level,
+# and a model that takes none still runs.
+expect_pass "an id from another family runs" "$GOOD_STDOUT" \
+  --agy "$STUB" --model gpt-oss-120b --out "$TMP/run3c" "$TMP/prompt.txt"
+argv_equals "another family: full argv, no --effort anywhere" \
+  "-p" "$PROMPT_ARG" "--model" "gpt-oss-120b" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m"
+
+# an explicit --effort is passed through even for an id that will reject it,
 # so agy's own error surfaces instead of being silently dropped
 expect_pass "explicit --effort passed through" "$GOOD_STDOUT" \
-  --agy "$STUB" --model claude-sonnet-4-6 --effort low --out "$TMP/run4" "$TMP/prompt.txt"
-argv_equals "explicit --effort is forwarded even to a model that rejects it" \
-  "-p" "$PROMPT_ARG" "--model" "claude-sonnet-4-6" \
+  --agy "$STUB" --model claude-opus-5-5-low --effort high --out "$TMP/run4" "$TMP/prompt.txt"
+argv_equals "explicit --effort is forwarded even to an id that rejects it" \
+  "-p" "$PROMPT_ARG" "--model" "claude-opus-5-5-low" \
   "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
-  "--effort" "low"
+  "--effort" "high"
 
 # ...and when agy rejects that combination, the error reaches the user rather than
-# being swallowed. This is the behaviour the pass-through exists for.
+# being swallowed. This is the behaviour the pass-through exists for. The envelope is the
+# one agy 1.3.4 printed for this exact command line.
 cat > "$TMP/effort-rejected.json" <<'EOF'
 {"conversation_id":"","status":"ERROR","response":"",
- "error":"invalid model selection (--model \"claude-sonnet-4-6\" --effort \"low\"): --effort is not supported for model \"claude-sonnet-4-6\""}
+ "error":"invalid model selection (--model \"claude-opus-5-5-low\" --effort \"high\"): --model claude-opus-5-5-low conflicts with --effort=high"}
 EOF
 STUB_RC=1 STUB_STDOUT="$TMP/effort-rejected.json" \
-  expect_fail "rejected --effort surfaces agy's error" 1 "not supported for model" \
-  --agy "$STUB" --model claude-sonnet-4-6 --effort low --out "$TMP/run4b" "$TMP/prompt.txt"
+  expect_fail "rejected --effort surfaces agy's error" 1 "conflicts with --effort=high" \
+  --agy "$STUB" --model claude-opus-5-5-low --effort high --out "$TMP/run4b" "$TMP/prompt.txt"
 
 # a bare binary name for --agy is resolved through PATH, not treated as ./agy
 PATH="$TMP:$PATH" expect_pass "bare --agy name resolves via PATH" "$GOOD_STDOUT" \
@@ -693,9 +713,9 @@ expect_models_calls "a newer listing is never consulted" 0
 
 # An explicit --model is still used as given, and labelled as such.
 expect_pass "an explicit --model is used as given" "$GOOD_STDOUT" \
-  --agy "$STUB" --model claude-opus-4-6-thinking --out "$TMP/run-default3" \
+  --agy "$STUB" --model claude-opus-5-5-high --out "$TMP/run-default3" \
   "$TMP/prompt.txt"
-argv_has "the explicit id reaches agy" "--model" "claude-opus-4-6-thinking"
+argv_has "the explicit id reaches agy" "--model" "claude-opus-5-5-high"
 expect_stderr "an explicit --model is labelled as such" "explicit --model"
 
 # The discovery flag is gone; a caller still passing it must hear so, not be ignored.
@@ -786,7 +806,7 @@ expect_stderr "the exhausted ladder says agy has no budget flag" \
 expect_stderr "the exhausted ladder puts the thinking numbers on the record" \
   "54977 of its 55850"
 expect_stderr "the exhausted ladder offers a claude id as the other model" \
-  "a claude id (claude-opus-4-6-thinking)"
+  "a claude id (claude-opus-5-5)"
 expect_stderr_absent "the exhausted ladder never suggests running 3.1 Pro" \
   "--model gemini-3.1-pro"
 
@@ -808,12 +828,38 @@ STUB_STDOUT="$TMP/token-limit.json" \
 expect_calls "a suffixed id runs once" 1
 argv_lacks "no sibling id is invented" "gemini-3.8-flash-medium" "--effort"
 
-# A model with no effort control at all.
+# An id the wrapper sent no effort for has no rung to step down from. It must not claim
+# the model has no effort setting: agy 1.3.4 accepted `--model gpt-oss-120b --effort medium`.
 : > "$STUB_CALLS"
 STUB_STDOUT="$TMP/token-limit.json" \
-  expect_fail "a model without an effort setting says so" 1 "takes no effort setting" \
-  --agy "$STUB" --model claude-opus-4-6-thinking --out "$TMP/run-retry5" "$TMP/prompt.txt"
-expect_calls "a model without an effort setting runs once" 1
+  expect_fail "an id run without an effort says so" 1 "was run without --effort" \
+  --agy "$STUB" --model gpt-oss-120b --out "$TMP/run-retry5" "$TMP/prompt.txt"
+expect_calls "an id run without an effort runs once" 1
+expect_stderr_absent "an id run without an effort is not called effort-less" \
+  "takes no effort setting"
+
+# A Claude base id carries its effort in the flag, so the ladder steps it down as well.
+: > "$STUB_CALLS"
+STUB_STDOUT="$TMP/token-limit.json" \
+  STUB_STDOUT_2="$TMP/good.json" \
+  expect_pass "a claude base id is stepped down too" "$GOOD_STDOUT" \
+  --agy "$STUB" --model claude-opus-5-5 --out "$TMP/run-retry5b" "$TMP/prompt.txt"
+expect_calls "the claude retry costs exactly one more run" 2
+ARGV_FILE_OVERRIDE="$STUB_ARGV.2" argv_equals "the claude retry differs only in the effort" \
+  "-p" "$PROMPT_ARG" "--model" "claude-opus-5-5" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
+  "--effort" "medium"
+
+# When the reviewer already is a Claude model, "switch to a claude id" is no way out.
+: > "$STUB_CALLS"
+STUB_STDOUT="$TMP/token-limit.json" \
+  expect_fail "an exhausted claude ladder fails" 1 "effort tried: high, medium, low" \
+  --agy "$STUB" --model claude-opus-5-5 --out "$TMP/run-retry5c" "$TMP/prompt.txt"
+expect_calls "the claude ladder stops at low" 3
+expect_stderr "the exhausted claude ladder still offers the split" \
+  "split the bundle and review it in parts"
+expect_stderr_absent "the exhausted claude ladder does not offer a claude id" \
+  "a claude id"
 
 # Only THIS error is retried. Anything else means a second run buys the same answer
 # twice — the exact waste this whole branch exists to avoid.
