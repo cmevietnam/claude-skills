@@ -509,7 +509,7 @@ expect_pass "run path prints review" "$GOOD_STDOUT" \
 PROMPT_ARG="$(cat "$TMP/prompt.txt"; printf x)"; PROMPT_ARG="${PROMPT_ARG%x}"
 argv_equals "full argv: -p, the exact prompt, and nothing unexpected" \
   "-p" "$PROMPT_ARG" \
-  "--model" "gemini-3.8-flash" \
+  "--model" "gemini-4-argon" \
   "--disable-slash-commands" \
   "--output-format" "json" \
   "--print-timeout" "9m" \
@@ -590,7 +590,7 @@ CRLF_ARG="$(cat "$TMP/crlf-prompt.txt"; printf x)"; CRLF_ARG="${CRLF_ARG%x}"
 expect_pass "CRLF prompt survives" "$GOOD_STDOUT" \
   --agy "$STUB" --out "$TMP/run-crlf" "$TMP/crlf-prompt.txt"
 argv_equals "CRLF prompt reaches agy byte-for-byte" \
-  "-p" "$CRLF_ARG" "--model" "gemini-3.8-flash" \
+  "-p" "$CRLF_ARG" "--model" "gemini-4-argon" \
   "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
   "--effort" "high"
 
@@ -660,34 +660,35 @@ else
 fi
 
 # --- the default model: pinned, never discovered -------------------------------------
-# The owner pinned gemini-3.8-flash at --effort high on 2026-09-25. A newer Flash in the
-# listing must NOT move the default, and the default must not even ask for the listing.
+# The owner pinned gemini-4-argon at --effort high on 2026-10-14 (it was gemini-3.8-flash
+# from 2026-09-25). A newer model in the listing must NOT move the default, and the
+# default must not even ask for the listing.
 # Each case gets an empty XDG_CACHE_HOME: the old discovery code cached its answer there,
 # and a warm cache would let a reintroduced listing call hide behind "0 calls".
 
 : > "$STUB_MODELS_CALLS"
 XDG_CACHE_HOME="$TMP/cold-cache-1" expect_pass "the default run" "$GOOD_STDOUT" \
   --agy "$STUB" --out "$TMP/run-default1" "$TMP/prompt.txt"
-argv_equals "the default is gemini-3.8-flash at --effort high" \
-  "-p" "$PROMPT_ARG" "--model" "gemini-3.8-flash" \
+argv_equals "the default is gemini-4-argon at --effort high" \
+  "-p" "$PROMPT_ARG" "--model" "gemini-4-argon" \
   "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
   "--effort" "high"
 expect_models_calls "the default asks agy for no model listing" 0
 expect_stderr "the model line labels the pinned default" \
-  "model:      gemini-3.8-flash (default), effort high"
+  "model:      gemini-4-argon (default), effort high"
 
-# A listing that offers a newer Flash changes nothing: the default is pinned by decision.
+# A listing that offers a newer model changes nothing: the default is pinned by decision.
 cat > "$TMP/models-newer.txt" <<'EOF2'
-gemini-4-flash-high	Gemini 4 Flash (High)
-gemini-3.10-flash-high	Gemini 3.10 Flash (High)
+gemini-5-argon-high	Gemini 5 Argon (High)
+gemini-4.1-argon-high	Gemini 4.1 Argon (High)
+gemini-4-argon-high	Gemini 4 Argon (High)
 gemini-3.8-flash-high	Gemini 3.8 Flash (High)
-gemini-3.1-pro-high	Gemini 3.1 Pro (High)
 EOF2
 : > "$STUB_MODELS_CALLS"
 XDG_CACHE_HOME="$TMP/cold-cache-2" STUB_MODELS="$TMP/models-newer.txt" \
-  expect_pass "a newer Flash in the listing does not move the default" "$GOOD_STDOUT" \
+  expect_pass "a newer model in the listing does not move the default" "$GOOD_STDOUT" \
   --agy "$STUB" --out "$TMP/run-default2" "$TMP/prompt.txt"
-argv_has "the default stays gemini-3.8-flash" "--model" "gemini-3.8-flash"
+argv_has "the default stays gemini-4-argon" "--model" "gemini-4-argon"
 expect_models_calls "a newer listing is never consulted" 0
 
 # An explicit --model is still used as given, and labelled as such.
@@ -718,7 +719,7 @@ expect_fail "a banned id with an explicit --effort is refused too" 2 "is banned"
   "$TMP/prompt.txt"
 expect_calls "a banned id with --effort never reaches agy" 0
 expect_fail "the refusal points at the default" 2 \
-  "Omit --model for the default (gemini-3.8-flash, effort high)" \
+  "Omit --model for the default (gemini-4-argon, effort high)" \
   --agy "$STUB" --model gemini-3.1-pro-high --out "$TMP/run-ban-hint" "$TMP/prompt.txt"
 
 # The ban is exact: ids that merely share a prefix still run.
@@ -745,11 +746,11 @@ expect_stderr "the retry is announced with both efforts" \
 expect_stderr "the summary names the effort that produced the review" \
   "effort=medium attempts=2"
 ARGV_FILE_OVERRIDE="$STUB_ARGV.1" argv_equals "attempt 1 runs at the default effort" \
-  "-p" "$PROMPT_ARG" "--model" "gemini-3.8-flash" \
+  "-p" "$PROMPT_ARG" "--model" "gemini-4-argon" \
   "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
   "--effort" "high"
 ARGV_FILE_OVERRIDE="$STUB_ARGV.2" argv_equals "attempt 2 differs only in the effort" \
-  "-p" "$PROMPT_ARG" "--model" "gemini-3.8-flash" \
+  "-p" "$PROMPT_ARG" "--model" "gemini-4-argon" \
   "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
   "--effort" "medium"
 

@@ -81,7 +81,7 @@ reach the user intact, and must reach them _before_ the diff does.
 ## Shape of a good report
 
 ```
-## Antigravity findings (gemini-3.8-flash, effort=high)
+## Antigravity findings (gemini-4-argon, effort=high)
 
 Raw output: /tmp/agy-review/out.json
 
@@ -94,7 +94,7 @@ Verified each finding against the code: N correct, N partly correct, N did not r
 ```
 
 The model in that heading is the one `agy-review` printed on its `model:` line, not
-the one you asked for or expected. With no `--model` that is `gemini-3.8-flash`, and the
+the one you asked for or expected. With no `--model` that is `gemini-4-argon`, and the
 effort to report is the one on the final `effort=` line, which the retry ladder may have
 stepped down from `high`.
 

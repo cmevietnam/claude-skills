@@ -180,8 +180,32 @@ discards the explanation of any failure.
 
 ## Models
 
-`agy models` prints `id<TAB>label`. Live list on 2026-09-25 (agy 1.2.11), unchanged from
-2026-09-05:
+`agy models` prints `id<TAB>label`. Live list on 2026-10-14 (agy 1.3.4, a Google AI Ultra
+account), in the order printed:
+
+```
+gemini-3.8-flash-high      Gemini 3.8 Flash (High)
+gemini-3.8-flash-medium    Gemini 3.8 Flash (Medium)
+gemini-3.8-flash-low       Gemini 3.8 Flash (Low)
+gemini-4-argon-medium      Gemini 4 Argon (Medium)
+gemini-4-argon-high        Gemini 4 Argon (High)
+gemini-4-argon-low         Gemini 4 Argon (Low)
+claude-opus-5-5-low/medium/high
+claude-sonnet-5-5-low/medium/high
+gpt-oss-120b-medium        GPT-OSS 120B (Medium)
+```
+
+`agy-review`'s default is none of these lines as printed: it is the base id
+`gemini-4-argon` with `--effort high`, which selects the same model and level as
+`gemini-4-argon-high`.
+
+The three `gemini-4-argon-*` lines are per account: the same CLI on the same day listed
+everything else but them until the account moved to Google AI Ultra, and
+`--model gemini-4-argon` answered `model gemini-4-argon is not recognized as a known model
+or custom model in settings`.
+
+The list of 2026-09-25 (agy 1.2.11, unchanged from 2026-09-05) was different, and the
+transcripts below were recorded against it:
 
 ```
 gemini-3.8-flash-high      Gemini 3.8 Flash (High)
@@ -206,6 +230,9 @@ $ agy -p "..." --model gemini-3.8-flash-low --effort high
 ```
 
 `--model gemini-3.8-flash --effort high` works, as does `--effort low` with no `--model`.
+Argon follows the same rule (agy 1.3.4): `--model gemini-4-argon --effort high` and
+`--effort medium` both returned `SUCCESS`, and `--model gemini-4-argon-low --effort high`
+failed with `--model gemini-4-argon-low conflicts with --effort=high`.
 
 Some models refuse `--effort` outright rather than conflicting with it:
 
@@ -223,8 +250,8 @@ So the rule is narrower than "unsuffixed ids take `--effort`": only **unsuffixed
 **explicit** `--effort` unconditionally, including to models that will reject it, so
 `agy`'s own error reaches you instead of being silently dropped.
 
-It is also why its pinned default is the **unsuffixed** `gemini-3.8-flash`: every id the
-listing offers carries a suffix, and pinning `gemini-3.8-flash-high` would turn the default
+It is also why its pinned default is the **unsuffixed** `gemini-4-argon`: every id the
+listing offers carries a suffix, and pinning `gemini-4-argon-high` would turn the default
 `--effort high` into the conflict above.
 
 A long prompt that invites a long answer can also fail after the model has run:
@@ -237,8 +264,13 @@ A long prompt that invites a long answer can also fail after the model has run:
 
 Observed on a 57 KB review prompt. Cap the requested output in the prompt itself.
 
-An unknown model is **never silently substituted**: exit 1, `"status":"ERROR"`, and the
-full available list inside `.error`.
+An unknown model is **never silently substituted**: exit 1 and `"status":"ERROR"`. What
+`.error` holds depends on `--effort` (agy 1.3.4, `--model gemini-9-nope`):
+
+- without `--effort`: `model gemini-9-nope is not recognized as a known model or custom
+  model in settings`, followed by `Available models:` and the full list of labels;
+- with `--effort high`, which is how `agy-review` runs an unsuffixed `gemini-*` id: only
+  `--effort is not supported for model "gemini-9-nope"`, and no list.
 
 ## Sessions
 
