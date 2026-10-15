@@ -74,6 +74,20 @@ diff is half the thinking. `--no-retry` turns the ladder off, and
 `skills/antigravity/references/review-prompts.md` carries the split-and-merge recipe
 along with what it costs (cross-file findings are the price).
 
+## Letting the reviewer read the repo, for one run
+
+`agy-review --repo DIR` lets the model read the files under `DIR` itself instead of
+receiving everything in the prompt. `agy` can only be granted that through an allow-rule
+in its **global** `settings.json`, so the wrapper adds `read_file(DIR)` for the run and
+takes it out afterwards (on success, failure, Ctrl-C, SIGTERM and SIGHUP). Overlapping
+runs share the allow-list: each takes out only its own rule, and the last one out
+restores the original bytes. A run killed with SIGKILL is cleaned up by the next one, or
+by `agy-review --restore`. It refuses to start when the user already has allow-rules, or
+when `DIR` overlaps `~/.gemini`, `~/.ssh`, `~/.gnupg` or `~/.aws`, and never overwrites a
+`settings.json` someone else changed. Every file under `DIR` is readable, untracked ones
+included; while runs last, other `agy` sessions share their rules. Details and evidence
+in the skill.
+
 ## Relationship to `codex` and `review`
 
 The [`review`](../review) plugin runs adversarial review with multiple **Claude** models
@@ -112,7 +126,7 @@ Then sign in **from a real terminal** — `agy` opens a TUI and there is no head
 sign-in (`bubbletea: could not open TTY`), so Claude Code's `!` prefix cannot do it.
 Headless runs afterwards reuse the cached credentials.
 
-Verified against **agy 1.1.27**, with the default model re-checked on agy 1.3.4; the
+Verified against **agy 1.1.27**, with the default model re-checked on agy 1.3.4 and `--repo` on agy 1.3.5; the
 skill says what was checked and when. `agy` self-updates in the background, so re-verify
 after a gap.
 

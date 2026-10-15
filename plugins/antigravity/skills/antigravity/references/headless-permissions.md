@@ -108,6 +108,29 @@ Verified behaviour, one step at a time:
 | `command(cat)`                       | model falls back to `read_file` → `denied_actions: [read_file / ViewFile]` |
 | `command(cat)` + `read_file(<repo>)` | `denied_actions: null`, correct file contents returned                     |
 
+### What `read_file(<dir>)` actually matches
+
+Verified on 2026-10-15 against `agy 1.3.5`, with `read_file(<repo>)` as the only rule and a
+canary file in each place:
+
+| Path asked for                                   | Result                      |
+| ------------------------------------------------ | --------------------------- |
+| `<repo>/sub/canary.txt`                          | read                        |
+| `<repo>-secret/s.txt` (same string prefix)       | denied: whole path components |
+| `<repo>/link.txt`, a symlink to a file outside    | denied: the link is resolved |
+| `<repo>/../outside.txt`                          | denied: `..` is normalised  |
+| any of the above, rule written as `<repo>/`      | same results                |
+
+`--add-dir` is not needed for the read to be allowed.
+
+Told to "explore the repository", the model ran `find <repo> -type f` first, which is
+denied (`permission check failed for unsandboxed "find ..."`), and the run ended with an
+empty response. Given the file list in the prompt and told to read only with its
+file-viewing tool, it used `view_file` alone and finished, three runs out of three. That is
+what `agy-review --repo` does: it adds this one rule for the run (shared with any other
+`--repo` run alive at the time), appends the `git ls-files` list to the prompt, and takes
+the rule out again afterwards.
+
 ### `command(cat)` is not a read-only rule
 
 It appears in the table because that is how the behaviour was measured, not as a
