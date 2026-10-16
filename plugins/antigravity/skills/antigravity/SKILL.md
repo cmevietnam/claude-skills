@@ -65,6 +65,8 @@ print anything unless the envelope proves a review actually happened:
 agy-review [--model M] [--effort E] [--out DIR] PROMPT_FILE   # run, validate, print
 agy-review --no-retry [...] PROMPT_FILE                        # never step the effort down
 agy-review --check out.json                                    # validate an existing run
+agy-review --repo DIR [...] PROMPT_FILE                       # let it read DIR for this run
+agy-review --restore                                           # drop grants of killed runs
 ```
 
 It exits 1 with a diagnosis on an empty output file, non-JSON output, a populated `error`,
@@ -72,7 +74,7 @@ a non-`SUCCESS` status, any `denied_actions`, or an empty/whitespace response �
 tells you where the raw `out.json` and `err.txt` are. Confirmed against the live CLI: a
 prompt that triggers an auto-deny gives `agy` exit 0 / SUCCESS and `agy-review` exit 1.
 
-`scripts/test-agy-review.sh` has 157 checks, 15 of them meta-tests that deliberately make
+`scripts/test-agy-review.sh` has 272 checks, 15 of them meta-tests that deliberately make
 each assertion helper fail — because a test that cannot go red proves nothing.
 
 Do not substitute `jq -r '.response // "failed"'`: on a zero-byte file `jq` prints
@@ -247,32 +249,73 @@ means "unknown id" as often as it means "this model takes no effort".
 When the user wants a real second opinion on security-sensitive code, prefer
 `claude-opus-5-5` or run two models and diff their findings.
 
-## Letting it read the repo (only when needed)
+## Letting it read the repo: `--repo`
 
-Headless, every tool that needs approval is denied. To grant access, add allow-rules to
-`~/.gemini/antigravity-cli/settings.json` — **one rule per tool**, verified working:
-
-```json
-{
-  "permissions": {
-    "allow": ["read_file(/abs/path/to/repo)"]
-  }
-}
+```bash
+agy-review --repo /abs/path/to/repo --timeout 30m PROMPT_FILE   # read access, this run
+agy-review --restore                              # drop grants of runs killed with -9
 ```
 
-`read_file(<prefix>)` is the rule to reach for: it is scoped to a path. **`command(cat)`
-is not** — despite reading like "let it read the repo", it permits `cat` against every
-file the user can read, `~/.ssh/id_ed25519` and `~/.aws/credentials` included, and the
-rule is global and persists into every later session. Add it only if something truly needs
-a shell, say so explicitly, and remove it afterwards.
+Headless, every tool is denied, and the only way to allow one is an allow-rule in the
+**global** `~/.gemini/antigravity-cli/settings.json`. `--repo DIR` adds
+`read_file(<DIR, resolved>)` there for the length of the run, appends the repo's
+`git ls-files` list to the prompt, and takes the rule out again: on success, on failure,
+on Ctrl-C, SIGTERM and SIGHUP. Verified on agy 1.3.5: the rule matches whole path
+components (a sibling `DIR-secret` is denied), resolves symlinks and normalises `..`.
 
-One rule per tool: `command(cat)` alone still leaves `read_file` denied, and vice versa.
-Tool names seen: `run_command` (`command(<binary>)`), `read_file` (`ViewFile`),
-`find_by_name`. Ask the user before writing to their global settings, and prefer the
-no-tools shape above — it needs no permissions at all.
+**Several `--repo` runs can overlap**, on the same repo or different ones: the allow-list
+is always the union of the rules of the runs still alive, each run takes out only its
+own, and the last one out puts the original bytes of `settings.json` back. While they
+overlap, each reviewer can read the other repos too (the owner's accepted trade-off,
+2026-10-15). A run killed with SIGKILL leaves its grant behind; the next `--repo` run or
+`agy-review --restore` drops it, telling a dead run from an unrelated process that later
+got the same pid by its start time. Edits are serialised by an `flock` on
+`agy-review.lock` beside `settings.json`; the registry of live grants is
+`agy-review-grants/` there.
 
-`--dangerously-skip-permissions` auto-approves everything including writes. Ask first, say
-so plainly, and consider `--sandbox` alongside it.
+Write the prompt for `--repo` without the "do not call any tools" preamble: name the
+files or the change to review and let it read. The wrapper adds its own rules: read with
+the file-viewing tool only, no commands, no search, no directory listing. A model told to
+explore runs `find`, which is denied and empties the review; with the list it reads with
+`view_file` alone.
+
+**Give it a longer `--timeout`.** Reading files first makes the run slower: one Argon
+high `--repo` review was still working at the default 9 minutes, and agy then printed
+`print timeout ... returning partial output` and reported SUCCESS. `agy-review` refuses
+that run (exit 1). The same review with `--timeout 30m` finished in 377 s.
+
+**`--repo` does not keep a review under the output token limit.** On 2026-10-15 a
+`--repo` review of an 84 KB diff at Argon high overran it (`output_tokens: 69998`, of
+which 63058 thinking, then `status: ERROR`) and succeeded on the retry at medium. An
+earlier pair of runs on a smaller bundle had gone the other way (47153 output tokens with
+the material in a 122 KB prompt, 35215 for the `--repo` session), so the size of the
+material, not the way it reaches the model, is what decides. agy reports usage per
+session, not per response.
+
+What it refuses, before `agy` starts (exit 2, settings untouched):
+
+- `settings.json` already has allow-rules of the user's. Show them and let the user
+  decide: with them in place the run could do more than read.
+- `settings.json` is not a plain JSON object, or is a symlink.
+- `DIR` is `/`, the home directory or above it; sits inside, or contains (through a
+  symlink, as dotfiles setups do), `~/.gemini` (agy's OAuth token), `~/.ssh`, `~/.gnupg`
+  or `~/.aws`; is outside a git work tree, or in one rooted at the home directory (a
+  dotfiles repo); contains `(`, `)` or a control character; or has more than 3000
+  tracked files (pass a subdirectory). `GIT_*` variables of the caller are ignored.
+- `settings.json` was changed by someone else while grants were in place: it is never
+  overwritten. The message names the original's backup and what to do by hand.
+
+What it does not protect:
+
+- **Every file under `DIR` is readable**, untracked `.env` included. The prompt lists only
+  tracked files and says to read only those, but that is guidance, not a fence. Do not use
+  `--repo` on a tree holding secrets you would not send to Google.
+- **While the run lasts, every other `agy` session of this user has the rule too.**
+
+Any rule beyond that one is still a manual change to the user's global settings. Ask
+first. `command(cat)` in particular is not a read-only rule: it permits `cat` against
+every file the user can read, `~/.ssh/id_ed25519` included, and persists into every later
+session. `--dangerously-skip-permissions` auto-approves everything, writes included.
 
 Rule-by-rule evidence: `references/headless-permissions.md`.
 
@@ -329,6 +372,11 @@ like any other denied run; `--check` is what catches it.
 
   Invisible to anything that reads `.response` without checking `.error`; `agy-review`
   catches it.
+
+- **`print timeout ... returning partial output`** on stderr — `--print-timeout` ended the
+  turn early, and agy still reports `SUCCESS`, with an empty or a cut-off response.
+  `agy-review` refuses it (exit 1). Re-run with a longer `--timeout`; `--repo` reviews
+  need it most.
 
 - **stderr carries the diagnosis**, including the auto-deny warning. Never discard it —
   capture it to a file. Mixing it into stdout corrupts `stream-json` output with non-JSON

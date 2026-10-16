@@ -419,8 +419,29 @@ printf '%s\0' "$@" > "$STUB_ARGV"
 printf '%s\0' "$@" > "$STUB_ARGV.$N"
 OUT_VAR="STUB_STDOUT_$N"
 RC_VAR="STUB_RC_$N"
+# --repo cases: keep agy's settings exactly as this attempt saw them, change them behind
+# the wrapper's back, or hold still long enough to be signalled.
+if [ -n "${STUB_SETTINGS_SNAP:-}" ]; then
+  cp "$HOME/.gemini/antigravity-cli/settings.json" "$STUB_SETTINGS_SNAP.$N" 2>/dev/null \
+    || echo "ABSENT" > "$STUB_SETTINGS_SNAP.$N"
+fi
+if [ -n "${STUB_EDIT_SETTINGS:-}" ]; then
+  printf ' ' >> "$HOME/.gemini/antigravity-cli/settings.json"
+fi
+# A parked attempt records its pid, then waits up to STUB_SLEEP seconds, or until the
+# file STUB_RELEASE appears, which lets a test end it as a normal, successful run.
+if [ -n "${STUB_SLEEP:-}" ]; then
+  echo $$ > "$STUB_STARTED"
+  i=0
+  while [ $i -lt $((STUB_SLEEP * 10)) ]; do
+    [ -n "${STUB_RELEASE:-}" ] && [ -e "$STUB_RELEASE" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+fi
 cat "${!OUT_VAR:-$STUB_STDOUT}"
 [ -n "${STUB_STDERR:-}" ] && cat "$STUB_STDERR" >&2
+[ -n "${STUB_UNLINK_ERR:-}" ] && unlink "$STUB_UNLINK_ERR"
 exit "${!RC_VAR:-${STUB_RC:-0}}"
 EOF
 chmod +x "$STUB"
@@ -913,6 +934,752 @@ expect_stderr_absent "an ordinary prompt is not flagged" "KB of prompt at --effo
 # too rather than silently ignored.
 expect_fail "--check with --no-retry" 2 "takes no run options" \
   --check "$TMP/good.json" --no-retry
+
+# agy at its print timeout: SUCCESS, a response, and "returning partial output" on stderr.
+# Whatever the response holds is cut off mid-turn, so it is never passed on as a review.
+printf '[agy] print timeout after 9m0s with turn in progress; returning partial output\n' \
+  > "$TMP/print-timeout.err"
+STUB_STDERR="$TMP/print-timeout.err" expect_fail "print timeout is not a review" 1 \
+  "returned partial output" --agy "$STUB" --out "$TMP/run-print-timeout" "$TMP/prompt.txt"
+# ...even when err.txt is gone by the time it is checked: the marker is read through the
+# descriptor agy wrote to, not by pathname.
+STUB_STDERR="$TMP/print-timeout.err" STUB_UNLINK_ERR="$TMP/run-print-timeout-2/err.txt" \
+  expect_fail "print timeout with err.txt removed" 1 "returned partial output" \
+  --agy "$STUB" --out "$TMP/run-print-timeout-2" "$TMP/prompt.txt"
+
+# --- --repo: a read grant in agy's GLOBAL settings, for one run ----------------------
+# Every case runs with HOME pointed at a scratch directory: the real
+# ~/.gemini/antigravity-cli/settings.json is never read or written by this suite.
+
+RH="$TMP/home"
+mkdir -p "$RH/.gemini/antigravity-cli"
+RH="$(cd "$RH" && pwd -P)"        # resolved, the way the wrapper resolves paths
+SETTINGS="$RH/.gemini/antigravity-cli/settings.json"
+GRANTS="$RH/.gemini/antigravity-cli/agy-review-grants"
+REPO="$RH/work/proj"
+mkdir -p "$REPO/sub"
+printf 'def f():\n    return 1\n' > "$REPO/a.py"
+printf 'x = 2\n' > "$REPO/sub/b.py"
+git -C "$REPO" init -q && git -C "$REPO" add a.py sub/b.py \
+  || { echo "FATAL: cannot build the --repo fixture"; exit 1; }
+printf 'SECRET=1\n' > "$REPO/.env"   # untracked: never listed to the model
+RULE="read_file($REPO)"
+REPO2="$RH/work/proj2"
+mkdir -p "$REPO2"
+printf 'y = 3\n' > "$REPO2/c.py"
+git -C "$REPO2" init -q && git -C "$REPO2" add c.py \
+  || { echo "FATAL: cannot build the second --repo fixture"; exit 1; }
+RULE2="read_file($REPO2)"
+SNAP="$TMP/settings-snap"
+export STUB_STARTED="$TMP/stub-started"
+
+# reset_repo_state -- no settings.json, no lock, no snapshots, no counted calls.
+reset_repo_state() {
+  rm -rf "$SETTINGS" "$GRANTS" "$SNAP".*
+  : > "$STUB_CALLS"
+}
+
+# expect_after NAME absent|FILE -- after the run: no lock, and settings.json either gone
+# or byte-identical to FILE.
+expect_after() {
+  local name="$1" want="$2"
+  if [ -e "$GRANTS" ]; then
+    note_fail "$name: the grant registry $GRANTS was left behind"
+  elif [ "$want" = absent ]; then
+    if [ -e "$SETTINGS" ] || [ -L "$SETTINGS" ]; then
+      note_fail "$name: settings.json exists after the run: $(head -c 200 "$SETTINGS")"
+    else
+      note_pass "$name"
+    fi
+  elif cmp -s "$SETTINGS" "$want"; then
+    note_pass "$name"
+  else
+    note_fail "$name: settings.json differs from the original after the run"
+  fi
+}
+
+# expect_snap NAME ATTEMPT EXPECTED_JSON -- what agy saw on that attempt, compared as JSON.
+expect_snap() {
+  local name="$1" n="$2" want="$3"
+  if [ ! -s "$SNAP.$n" ]; then
+    note_fail "$name: no snapshot for attempt $n — the stub never ran that far"
+  elif python3 -c '
+import json, sys
+got = open(sys.argv[1]).read()
+sys.exit(0 if got != "ABSENT\n" and json.loads(got) == json.loads(sys.argv[2]) else 1)' \
+      "$SNAP.$n" "$want"; then
+    note_pass "$name"
+  else
+    note_fail "$name: agy saw $(head -c 300 "$SNAP.$n")"
+  fi
+}
+
+# prompt_check NAME has|lacks TEXT -- the -p argument of the last review call.
+prompt_check() {
+  local name="$1" mode="$2" text="$3"
+  argv_capture_ok "$name" || return
+  if ARGV_FILE="$(argv_file)" python3 -c '
+import os, sys
+a = open(os.environ["ARGV_FILE"], "rb").read().split(b"\0")
+p = a[a.index(b"-p") + 1].decode()
+found = sys.argv[2] in p
+sys.exit(0 if found == (sys.argv[1] == "has") else 1)' "$mode" "$text"; then
+    note_pass "$name"
+  else
+    note_fail "$name: the prompt should $mode '$text'"
+  fi
+}
+
+export STUB_SETTINGS_SNAP="$SNAP"
+
+# 1. No settings.json before: agy sees exactly our rule, and the file is gone afterwards.
+reset_repo_state
+HOME="$RH" expect_pass "--repo runs the review" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/repo-1" --repo "$REPO" "$TMP/prompt.txt"
+expect_snap "--repo: agy sees exactly one read_file rule" 1 \
+  "{\"permissions\":{\"allow\":[\"$RULE\"]}}"
+expect_after "--repo: a settings.json it created is removed" absent
+expect_stderr "--repo announces the grant" "repo:       $RULE added to"
+prompt_check "--repo lists a tracked file" has $'\na.py\n'
+prompt_check "--repo lists a tracked file in a subdirectory" has $'\nsub/b.py\n'
+prompt_check "--repo keeps the caller's prompt" has "+++ b/foo.py"
+prompt_check "--repo tells the model not to run commands" has "do NOT run shell commands"
+prompt_check "--repo does not list an untracked .env" lacks ".env"
+argv_lacks "--repo widens nothing else on the command line" \
+  "--add-dir" "--dangerously-skip-permissions"
+
+# 2. An existing settings.json with other keys: merged for the run, then byte-identical,
+#    mode included.
+reset_repo_state
+printf '{\n  "theme": "dark",\n  "permissions": {"deny": ["command(rm)"]}\n}\n' > "$SETTINGS"
+chmod 640 "$SETTINGS"
+cp -p "$SETTINGS" "$TMP/settings-orig"
+HOME="$RH" expect_pass "--repo with an existing settings.json" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/repo-2" --repo "$REPO" "$TMP/prompt.txt"
+expect_snap "--repo keeps the user's other settings during the run" 1 \
+  "{\"theme\":\"dark\",\"permissions\":{\"deny\":[\"command(rm)\"],\"allow\":[\"$RULE\"]}}"
+expect_after "--repo restores settings.json byte for byte" "$TMP/settings-orig"
+if [ "$(stat -f '%Lp' "$SETTINGS" 2>/dev/null || stat -c '%a' "$SETTINGS")" = 640 ]; then
+  note_pass "--repo restores the file mode"
+else
+  note_fail "--repo changed the mode of settings.json"
+fi
+
+# 3. An empty allow-list is no rule at all.
+reset_repo_state
+printf '{"permissions":{"allow":[]}}' > "$SETTINGS"
+cp "$SETTINGS" "$TMP/settings-orig"
+HOME="$RH" expect_pass "--repo with an empty allow-list" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/repo-3" --repo "$REPO" "$TMP/prompt.txt"
+expect_after "--repo restores an empty allow-list" "$TMP/settings-orig"
+
+# 4. Refusals that must leave settings.json untouched and never start agy.
+refuse_case() {
+  local name="$1" content="$2" want="$3"
+  reset_repo_state
+  printf '%s' "$content" > "$SETTINGS"
+  cp "$SETTINGS" "$TMP/settings-orig"
+  HOME="$RH" expect_fail "$name" 2 "$want" \
+    --agy "$STUB" --out "$TMP/repo-r-$RANDOM" --repo "$REPO" "$TMP/prompt.txt"
+  expect_calls "$name: agy never ran" 0
+  expect_after "$name: settings.json untouched" "$TMP/settings-orig"
+}
+refuse_case "--repo refuses when allow-rules exist" \
+  '{"permissions":{"allow":["command(cat)"]}}' "already has allow-rules"
+refuse_case "--repo refuses settings that are not JSON" '{"permissions": ' "not plain JSON"
+refuse_case "--repo refuses a non-object permissions" '{"permissions":[1]}' "is not an object"
+refuse_case "--repo refuses a non-list allow" '{"permissions":{"allow":"x"}}' "is not a list"
+
+reset_repo_state
+printf '{}' > "$TMP/elsewhere.json"
+ln -s "$TMP/elsewhere.json" "$SETTINGS"
+HOME="$RH" expect_fail "--repo refuses a symlinked settings.json" 2 "symlink" \
+  --agy "$STUB" --out "$TMP/repo-5" --repo "$REPO" "$TMP/prompt.txt"
+expect_calls "--repo symlinked settings: agy never ran" 0
+if [ -L "$SETTINGS" ] && [ "$(cat "$TMP/elsewhere.json")" = "{}" ] && [ ! -e "$GRANTS" ]; then
+  note_pass "--repo symlinked settings: link and target untouched, no registry"
+else
+  note_fail "--repo symlinked settings: something was changed or a registry was left"
+fi
+
+# 5. Directories that must never be granted.
+reset_repo_state
+mkdir -p "$TMP/not-git" "$RH/.gemini/inner" "$RH/work/par(en"
+HOME="$RH" expect_fail "--repo refuses HOME itself" 2 "whole home directory" \
+  --agy "$STUB" --repo "$RH" "$TMP/prompt.txt"
+HOME="$RH" expect_fail "--repo refuses an ancestor of HOME" 2 "whole home directory" \
+  --agy "$STUB" --repo "$(dirname "$RH")" "$TMP/prompt.txt"
+HOME="$RH" expect_fail "--repo refuses /" 2 "whole home directory" \
+  --agy "$STUB" --repo / "$TMP/prompt.txt"
+HOME="$RH" expect_fail "--repo refuses ~/.gemini" 2 "OAuth token" \
+  --agy "$STUB" --repo "$RH/.gemini/inner" "$TMP/prompt.txt"
+HOME="$RH" expect_fail "--repo refuses a parenthesis in the path" 2 "parenthesis" \
+  --agy "$STUB" --repo "$RH/work/par(en" "$TMP/prompt.txt"
+HOME="$RH" expect_fail "--repo refuses a directory outside git" 2 "not in a git work tree" \
+  --agy "$STUB" --repo "$TMP/not-git" "$TMP/prompt.txt"
+HOME="$RH" expect_fail "--repo refuses a missing directory" 2 "is not a directory" \
+  --agy "$STUB" --repo "$TMP/no-such-dir" "$TMP/prompt.txt"
+HOME="$RH" expect_fail "--repo refuses an empty value" 2 "empty value" \
+  --agy "$STUB" --repo "" "$TMP/prompt.txt"
+expect_calls "refused --repo directories: agy never ran" 0
+expect_after "refused --repo directories: nothing written" absent
+
+mkdir -p "$TMP/nohome"
+HOME="$TMP/nohome" expect_fail "--repo needs agy's config directory" 2 "run \`agy\` once" \
+  --agy "$STUB" --out "$TMP/repo-6" --repo "$REPO" "$TMP/prompt.txt"
+
+# 5b. Secrets reachable through the repo. Each fixture is a HOME of its own, so the
+#     dotfiles layouts below cannot leak into the other cases.
+mkhome() {  # mkhome DIR -- a fresh HOME with agy's config directory in it
+  mkdir -p "$1/.gemini/antigravity-cli"
+}
+mkgit() {   # mkgit DIR FILE... -- a git work tree tracking the named files
+  local d="$1"; shift
+  git -C "$d" init -q && git -C "$d" add "$@"
+}
+
+# ~/.gemini is a symlink into a dotfiles repo: the repo holds agy's OAuth token.
+HA="$TMP/home-dotgemini"; mkdir -p "$HA" "$TMP/dotfiles/.gemini/antigravity-cli"
+echo x > "$TMP/dotfiles/vimrc"; mkgit "$TMP/dotfiles" vimrc
+ln -s "$TMP/dotfiles/.gemini" "$HA/.gemini"
+HOME="$HA" expect_fail "--repo refuses a repo that holds ~/.gemini through a symlink" 2 \
+  "OAuth token" --agy "$STUB" --repo "$TMP/dotfiles" "$TMP/prompt.txt"
+
+# ~/.ssh is a symlink into the repo.
+HS="$TMP/home-dotssh"; mkhome "$HS"; mkdir -p "$TMP/dotssh-repo/ssh"
+echo k > "$TMP/dotssh-repo/ssh/id_ed25519"; echo x > "$TMP/dotssh-repo/a"
+mkgit "$TMP/dotssh-repo" a; ln -s "$TMP/dotssh-repo/ssh" "$HS/.ssh"
+HOME="$HS" expect_fail "--repo refuses a repo that holds ~/.ssh through a symlink" 2 \
+  "SSH keys" --agy "$STUB" --repo "$TMP/dotssh-repo" "$TMP/prompt.txt"
+
+# HOME itself is a git work tree (a dotfiles repo): ~/.ssh passes `git ls-files`.
+HG="$TMP/home-git"; mkhome "$HG"; mkdir -p "$HG/.ssh" "$HG/notes"
+echo cfg > "$HG/.ssh/config"; echo KEY > "$HG/.ssh/id_ed25519"; echo n > "$HG/notes/n.txt"
+mkgit "$HG" .ssh/config notes/n.txt
+HOME="$HG" expect_fail "--repo refuses ~/.ssh" 2 "SSH keys" \
+  --agy "$STUB" --repo "$HG/.ssh" "$TMP/prompt.txt"
+HOME="$HG" expect_fail "--repo refuses a directory whose work tree is HOME" 2 \
+  "rooted at the home directory" --agy "$STUB" --repo "$HG/notes" "$TMP/prompt.txt"
+
+# GIT_DIR from the caller's environment must not vouch for a directory outside git.
+HOME="$RH" GIT_DIR="$REPO/.git" expect_fail "--repo ignores an exported GIT_DIR" 2 \
+  "not in a git work tree" --agy "$STUB" --repo "$TMP/not-git" "$TMP/prompt.txt"
+HOME="$RH" GIT_WORK_TREE="$REPO" GIT_DIR="$REPO/.git" expect_fail \
+  "--repo ignores an exported GIT_WORK_TREE" 2 "not in a git work tree" \
+  --agy "$STUB" --repo "$TMP/not-git" "$TMP/prompt.txt"
+
+# ~/.gemini itself, not only a directory inside it.
+HOME="$RH" expect_fail "--repo refuses ~/.gemini itself" 2 "OAuth token" \
+  --agy "$STUB" --repo "$RH/.gemini" "$TMP/prompt.txt"
+expect_calls "secret-bearing --repo directories: agy never ran" 0
+
+# A git that answers `rev-parse --show-toplevel` with nothing (older releases did, run
+# inside a .git directory) must not make the caller's cwd pass for the work tree.
+mkdir -p "$TMP/fakegit"
+REAL_GIT="$(command -v git)"
+printf '#!/bin/bash\nfor a in "$@"; do [ "$a" = rev-parse ] && exit 0; done\nexec "%s" "$@"\n' \
+  "$REAL_GIT" > "$TMP/fakegit/git"
+chmod +x "$TMP/fakegit/git"
+HOME="$RH" PATH="$TMP/fakegit:$PATH" expect_fail "--repo: an empty work-tree answer is no work tree" \
+  2 "not in a git work tree" --agy "$STUB" --repo "$REPO" "$TMP/prompt.txt"
+
+# 6. A symlink to the repo is granted as the directory it points at.
+reset_repo_state
+ln -s "$REPO" "$TMP/repo-link"
+HOME="$RH" expect_pass "--repo through a symlink" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/repo-7" --repo "$TMP/repo-link" "$TMP/prompt.txt"
+expect_snap "--repo through a symlink grants the resolved path" 1 \
+  "{\"permissions\":{\"allow\":[\"$RULE\"]}}"
+
+# 7. Every failure after the grant still takes it back.
+reset_repo_state
+STUB_RC=1 STUB_STDOUT="$TMP/error-status.json" HOME="$RH" expect_fail \
+  "--repo: agy exits non-zero" 1 "agy exited 1" \
+  --agy "$STUB" --out "$TMP/repo-8" --repo "$REPO" "$TMP/prompt.txt"
+expect_after "--repo: grant removed after agy failed" absent
+
+reset_repo_state
+STUB_STDOUT="$TMP/denied.json" HOME="$RH" expect_fail \
+  "--repo: a denied tool fails the run with a --repo hint" 1 "With --repo only file reads" \
+  --agy "$STUB" --out "$TMP/repo-9" --repo "$REPO" "$TMP/prompt.txt"
+expect_after "--repo: grant removed after a denied run" absent
+
+reset_repo_state
+STUB_STDOUT="$TMP/token-limit.json" HOME="$RH" expect_fail \
+  "--repo: output limit at the bottom of the ladder" 1 "overran the output budget" \
+  --agy "$STUB" --out "$TMP/repo-10" --effort low --repo "$REPO" "$TMP/prompt.txt"
+expect_after "--repo: grant removed after a limit failure" absent
+
+# 8. The retry ladder keeps the grant for every attempt and removes it once.
+reset_repo_state
+STUB_STDOUT_1="$TMP/token-limit.json" HOME="$RH" expect_pass \
+  "--repo: retry after the output limit" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/repo-11" --repo "$REPO" "$TMP/prompt.txt"
+expect_calls "--repo: two attempts" 2
+expect_snap "--repo: attempt 1 has the grant" 1 "{\"permissions\":{\"allow\":[\"$RULE\"]}}"
+expect_snap "--repo: attempt 2 has the grant" 2 "{\"permissions\":{\"allow\":[\"$RULE\"]}}"
+expect_after "--repo: grant removed after the ladder" absent
+
+# 9. Someone edits settings.json during the run: never overwritten, registry kept, no
+#    review, and every later run or --restore refuses until a human sorts it out.
+reset_repo_state
+STUB_EDIT_SETTINGS=1 HOME="$RH" expect_fail \
+  "--repo: settings changed during the run" 1 "changed by someone else" \
+  --agy "$STUB" --out "$TMP/repo-12" --repo "$REPO" "$TMP/prompt.txt"
+if [ -d "$GRANTS" ] && grep -q "$RULE" "$SETTINGS" && [ "$(tail -c 1 "$SETTINGS")" = " " ]; then
+  note_pass "--repo: someone else's edit is not overwritten and the registry is kept"
+else
+  note_fail "--repo: the edited settings.json was overwritten or the registry removed"
+fi
+HOME="$RH" expect_fail "--repo: a foreign edit blocks the next run" 2 "changed by someone else" \
+  --agy "$STUB" --out "$TMP/repo-13" --repo "$REPO" "$TMP/prompt.txt"
+HOME="$RH" expect_fail "--restore will not clobber an edited settings.json" 1 \
+  "changed by someone else" --restore
+if [ -d "$GRANTS" ] && grep -q "$RULE" "$SETTINGS" && [ "$(tail -c 1 "$SETTINGS")" = " " ]; then
+  note_pass "--restore refusal: the edit and the registry are both still there"
+else
+  note_fail "--restore refusal: it overwrote the edit or removed the registry"
+fi
+
+# start_held NAME REPO SLEEP -- a --repo run in the background, parked inside agy until
+# killed or SLEEP runs out. Sets HELD_PID (the wrapper) and HELD_STUB (the stub agy).
+start_held() {
+  local tag="$1" repo="$2" secs="$3"
+  rm -f "$TMP/started-$tag" "$TMP/release-$tag" "$TMP/held-$tag.out" "$TMP/held-$tag.err"
+  STUB_STARTED="$TMP/started-$tag" STUB_RELEASE="$TMP/release-$tag" STUB_SLEEP="$secs" \
+    HOME="$RH" \
+    python3 "$BIN" --agy "$STUB" --out "$TMP/held-$tag-$RANDOM" --repo "$repo" \
+    "$TMP/prompt.txt" >"$TMP/held-$tag.out" 2>"$TMP/held-$tag.err" &
+  HELD_PID=$!
+  local i=0
+  while [ ! -s "$TMP/started-$tag" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  HELD_STUB="$(cat "$TMP/started-$tag" 2>/dev/null)"
+  [ -n "$HELD_STUB" ]
+}
+
+# settings_rules -- the allow-list in settings.json right now, one rule per line.
+settings_rules() {
+  python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except FileNotFoundError:
+    print("ABSENT"); raise SystemExit
+for r in d.get("permissions", {}).get("allow", []):
+    print(r)' "$SETTINGS"
+}
+
+expect_rules() {
+  local name="$1" want="$2" got
+  got="$(settings_rules)"
+  if [ "$got" = "$want" ]; then note_pass "$name"; else note_fail "$name: allow-list is '$got'"; fi
+}
+
+# 10. Overlapping runs on two repos: each sees the union, each removes only its own rule,
+#     the last one out restores the original.
+reset_repo_state
+printf '{"theme":"light"}\n' > "$SETTINGS"
+cp "$SETTINGS" "$TMP/settings-orig"
+if start_held A "$REPO" 30; then
+  PID_A=$HELD_PID
+  expect_rules "overlap: A alone holds its rule" "$RULE"
+  HOME="$RH" expect_pass "overlap: B runs while A holds a grant" "$GOOD_STDOUT" \
+    --agy "$STUB" --out "$TMP/repo-ov-b" --repo "$REPO2" "$TMP/prompt.txt"
+  N_B="$(wc -l < "$STUB_CALLS" | tr -d ' ')"
+  expect_snap "overlap: B's agy sees both rules" "$N_B" \
+    "{\"theme\":\"light\",\"permissions\":{\"allow\":[\"$RULE\",\"$RULE2\"]}}"
+  expect_stderr "overlap: B says A's rule stays" "rule(s) of other running reviews stay"
+  expect_rules "overlap: after B, only A's rule is left" "$RULE"
+  touch "$TMP/release-A"   # A's agy finishes; A takes its rule back
+  wait "$PID_A"; RC_A=$?
+  if [ "$RC_A" -eq 0 ]; then note_pass "overlap: A completes"; else note_fail "overlap: A exited $RC_A — $(head -c 200 "$TMP/held-A.err")"; fi
+  expect_after "overlap: the last run out restores the original" "$TMP/settings-orig"
+else
+  note_fail "overlap: run A never reached agy"
+fi
+
+# 11. Two runs on the same repo: one rule, held until the second one leaves.
+reset_repo_state
+if start_held A "$REPO" 30; then
+  PID_A=$HELD_PID
+  HOME="$RH" expect_pass "same repo: a second run on it" "$GOOD_STDOUT" \
+    --agy "$STUB" --out "$TMP/repo-same-b" --repo "$REPO" "$TMP/prompt.txt"
+  N_B="$(wc -l < "$STUB_CALLS" | tr -d ' ')"
+  expect_snap "same repo: the rule appears once" "$N_B" \
+    "{\"permissions\":{\"allow\":[\"$RULE\"]}}"
+  expect_rules "same repo: the first run still has its rule" "$RULE"
+  touch "$TMP/release-A"; wait "$PID_A"
+  expect_after "same repo: gone once both have left" absent
+else
+  note_fail "same repo: run A never reached agy"
+fi
+
+# 12. A run killed with SIGKILL cannot clean up. Its grant is dropped by the next run, or
+#     by --restore, and never outlives it in anyone's allow-list.
+reset_repo_state
+printf '{"theme":"light"}\n' > "$SETTINGS"
+cp "$SETTINGS" "$TMP/settings-orig"
+if start_held K "$REPO" 30; then
+  kill -KILL "$HELD_PID" "$HELD_STUB" 2>/dev/null; wait "$HELD_PID" 2>/dev/null
+  expect_rules "SIGKILL: the dead run's rule is still there" "$RULE"
+  HOME="$RH" expect_pass "SIGKILL: the next run proceeds" "$GOOD_STDOUT" \
+    --agy "$STUB" --out "$TMP/repo-k2" --repo "$REPO2" "$TMP/prompt.txt"
+  N_B="$(wc -l < "$STUB_CALLS" | tr -d ' ')"
+  expect_snap "SIGKILL: the next run drops the dead run's rule" "$N_B" \
+    "{\"theme\":\"light\",\"permissions\":{\"allow\":[\"$RULE2\"]}}"
+  expect_after "SIGKILL: the original is back after the next run" "$TMP/settings-orig"
+else
+  note_fail "SIGKILL: run K never reached agy"
+fi
+
+reset_repo_state
+printf '{"theme":"light"}\n' > "$SETTINGS"
+if start_held K "$REPO" 30; then
+  kill -KILL "$HELD_PID" "$HELD_STUB" 2>/dev/null; wait "$HELD_PID" 2>/dev/null
+  run_bin_home() { HOME="$RH" run_bin "$@"; }
+  run_bin_home --restore
+  if [ "$RC" -eq 0 ] && printf '%s' "$STDERR" | grep -q "no --repo grant is left"; then
+    note_pass "--restore after SIGKILL reports the restore"
+  else
+    note_fail "--restore after SIGKILL: exit $RC — ${STDERR:0:200}"
+  fi
+  expect_after "--restore after SIGKILL puts the original back" "$TMP/settings-orig"
+else
+  note_fail "--restore after SIGKILL: run K never reached agy"
+fi
+
+# --restore while a live run holds a grant: dead ones go, the live one stays.
+reset_repo_state
+if start_held A "$REPO" 30; then
+  PID_A=$HELD_PID
+  HOME="$RH" run_bin --restore
+  if [ "$RC" -eq 0 ] && printf '%s' "$STDERR" | grep -q "rule(s) of running reviews stay"; then
+    note_pass "--restore leaves a live run's grant alone"
+  else
+    note_fail "--restore with a live run: exit $RC — ${STDERR:0:200}"
+  fi
+  expect_rules "--restore: the live rule is still granted" "$RULE"
+  touch "$TMP/release-A"; wait "$PID_A"
+  expect_after "--restore: the live run still cleans up after itself" absent
+else
+  note_fail "--restore with a live run: run A never reached agy"
+fi
+
+HOME="$RH" run_bin --restore
+if [ "$RC" -eq 0 ] && printf '%s' "$STDERR" | grep -q "nothing to restore"; then
+  note_pass "--restore with nothing outstanding says so"
+else
+  note_fail "--restore with nothing outstanding: exit $RC — ${STDERR:0:200}"
+fi
+
+# 13. The edit mutex: a run waits for whoever holds it instead of racing them.
+reset_repo_state
+python3 -c '
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+open(sys.argv[2], "w").close()
+time.sleep(3)' "$RH/.gemini/antigravity-cli/agy-review.lock" "$TMP/mutex-held" &
+MUTEX_PID=$!
+i=0; while [ ! -e "$TMP/mutex-held" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+now() { python3 -c "import time; print(int(time.time() * 1000))"; }
+T0=$(now)
+HOME="$RH" expect_pass "mutex: a run waits for the edit lock" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/repo-mutex" --repo "$REPO" "$TMP/prompt.txt"
+T1=$(now)
+wait "$MUTEX_PID"; rm -f "$TMP/mutex-held"
+# The holder keeps the lock 3 s; a run that did not wait finishes in well under 1 s.
+if [ $((T1 - T0)) -ge 2500 ]; then note_pass "mutex: the run really waited"; else note_fail "mutex: the run did not wait ($((T1 - T0)) ms)"; fi
+expect_after "mutex: grant removed" absent
+
+HOME="$RH" expect_fail "--restore takes no other options" 2 "takes no other options" \
+  --restore "$TMP/prompt.txt"
+HOME="$RH" expect_fail "--check with --repo" 2 "takes no run options" \
+  --check "$TMP/good.json" --repo "$REPO"
+
+# 14. Signals: the grant is taken back when the run is interrupted mid-flight.
+signal_case() {
+  local sig="$1" want_rc="$2"
+  reset_repo_state
+  rm -f "$STUB_STARTED"
+  STUB_SLEEP=30 HOME="$RH" python3 "$BIN" --agy "$STUB" --out "$TMP/repo-sig-$sig" \
+    --repo "$REPO" "$TMP/prompt.txt" >"$TMP/.sig-out" 2>"$TMP/.sig-err" &
+  local pid=$! i=0
+  while [ ! -e "$STUB_STARTED" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  if [ ! -e "$STUB_STARTED" ]; then
+    kill -KILL "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    note_fail "--repo $sig: the stub never started"
+    return
+  fi
+  if ! grep -q "$RULE" "$SETTINGS" 2>/dev/null; then
+    note_fail "--repo $sig: the grant was not in place while agy ran"
+  fi
+  kill -"$sig" "$pid"
+  wait "$pid"; local rc=$?
+  if [ "$rc" -ne "$want_rc" ]; then
+    note_fail "--repo $sig: exit $rc, expected $want_rc — $(head -c 200 "$TMP/.sig-err")"
+  elif grep -q Traceback "$TMP/.sig-err"; then
+    note_fail "--repo $sig: died with a traceback"
+  else
+    note_pass "--repo $sig: exits $want_rc"
+  fi
+  expect_after "--repo $sig: grant removed" absent
+}
+signal_case TERM 143
+signal_case INT 130
+signal_case HUP 129
+
+# 15. A burst of signals: the second and third must not cut the release short.
+reset_repo_state
+if start_held S "$REPO" 30; then
+  kill -TERM "$HELD_PID"; kill -INT "$HELD_PID"; kill -HUP "$HELD_PID"
+  wait "$HELD_PID"
+  expect_after "signal burst: grant removed" absent
+else
+  note_fail "signal burst: the run never reached agy"
+fi
+
+# 15b. A signal that arrives while the release is under way must not abort it. Holding
+#      the edit mutex parks the run inside its release, deterministically, while the
+#      signal is sent; then the mutex is let go.
+reset_repo_state
+if start_held R "$REPO" 30; then
+  rm -f "$TMP/mutex-held" "$TMP/mutex-go"
+  python3 -c '
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+open(sys.argv[2], "w").close()
+while not os.path.exists(sys.argv[3]):
+    time.sleep(0.05)' "$RH/.gemini/antigravity-cli/agy-review.lock" "$TMP/mutex-held" \
+    "$TMP/mutex-go" &
+  HOLDER=$!
+  i=0; while [ ! -e "$TMP/mutex-held" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  touch "$TMP/release-R"     # agy finishes; the run now waits for the mutex to release
+  sleep 1
+  kill -TERM "$HELD_PID" 2>/dev/null
+  sleep 0.5
+  touch "$TMP/mutex-go"; wait "$HOLDER"
+  wait "$HELD_PID"; R_RC=$?
+  expect_after "signal during the release: grant still removed" absent
+  # The signal was only held back while the grant came out: it still ends the run,
+  # and no review is printed as if nothing had happened.
+  if [ "$R_RC" -eq 143 ] && [ ! -s "$TMP/held-R.out" ]; then
+    note_pass "signal during the release: still exits 143, prints nothing"
+  else
+    note_fail "signal during the release: exit $R_RC, stdout $(head -c 80 "$TMP/held-R.out")"
+  fi
+else
+  note_fail "signal during the release: the run never reached agy"
+fi
+
+# 15c. A signal while the run still waits to add its grant: it stops cleanly and leaves
+#      nothing behind.
+reset_repo_state
+rm -f "$TMP/mutex-held" "$TMP/mutex-go"
+python3 -c '
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+open(sys.argv[2], "w").close()
+while not os.path.exists(sys.argv[3]):
+    time.sleep(0.05)' "$RH/.gemini/antigravity-cli/agy-review.lock" "$TMP/mutex-held" \
+  "$TMP/mutex-go" &
+HOLDER=$!
+i=0; while [ ! -e "$TMP/mutex-held" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+: > "$STUB_CALLS"
+HOME="$RH" python3 "$BIN" --agy "$STUB" --out "$TMP/repo-acq-sig" --repo "$REPO" \
+  "$TMP/prompt.txt" >/dev/null 2>"$TMP/.acq-err" &
+ACQ=$!
+sleep 1
+kill -TERM "$ACQ"
+sleep 0.5
+touch "$TMP/mutex-go"; wait "$HOLDER"
+wait "$ACQ"; ACQ_RC=$?
+if [ "$ACQ_RC" -eq 143 ] && ! grep -q Traceback "$TMP/.acq-err"; then
+  note_pass "signal while acquiring: exits 143 cleanly"
+else
+  note_fail "signal while acquiring: exit $ACQ_RC — $(head -c 200 "$TMP/.acq-err")"
+fi
+expect_calls "signal while acquiring: agy never ran" 0
+expect_after "signal while acquiring: nothing left behind" absent
+
+# 16. stderr that breaks right after the grant is written (a reader such as `| head -1`
+#     that has gone away): the write fails inside the `try`, and the grant still goes.
+reset_repo_state
+HOME="$RH" python3 - "$BIN" "$STUB" "$TMP/repo-epipe" "$REPO" "$TMP/prompt.txt" <<'PY'
+import os, subprocess, sys
+r, w = os.pipe()
+os.close(r)                      # every write to stderr now fails with EPIPE
+binary, stub, out, repo, prompt = sys.argv[1:]
+subprocess.call([sys.executable, binary, "--agy", stub, "--out", out, "--repo", repo, prompt],
+                stdout=subprocess.DEVNULL, stderr=w)
+PY
+expect_after "broken stderr: grant removed" absent
+
+# write_registry RULE PID STARTED -- a registry as a run with that pid and start time
+# would have left it, settings.json included, with the original {"theme":"light"}.
+write_registry() {
+  printf '{"theme":"light"}\n' > "$TMP/settings-orig"
+  mkdir -m 700 "$GRANTS"
+  cp "$TMP/settings-orig" "$GRANTS/settings.orig"
+  python3 - "$GRANTS" "$SETTINGS" "$1" "$2" "$3" "$TMP/settings-orig" <<'PY'
+import hashlib, json, sys
+g, s, rule, pid, started, orig = sys.argv[1:]
+o = json.load(open(orig))
+w = (json.dumps(dict(o, permissions={"allow": [rule]}), indent=2) + "\n").encode()
+open(s, "wb").write(w)
+json.dump({"existed": True, "mode": 0o600, "accepted": [hashlib.sha256(w).hexdigest()]},
+          open(g + "/state.json", "w"))
+json.dump({"pid": int(pid), "rule": rule, "started": started or None},
+          open(f"{g}/grant-{pid}.json", "w"))
+PY
+}
+
+# 17. A dead run's pid now belongs to an unrelated process: the start time tells them
+#     apart, and the stale rule goes.
+reset_repo_state
+write_registry "$RULE" $$ "Thu Jan  1 00:00:00 1970"
+HOME="$RH" run_bin --restore
+if [ "$RC" -eq 0 ] && printf '%s' "$STDERR" | grep -q "no --repo grant is left"; then
+  note_pass "pid reuse: --restore drops the dead run's rule"
+else
+  note_fail "pid reuse: exit $RC — ${STDERR:0:200}"
+fi
+expect_after "pid reuse: the original is back" "$TMP/settings-orig"
+
+# ...while a grant whose pid AND start time match is a live run, and stays.
+reset_repo_state
+write_registry "$RULE" $$ "$(LC_ALL=C ps -o lstart= -p $$ | sed 's/^ *//; s/ *$//')"
+HOME="$RH" run_bin --restore
+if [ "$RC" -eq 0 ] && printf '%s' "$STDERR" | grep -q "rule(s) of running reviews stay"; then
+  note_pass "pid reuse: a matching start time is a live run"
+else
+  note_fail "pid reuse, live: exit $RC — ${STDERR:0:200}"
+fi
+expect_rules "pid reuse: the live rule stays" "$RULE"
+
+# 18. Killed after putting the original back but before removing the registry: the
+#     original bytes are not someone else's edit.
+reset_repo_state
+write_registry "$RULE" 999999 ""
+cp "$TMP/settings-orig" "$SETTINGS"
+rm -f "$GRANTS"/grant-*.json
+HOME="$RH" run_bin --restore
+if [ "$RC" -eq 0 ] && printf '%s' "$STDERR" | grep -q "no --repo grant is left"; then
+  note_pass "original back, registry left: --restore finishes the job"
+else
+  note_fail "original back, registry left: exit $RC — ${STDERR:0:200}"
+fi
+expect_after "original back, registry left: nothing remains" "$TMP/settings-orig"
+
+# A registry with no grant at all (its run died before registering) does not block the
+# next run.
+reset_repo_state
+write_registry "$RULE" 999999 ""
+cp "$TMP/settings-orig" "$SETTINGS"
+rm -f "$GRANTS"/grant-*.json
+HOME="$RH" expect_pass "orphan registry: the next run proceeds" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/repo-orphan" --repo "$REPO2" "$TMP/prompt.txt"
+expect_after "orphan registry: cleaned up afterwards" "$TMP/settings-orig"
+
+# 19. A grant file carrying this very process's pid was left by a dead run whose pid
+#     the OS reused for it: it is stale whatever its start time says. Exercised in
+#     process, since no shell can predict the pid of the run it starts.
+reset_repo_state
+HOME="$RH" python3 - "$BIN" "$RULE" <<'PY' >"$TMP/.f1" 2>&1
+import hashlib, importlib.machinery, importlib.util, json, os, sys
+sys.dont_write_bytecode = True   # no __pycache__ inside the plugin
+loader = importlib.machinery.SourceFileLoader("agyreview", sys.argv[1])
+spec = importlib.util.spec_from_loader("agyreview", loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+rule = sys.argv[2]
+for started in ("Thu Jan  1 00:00:00 1970", m.process_start(os.getpid()), None):
+    g = m.grants_dir()
+    os.mkdir(g, 0o700)
+    w = (json.dumps({"permissions": {"allow": [rule]}}, indent=2) + "\n").encode()
+    open(m.settings_path(), "wb").write(w)
+    json.dump({"existed": False, "mode": 0o600, "accepted": [hashlib.sha256(w).hexdigest()]},
+              open(g + "/state.json", "w"))
+    json.dump({"pid": os.getpid(), "rule": rule, "started": started},
+              open(f"{g}/grant-{os.getpid()}.json", "w"))
+    with m.settings_mutex():
+        left = m.update_grants()
+    print(f"started={started!r} rules_left={left} settings_exists={os.path.exists(m.settings_path())}")
+PY
+if [ "$(grep -c "rules_left=\[\] settings_exists=False" "$TMP/.f1")" = 3 ]; then
+  note_pass "own-pid grant: dropped as stale, whatever its start time"
+else
+  note_fail "own-pid grant: $(cat "$TMP/.f1")"
+fi
+expect_after "own-pid grant: nothing left" absent
+
+# 20. grant_alive: a pid of another user is not a run of ours, and a pid that exits
+#     between the liveness check and `ps` is dead, not "unknown, so alive".
+python3 - "$BIN" <<'PY' >"$TMP/.f2" 2>&1
+import importlib.machinery, importlib.util, os, sys
+sys.dont_write_bytecode = True   # no __pycache__ inside the plugin
+loader = importlib.machinery.SourceFileLoader("agyreview", sys.argv[1])
+spec = importlib.util.spec_from_loader("agyreview", loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+real_kill = os.kill
+def denied(pid, sig):
+    raise PermissionError(1, "Operation not permitted")
+os.kill = denied
+print("other-user", m.pid_alive(12345), m.grant_alive(12345, "x"))
+os.kill = real_kill
+answers = iter([True, False])                 # alive at the first look, gone at the second
+m.pid_alive = lambda pid: next(answers)
+m.process_start = lambda pid: None            # ps found nothing in between
+print("exited-between", m.grant_alive(12345, "Wed Oct 15 01:00:00 2026"))
+PY
+if grep -q "other-user False False" "$TMP/.f2" && grep -q "exited-between False" "$TMP/.f2"; then
+  note_pass "grant_alive: other users' pids and vanished pids are dead"
+else
+  note_fail "grant_alive: $(cat "$TMP/.f2")"
+fi
+
+# 21. Setup failures before anything is written are exit 2 with the real cause, never a
+#     claim that a grant could not be taken back.
+reset_repo_state
+unlink "$RH/.gemini/antigravity-cli/agy-review.lock"   # left by earlier cases
+ln -s "$TMP/nowhere" "$RH/.gemini/antigravity-cli/agy-review.lock" \
+  || { echo "FATAL: cannot plant the symlinked mutex"; exit 1; }
+HOME="$RH" expect_fail "--repo with a symlinked mutex file" 2 "could not add the read grant" \
+  --agy "$STUB" --out "$TMP/repo-f3" --repo "$REPO" "$TMP/prompt.txt"
+expect_stderr_absent "--repo with a symlinked mutex file: no false release failure" \
+  "back out of"
+unlink "$RH/.gemini/antigravity-cli/agy-review.lock"
+expect_after "--repo with a symlinked mutex file: nothing written" absent
+
+# ...and a signal while waiting for the mutex ends the run at once, not after the
+# holder lets go.
+reset_repo_state
+rm -f "$TMP/mutex-held" "$TMP/mutex-go"
+python3 -c '
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+open(sys.argv[2], "w").close()
+while not os.path.exists(sys.argv[3]):
+    time.sleep(0.05)' "$RH/.gemini/antigravity-cli/agy-review.lock" "$TMP/mutex-held" \
+  "$TMP/mutex-go" &
+HOLDER=$!
+i=0; while [ ! -e "$TMP/mutex-held" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+HOME="$RH" python3 "$BIN" --agy "$STUB" --out "$TMP/repo-f3b" --repo "$REPO" \
+  "$TMP/prompt.txt" >/dev/null 2>"$TMP/.f3b" &
+WAITER=$!
+sleep 1
+T0=$(now); kill -TERM "$WAITER"; wait "$WAITER"; W_RC=$?; T1=$(now)
+touch "$TMP/mutex-go"; wait "$HOLDER"
+if [ "$W_RC" -eq 143 ] && [ $((T1 - T0)) -lt 1500 ]; then
+  note_pass "signal while waiting for the mutex: exits at once ($((T1 - T0)) ms)"
+else
+  note_fail "signal while waiting for the mutex: exit $W_RC after $((T1 - T0)) ms"
+fi
+expect_after "signal while waiting for the mutex: nothing left" absent
 
 # --- meta-tests: prove each helper can actually go red -------------------------------
 # Without these, a crashing binary or a mis-wired assertion would make cases pass by

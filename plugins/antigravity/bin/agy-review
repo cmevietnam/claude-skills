@@ -9,8 +9,11 @@ failures.
 Usage:
   agy-review [options] PROMPT_FILE     run the prompt, validate, print the response
   agy-review --check ENVELOPE_JSON     validate an envelope that already exists
+  agy-review --restore                 drop --repo grants that killed runs left behind
 
 Options:
+  --repo DIR     let the reviewer read the files under DIR (a git work tree) for this run
+                 only. See "Repository access" below.
   --model M      model id. Default: gemini-4-argon, at --effort high. Any
                  gemini-3.1-pro id is refused (exit 2), with or without an effort suffix.
   --no-retry     do not step the effort down and retry when agy reports that the answer
@@ -65,18 +68,56 @@ applies the default only to an unsuffixed `gemini-*` or `claude-*` id and omits 
 everywhere else, where agy picks the level itself. An explicit --effort is always passed
 through, so `agy`'s own error surfaces rather than being silently dropped.
 
-Exit codes: 0 review produced, 1 run failed or was incomplete, 2 usage error.
+Repository access (--repo DIR): headless agy denies every tool, and the only way to allow
+one is an allow-rule in the GLOBAL ~/.gemini/antigravity-cli/settings.json. So for the
+length of this run the wrapper adds `read_file(<DIR, resolved>)` there and takes it out
+again afterwards — on success, failure, Ctrl-C, SIGTERM and SIGHUP. Verified on agy 1.3.5:
+that rule matches whole path components (a sibling `DIR-secret` is denied), resolves
+symlinks (a link in DIR pointing outside is denied) and normalises `..`. It refuses to
+start when settings.json holds allow-rules of the user's (those are theirs to manage) or is
+not plain JSON, and when DIR is /, the home directory or above it, overlaps ~/.gemini
+(agy's OAuth token), ~/.ssh, ~/.gnupg or ~/.aws in either direction, or is not in a git
+work tree of its own (one rooted at HOME, a dotfiles repo, does not count; the caller's
+GIT_* variables are ignored). Every file under DIR is readable, untracked `.env` files
+included: the model is told to read only the tracked files listed in the prompt, which is
+guidance, not a fence. A model asked to explore a repo runs `find` instead, which is denied
+and empties the review, so the wrapper appends the `git ls-files` list to the prompt and
+tells the model to read only with its file-viewing tool. While the rule is in place, any
+other agy session of this user can use it too. Reading files makes a run slower: give it
+a longer --timeout.
+
+Overlapping --repo runs share the grant: the allow-list is always the union of the rules
+of the runs still alive (each can then read the others' repos, an accepted trade-off), each
+run takes out only its own, and the last one out puts the original bytes back. The
+registry `agy-review-grants/` beside settings.json keeps those bytes and one file per run;
+an flock on `agy-review.lock` there serialises the edits. A run killed with SIGKILL leaves
+its grant; the next --repo run or `agy-review --restore` drops it, telling a dead run from
+an unrelated process that reused its pid by the start time `ps` reports. A settings.json
+someone else changed while grants were in place is never overwritten: the run stops and
+says what to fix by hand.
+
+Print timeout: when --print-timeout ends a turn, agy prints "returning partial output" on
+stderr and still reports SUCCESS. That run is refused: whatever the response holds was cut
+off mid-turn.
+
+Exit codes: 0 review produced, 1 run failed or was incomplete (or the grant could not be
+undone), 2 usage or setup error.
 """
 
 import argparse
+import contextlib
+import fcntl
+import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 EFFORT_SUFFIXES = ("-high", "-medium", "-low")
 
@@ -95,12 +136,34 @@ BANNED_MODEL_RE = re.compile(r"^gemini-3\.1-pro(?:-|$)", re.IGNORECASE)
 # substring because the rest of the message varies ("Retries remaining: 3").
 OUTPUT_LIMIT_MARKER = "output token limit"
 
+# agy's stderr when --print-timeout ends a turn early: "[agy] print timeout after 9m0s
+# with turn in progress; returning partial output". Matched lowercase.
+PRINT_TIMEOUT_MARKER = "print timeout"
+
 # agy's effort ladder, strongest first.
 EFFORT_LADDER = ("high", "medium", "low")
 
 # A 92 KB prompt at --effort high was observed to hit the limit twice, and to succeed at
 # medium. Warn a little below that, where the run is worth a heads-up but not a refusal.
 LARGE_PROMPT_BYTES = 50 * 1024
+
+# agy's global settings, where the --repo grant is written. Relative to $HOME, which is
+# where agy itself looks; the tests point HOME at a scratch directory.
+SETTINGS_REL = os.path.join(".gemini", "antigravity-cli", "settings.json")
+# Beside settings.json: the registry of live grants, and the flock serialising edits.
+GRANTS_DIR_NAME = "agy-review-grants"
+MUTEX_NAME = "agy-review.lock"
+MUTEX_WAIT_SECONDS = 30
+
+# The signals a --repo run turns into an orderly release of its grant.
+GRANT_SIGNALS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+
+# The file list travels in the prompt, so a huge tree would crowd out the review itself.
+# Past this, review a subdirectory instead.
+MAX_REPO_FILES = 3000
+
+# Characters that would let a path end the rule early or smuggle a second one in.
+UNSAFE_RULE_CHARS = re.compile(r"[()\x00-\x1f\x7f]")
 
 # The review is UTF-8 whatever the locale says: agy emits UTF-8, and printing it through
 # an ASCII stdout would raise UnicodeEncodeError on a perfectly good review.
@@ -309,7 +372,7 @@ def read_envelope(path, err_path=None):
     return envelope_from_text(raw, hint)
 
 
-def validate(path, err_path=None, env=None):
+def validate(path, err_path=None, env=None, repo=None):
     """Return (response, envelope), or exit non-zero explaining why the run is unusable.
 
     `env` lets the caller supply an envelope it already read from its own file
@@ -328,8 +391,14 @@ def validate(path, err_path=None, env=None):
         die(
             "FAILED: the run was incomplete — these tools were auto-denied: "
             f"{env['denied_actions']}\n"
-            "Either put the material in the prompt and forbid tool use, or add "
-            "allow-rules to ~/.gemini/antigravity-cli/settings.json."
+            + (
+                f"With --repo only file reads under {repo} are allowed: the model "
+                "reached for something else. Re-run; if it keeps doing so, put the "
+                "material in the prompt instead."
+                if repo is not None else
+                "Either put the material in the prompt and forbid tool use, or add "
+                "allow-rules to ~/.gemini/antigravity-cli/settings.json."
+            )
         )
 
     raw_response = env.get("response")
@@ -383,6 +452,493 @@ def find_agy(explicit):
     die("FAILED: `agy` not found on PATH or at ~/.local/bin/agy", 2)
 
 
+def settings_path():
+    return os.path.join(os.path.expanduser("~"), SETTINGS_REL)
+
+
+def digest(data):
+    return None if data is None else hashlib.sha256(data).hexdigest()
+
+
+def read_bytes_or_none(path):
+    """The file's bytes, or None when it does not exist. A symlink is refused, never
+    followed: writing through one would change a file this tool knows nothing about."""
+    if os.path.islink(path):
+        raise OSError(f"{path} is a symlink; refusing to follow it")
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def atomic_write(path, data, mode):
+    """Replace `path` with `data` in one rename, so agy never reads a half-written file."""
+    fd, tmp = tempfile.mkstemp(prefix=".agy-review-", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fchmod(f.fileno(), mode)
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Another user's process. Grants live in this user's HOME, so it cannot be the
+        # run that wrote one: the pid has been reused.
+        return False
+    return True
+
+
+def process_start(pid):
+    """When `pid` started, as `ps` prints it, or None when that cannot be told."""
+    try:
+        res = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            stdin=subprocess.DEVNULL, capture_output=True,
+            env=dict(os.environ, LC_ALL="C"),
+        )
+    except OSError:
+        return None
+    out = res.stdout.decode("ascii", "replace").strip()
+    return out if res.returncode == 0 and out else None
+
+
+def grant_alive(pid, started):
+    """True while the run that wrote a grant is still running.
+
+    The start time recorded with the grant tells that run from an unrelated process that
+    later got the same pid. When `ps` cannot answer, a live pid counts as alive: keeping
+    a rule a little longer is the lesser fault than pulling one from a running review.
+    """
+    if not pid_alive(pid):
+        return False
+    if started is None:
+        return True
+    now = process_start(pid)
+    if now is None:
+        # ps said nothing: the process may have exited after the check above. Ask again.
+        return pid_alive(pid)
+    return now == started
+
+
+class GrantError(Exception):
+    """A grant operation that has to stop, with the exit code to stop with."""
+
+    def __init__(self, msg, code):
+        super().__init__(msg)
+        self.code = code
+
+
+def config_dir():
+    return os.path.dirname(settings_path())
+
+
+def grants_dir():
+    return os.path.join(config_dir(), GRANTS_DIR_NAME)
+
+
+@contextlib.contextmanager
+def settings_mutex():
+    """Serialise every edit agy-review makes to settings.json.
+
+    An flock, not a lock directory: the kernel drops it when the holder dies, so a run
+    killed mid-edit can never leave it stuck. It is held for the edit only, never for
+    the length of a review, which is what lets several --repo runs overlap.
+    """
+    path = os.path.join(config_dir(), MUTEX_NAME)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        deadline = time.monotonic() + MUTEX_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise GrantError(
+                        f"FAILED: another agy-review held {path} for "
+                        f"{MUTEX_WAIT_SECONDS} s; try again",
+                        2,
+                    )
+                time.sleep(0.1)
+        yield
+    finally:
+        os.close(fd)
+
+
+def check_user_settings(path, current):
+    """Refuse a settings.json this tool must not take over: anything but a plain JSON
+    object, and any allow-rule already in it, since those are the user's to manage."""
+    if current is None:
+        return
+    try:
+        obj = json.loads(current.decode("utf-8"), parse_constant=reject_constant)
+    except (ValueError, RecursionError) as e:
+        raise GrantError(f"FAILED: {path} is not plain JSON ({e}); not touching it", 2)
+    if not isinstance(obj, dict):
+        raise GrantError(f"FAILED: {path} is not a JSON object; not touching it", 2)
+    perms = obj.get("permissions")
+    if perms is not None and not isinstance(perms, dict):
+        raise GrantError(f"FAILED: `permissions` in {path} is not an object; not touching it", 2)
+    allow = (perms or {}).get("allow")
+    if allow is not None and not isinstance(allow, list):
+        raise GrantError(f"FAILED: `permissions.allow` in {path} is not a list; not touching it", 2)
+    if allow:
+        raise GrantError(
+            f"FAILED: {path} already has allow-rules: {json.dumps(allow)}. They are yours "
+            "to manage, and with them in place a --repo run could do more than read the "
+            "repo. Remove them yourself, or review without --repo.",
+            2,
+        )
+
+
+def reject_constant(name):
+    raise ValueError(f"non-JSON constant {name}")
+
+
+def render(original, rules):
+    """The original settings with `rules` as the whole allow-list."""
+    obj = {} if original is None else json.loads(original.decode("utf-8"))
+    perms = obj.get("permissions") or {}
+    return (json.dumps(dict(obj, permissions=dict(perms, allow=rules)), indent=2) + "\n").encode("utf-8")
+
+
+def save_private(path, data):
+    """Write a registry file at 0600 in one rename."""
+    atomic_write(path, data, 0o600)
+
+
+def update_grants(add_rule=None):
+    """Bring settings.json in line with the live grants. Call with the mutex held.
+
+    The registry beside settings.json holds the original bytes (saved by the first
+    grant), one grant-<pid>.json per run, and the digests of the settings this tool
+    wrote. The allow-list is always exactly the rules of the runs still alive; when the
+    last one leaves, the original bytes go back and the registry is removed. Grants of
+    dead runs (SIGKILL, a power cut) are dropped on the way.
+
+    A settings.json whose digest is not one this tool wrote is someone else's edit and is
+    never overwritten. Returns the rules still granted, or None when there was nothing
+    to do because no registry existed.
+    """
+    path = settings_path()
+    gdir = grants_dir()
+    state_path = os.path.join(gdir, "state.json")
+    orig_path = os.path.join(gdir, "settings.orig")
+    if os.path.islink(path):
+        raise GrantError(f"FAILED: {path} is a symlink; refusing to follow it", 2)
+    current = read_bytes_or_none(path)
+
+    if os.path.islink(gdir):
+        raise GrantError(f"FAILED: {gdir} is a symlink; not touching it", 2)
+    if os.path.isdir(gdir) and not os.path.exists(state_path):
+        # A first grant that died before writing its state never wrote settings.json
+        # either (state comes first), so only the half-made registry needs to go.
+        shutil.rmtree(gdir)
+    if not os.path.isdir(gdir):
+        if add_rule is None:
+            return None
+        check_user_settings(path, current)
+        os.mkdir(gdir, 0o700)
+        if current is not None:
+            save_private(orig_path, current)
+        mode = 0o600 if current is None else stat.S_IMODE(os.stat(path).st_mode)
+        save_private(state_path, json.dumps({
+            "existed": current is not None, "mode": mode, "accepted": [digest(current)],
+        }).encode("utf-8"))
+
+    with open(state_path, "rb") as f:
+        state = json.loads(f.read().decode("utf-8"))
+    original = None
+    if state["existed"]:
+        with open(orig_path, "rb") as f:
+            original = f.read()
+
+    # The original bytes are never someone else's edit: a run killed after putting them
+    # back, but before removing the registry, leaves exactly that.
+    if digest(current) not in state["accepted"] and current != original:
+        live = sorted(n for n in os.listdir(gdir) if n.startswith("grant-"))
+        raise GrantError(
+            f"FAILED: {path} was changed by someone else while agy-review grants were in "
+            "place, so it was not touched. It may still hold the read_file rules of "
+            f"{len(live)} run(s). The original is "
+            + (f"kept at {orig_path}" if state["existed"] else "no file at all")
+            + f". Fix {path} by hand, then delete {gdir}.",
+            2 if add_rule is not None else 1,
+        )
+
+    rules = set()
+    for name in os.listdir(gdir):
+        m = re.fullmatch(r"grant-(\d+)\.json", name)
+        if not m:
+            continue
+        pid = int(m.group(1))
+        with open(os.path.join(gdir, name), "rb") as f:
+            grant = json.loads(f.read().decode("utf-8"))
+        # A grant file carrying this process's pid is dropped: on release it is this
+        # run's own, and on acquire (which writes its own after this loop) or --restore
+        # it was left by a dead run whose pid the OS has since handed to this process.
+        if pid == os.getpid() or not grant_alive(pid, grant.get("started")):
+            os.unlink(os.path.join(gdir, name))
+            continue
+        rules.add(grant["rule"])
+    if add_rule is not None:
+        save_private(
+            os.path.join(gdir, f"grant-{os.getpid()}.json"),
+            json.dumps({
+                "pid": os.getpid(),
+                "started": process_start(os.getpid()),
+                "rule": add_rule,
+            }).encode("utf-8"),
+        )
+        rules.add(add_rule)
+
+    rules = sorted(rules)
+    if rules:
+        written = render(original, rules)
+        if written != current:
+            # Accept both digests while the write is in flight, so a death between the
+            # two state updates is not mistaken for someone else's edit.
+            state["accepted"] = [digest(current), digest(written)]
+            save_private(state_path, json.dumps(state).encode("utf-8"))
+            # 0600 while any grant is in place; the original mode returns with the
+            # original bytes.
+            atomic_write(path, written, 0o600)
+            state["accepted"] = [digest(written)]
+            save_private(state_path, json.dumps(state).encode("utf-8"))
+    else:
+        if state["existed"]:
+            if current != original:
+                atomic_write(path, original, state["mode"])
+        elif current is not None:
+            os.unlink(path)
+        shutil.rmtree(gdir)
+    return rules
+
+
+class RepoGrant:
+    """One run's read_file rule in agy's global settings, shared with any other --repo
+    runs that overlap it, and its removal.
+
+    main() keeps SIGINT, SIGTERM and SIGHUP blocked from the end of the agy run, so the
+    release is never cut short; a signal during acquire() is reconciled by its cleanup.
+    """
+
+    def __init__(self, repo):
+        self.rule = f"read_file({repo})"
+        self.path = settings_path()
+        self.held = False
+        self.registered = False
+
+    def acquire(self):
+        if not os.path.isdir(config_dir()):
+            die(f"FAILED: {config_dir()} does not exist — run `agy` once in a terminal first", 2)
+        cleanup_error = None
+        try:
+            with settings_mutex():
+                # Nothing is written before the mutex is held, so a signal or an error
+                # while waiting for it leaves nothing to undo. From here on, signals stay
+                # blocked (main() lifts them only while agy runs), and a failure part
+                # way through is reconciled under this same lock.
+                signal.pthread_sigmask(signal.SIG_BLOCK, GRANT_SIGNALS)
+                try:
+                    update_grants(add_rule=self.rule)
+                except GrantError:
+                    raise  # every refusal comes before anything is written
+                except BaseException:
+                    try:
+                        update_grants()
+                    except BaseException as e:  # noqa: BLE001 - reported below
+                        cleanup_error = e
+                    raise
+                self.held = self.registered = True
+        except GrantError as e:
+            die(str(e), e.code)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            if cleanup_error is not None:
+                die(
+                    f"FAILED: could not add the read grant to {self.path} ({e}), nor clean "
+                    f"up after it ({cleanup_error}). Inspect it and run "
+                    "`agy-review --restore`.",
+                    1,
+                )
+            die(f"FAILED: could not add the read grant to {self.path} ({e})", 2)
+
+    def release(self):
+        """Take this run's rule back out. Returns only when that is done."""
+        if not self.held:
+            return
+        self.held = False
+        problem, rules = None, None
+        try:
+            with settings_mutex():
+                rules = update_grants()
+            if rules is None and self.registered:
+                problem = (
+                    f"the grant registry {grants_dir()} vanished during the run; "
+                    f"{self.path} may still contain `{self.rule}`"
+                )
+        except GrantError as e:
+            problem = str(e).removeprefix("FAILED: ")
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            problem = (
+                f"could not take `{self.rule}` back out of {self.path} ({e}); inspect it "
+                "and run `agy-review --restore`"
+            )
+        if problem:
+            die(f"FAILED: {problem}", 1)
+        if rules:
+            print(
+                f"repo:       grant removed; {len(rules)} rule(s) of other running "
+                "reviews stay until they finish",
+                file=sys.stderr,
+            )
+
+
+# Directories under HOME that hold credentials. A --repo directory may neither sit inside
+# one nor contain one, wherever the symlinks of a dotfiles setup put them.
+SECRET_DIRS = (
+    (".gemini", "agy's own OAuth token"),
+    (".ssh", "SSH keys"),
+    (".gnupg", "GPG keys"),
+    (".aws", "AWS credentials"),
+)
+
+
+def inside(path, root):
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def git_env():
+    """The environment for git, minus GIT_* variables: an exported GIT_DIR or
+    GIT_WORK_TREE would make git answer about another repository entirely."""
+    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+
+def resolve_repo(raw):
+    """The directory a --repo run may read, resolved, or a refusal."""
+    repo = os.path.realpath(os.path.expanduser(raw))
+    if not os.path.isdir(repo):
+        die(f"usage: --repo {raw} is not a directory", 2)
+    home = os.path.realpath(os.path.expanduser("~"))
+    if inside(home, repo):
+        die(
+            f"usage: --repo {repo} contains the whole home directory, ~/.ssh and agy's own "
+            "token included. Name the project directory.",
+            2,
+        )
+    for name, why in SECRET_DIRS:
+        secret = os.path.realpath(os.path.join(home, name))
+        if inside(repo, secret) or inside(secret, repo):
+            die(
+                f"usage: --repo {repo} overlaps ~/{name} ({secret}), which holds {why}",
+                2,
+            )
+    if UNSAFE_RULE_CHARS.search(repo):
+        die(
+            f"usage: --repo {repo!r} contains a parenthesis or a control character, "
+            "which cannot be written into an agy rule safely",
+            2,
+        )
+    return repo
+
+
+def run_git(repo, *args):
+    # core.fsmonitor names a program git would run: never from a repo under review.
+    try:
+        return subprocess.run(
+            ["git", "-c", "core.fsmonitor=false", "-C", repo, *args],
+            stdin=subprocess.DEVNULL, capture_output=True, env=git_env(),
+        )
+    except OSError as e:
+        die(f"FAILED: cannot run git in {repo}: {e}", 2)
+
+
+def list_repo_files(repo):
+    """The tracked files under `repo`, relative to it, as the model will be shown them."""
+    top = run_git(repo, "rev-parse", "--show-toplevel")
+    # Only the line ending is trimmed: a work tree path may begin or end with a space.
+    # An empty answer is no work tree at all; realpath("") would be the caller's cwd.
+    toplevel_raw = top.stdout.decode("utf-8", "surrogateescape").rstrip("\r\n")
+    if top.returncode != 0 or not toplevel_raw:
+        detail = top.stderr.decode("utf-8", "replace").strip()
+        die(f"usage: --repo {repo} is not in a git work tree ({detail})", 2)
+    toplevel = os.path.realpath(toplevel_raw)
+    home = os.path.realpath(os.path.expanduser("~"))
+    if inside(home, toplevel):
+        # A dotfiles repo rooted at HOME makes every directory under it "tracked".
+        die(
+            f"usage: --repo {repo} is in a git work tree rooted at the home directory "
+            f"({toplevel}), not in a project of its own",
+            2,
+        )
+    res = run_git(repo, "ls-files", "-z")
+    if res.returncode != 0:
+        detail = res.stderr.decode("utf-8", "replace").strip()
+        die(f"usage: --repo {repo} is not in a git work tree ({detail})", 2)
+    files, skipped = [], 0
+    for raw in res.stdout.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            name = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            skipped += 1
+            continue
+        if re.search(r"[\x00-\x1f\x7f]", name):
+            skipped += 1  # a newline would split one entry of the list into two
+            continue
+        files.append(name)
+    if skipped:
+        print(
+            f"warning: {skipped} tracked file(s) under {repo} have names that are not "
+            "printable UTF-8 and were left out of the list shown to the model",
+            file=sys.stderr,
+        )
+    if not files:
+        die(f"usage: --repo {repo} has no tracked files to read", 2)
+    if len(files) > MAX_REPO_FILES:
+        die(
+            f"usage: --repo {repo} has {len(files)} tracked files, more than "
+            f"{MAX_REPO_FILES}; the list would crowd out the review. Pass a subdirectory.",
+            2,
+        )
+    return files
+
+
+def repo_prompt(repo, files, prompt):
+    """The user's prompt between the access rules and the file list.
+
+    Measured on agy 1.3.5: told to explore a repo, the model ran `find`, which is denied
+    and empties the review; given the list and told to read only, it read files with
+    view_file and finished, three runs out of three.
+    """
+    rules = (
+        f"Repository access for this review: you may read files under {repo} with your "
+        "file-viewing tool (read_file / view_file), and nothing else. Every other tool is "
+        "denied in this run, and a single denied call discards the whole review: do NOT "
+        "run shell commands, do NOT search, do NOT list directories. Use the list of "
+        "tracked files at the end of this prompt instead of exploring. Paths in it are "
+        f"relative to {repo}: join them with that directory to get the absolute path to "
+        "read. Read what you need for context; you do not have to read everything.\n\n"
+    )
+    listing = f"\n\nTracked files under {repo} ({len(files)}):\n" + "\n".join(files) + "\n"
+    return rules + prompt + listing
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("target", nargs="?")
@@ -395,6 +951,8 @@ def main():
     ap.add_argument("--timeout", default=None)
     ap.add_argument("--agy")
     ap.add_argument("--no-retry", action="store_true")
+    ap.add_argument("--repo", default=None)
+    ap.add_argument("--restore", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
     args = ap.parse_args()
 
@@ -407,6 +965,7 @@ def main():
     for flag, value in (
         ("--check", args.check), ("--model", args.model), ("--effort", args.effort),
         ("--out", args.out), ("--timeout", args.timeout), ("--agy", args.agy),
+        ("--repo", args.repo),
     ):
         if value is not None and not value.strip():
             die(f"usage: {flag} was given an empty value", 2)
@@ -418,6 +977,41 @@ def main():
             "or pass a claude id for a second opinion.",
             2,
         )
+
+    if args.restore:
+        given = [
+            name
+            for name, value in (
+                ("PROMPT_FILE", args.target), ("--check", args.check),
+                ("--out", args.out), ("--agy", args.agy), ("--effort", args.effort),
+                ("--model", args.model), ("--timeout", args.timeout),
+                ("--no-retry", args.no_retry or None), ("--repo", args.repo),
+            )
+            if value is not None
+        ]
+        if given:
+            die(f"usage: --restore takes no other options, got: {', '.join(given)}", 2)
+        if not os.path.isdir(config_dir()):
+            print(f"nothing to restore: {config_dir()} does not exist", file=sys.stderr)
+            return 0
+        try:
+            with settings_mutex():
+                rules = update_grants()
+        except GrantError as e:
+            die(str(e), 1)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            die(f"FAILED: could not restore {settings_path()} ({e})", 1)
+        if rules is None:
+            print("nothing to restore: no --repo grant is outstanding", file=sys.stderr)
+        elif rules:
+            print(
+                f"grants of dead runs removed; {len(rules)} rule(s) of running reviews "
+                f"stay until they finish: {', '.join(rules)}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"restored {settings_path()}; no --repo grant is left", file=sys.stderr)
+        return 0
 
     if args.check is not None:
         # --check validates an existing envelope; nothing about a run applies to it.
@@ -432,6 +1026,7 @@ def main():
                 ("--model", args.model),
                 ("--timeout", args.timeout),
                 ("--no-retry", args.no_retry or None),
+                ("--repo", args.repo),
             )
             if value is not None
         ]
@@ -462,6 +1057,11 @@ def main():
         # exec() cannot carry a NUL; without this the failure is a ValueError traceback
         # from deep inside subprocess.
         die(f"FAILED: prompt file {args.target} contains a NUL byte", 2)
+
+    repo = None
+    if args.repo is not None:
+        repo = resolve_repo(args.repo)
+        prompt = repo_prompt(repo, list_repo_files(repo), prompt)
 
     binary = find_agy(args.agy)
 
@@ -540,86 +1140,126 @@ def main():
         )
 
     tried = []
-    while True:
-        attempt = len(tried) + 1
-        if attempt > 1:
-            # Each attempt keeps its own raw report: the failed one is the evidence that
-            # the retry was warranted, and overwriting it would destroy that.
-            out_path = os.path.join(out_dir, f"out-{attempt}.json")
-            err_path = os.path.join(out_dir, f"err-{attempt}.txt")
-            for path in (out_path, err_path):
-                if os.path.lexists(path):
-                    die(
-                        f"FAILED: {path} already exists — pick a different --out so an "
-                        "earlier run's raw report is not overwritten",
-                        2,
-                    )
-
-        cmd = [
-            binary,
-            "-p", prompt,
-            "--model", model,
-            "--disable-slash-commands",
-            "--output-format", "json",
-            "--print-timeout", timeout,
-        ]
-        if effort is not None:
-            cmd += ["--effort", effort]
-
-        # Announce the paths BEFORE running: a pre-exec failure (a bad shebang in the
-        # target, say) would otherwise leave an implicitly created temp directory nobody
-        # can find. The model goes here too, so a fallback is visible even when the run
-        # then fails — every finding has to be reported with the model that produced it.
-        print(
-            f"model:      {model} ({model_source})"
-            + (f", effort {effort}" if effort is not None else ""),
-            file=sys.stderr,
-        )
-        print(f"raw output: {out_path}", file=sys.stderr)
-        print(f"stderr:     {err_path}", file=sys.stderr)
-
-        envelope_bytes = None
-        try:
-            with private_create(out_path) as out_f, private_create(err_path) as err_f:
-                rc = subprocess.call(
-                    cmd, stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f
-                )
-                # Read the envelope back through the SAME descriptor we handed the child.
-                # Re-opening by pathname would let anyone who can write the output
-                # directory unlink out.json and drop a forged SUCCESS envelope in its
-                # place between the run and the check.
-                out_f.flush()
-                out_f.seek(0)
-                envelope_bytes = out_f.read()
-        except OSError as e:
-            die(f"FAILED: could not run {binary}: {e}", 2)
-        except ValueError as e:
-            die(f"FAILED: could not run {binary}: {e}", 2)
-
-        tried.append(effort if effort is not None else "n/a")
-
-        # The limit error arrives with either exit code, so it is inspected before the
-        # exit-code branch below: a retryable failure must not be reported as a dead end.
-        # Only THIS error is retried — every other one means running again changes
-        # nothing, and would just bill a second time for the same answer.
-        if hit_output_limit(
-            envelope_error_text(envelope_bytes.decode("utf-8", "replace"))
-        ):
-            nxt = lower_effort(effort) if steppable else None
-            if nxt is not None:
-                print(
-                    f"warning: attempt {attempt} at --effort {effort} exceeded the "
-                    f"output token limit; retrying at --effort {nxt}. The failed "
-                    f"attempt is kept at {out_path}.",
-                    file=sys.stderr,
-                )
-                effort = nxt
-                continue
-            die(
-                f"FAILED: {limit_guidance(model, tried, args.no_retry)}\n"
-                f"— see {err_path}"
+    grant = None
+    if repo is not None:
+        # SIGTERM and SIGHUP would otherwise end Python without running `finally`, and
+        # leave the grant in agy's global settings. The handler blocks further signals
+        # and raises, which unwinds through subprocess.call (killing agy) into the
+        # `finally` below. Once agy has run, signals stay blocked, so none can land
+        # inside that `finally` and cut the release short. Before that, a signal during
+        # acquire() unwinds through acquire's own cleanup.
+        def unwind(signum, _frame):
+            signal.pthread_sigmask(signal.SIG_BLOCK, GRANT_SIGNALS)
+            raise SystemExit(128 + signum)
+        for s in GRANT_SIGNALS:
+            signal.signal(s, unwind)
+        grant = RepoGrant(repo)
+    try:
+        if grant is not None:
+            grant.acquire()
+            print(
+                f"repo:       {grant.rule} added to {grant.path} for this run",
+                file=sys.stderr,
             )
-        break
+        while True:
+            attempt = len(tried) + 1
+            if attempt > 1:
+                # Each attempt keeps its own raw report: the failed one is the evidence that
+                # the retry was warranted, and overwriting it would destroy that.
+                out_path = os.path.join(out_dir, f"out-{attempt}.json")
+                err_path = os.path.join(out_dir, f"err-{attempt}.txt")
+                for path in (out_path, err_path):
+                    if os.path.lexists(path):
+                        die(
+                            f"FAILED: {path} already exists — pick a different --out so an "
+                            "earlier run's raw report is not overwritten",
+                            2,
+                        )
+
+            cmd = [
+                binary,
+                "-p", prompt,
+                "--model", model,
+                "--disable-slash-commands",
+                "--output-format", "json",
+                "--print-timeout", timeout,
+            ]
+            if effort is not None:
+                cmd += ["--effort", effort]
+
+            # Announce the paths BEFORE running: a pre-exec failure (a bad shebang in the
+            # target, say) would otherwise leave an implicitly created temp directory nobody
+            # can find. The model goes here too, so a fallback is visible even when the run
+            # then fails — every finding has to be reported with the model that produced it.
+            print(
+                f"model:      {model} ({model_source})"
+                + (f", effort {effort}" if effort is not None else ""),
+                file=sys.stderr,
+            )
+            print(f"raw output: {out_path}", file=sys.stderr)
+            print(f"stderr:     {err_path}", file=sys.stderr)
+
+            envelope_bytes = None
+            try:
+                with private_create(out_path) as out_f, private_create(err_path) as err_f:
+                    # agy inherits the signal mask, so it is lifted for exactly the
+                    # child's lifetime: Ctrl-C reaches agy, and a signal that arrived
+                    # while blocked is delivered here, inside the `try`.
+                    if grant is not None:
+                        signal.pthread_sigmask(signal.SIG_UNBLOCK, GRANT_SIGNALS)
+                    try:
+                        rc = subprocess.call(
+                            cmd, stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f
+                        )
+                    finally:
+                        if grant is not None:
+                            signal.pthread_sigmask(signal.SIG_BLOCK, GRANT_SIGNALS)
+                    # Read the envelope back through the SAME descriptor we handed the child.
+                    # Re-opening by pathname would let anyone who can write the output
+                    # directory unlink out.json and drop a forged SUCCESS envelope in its
+                    # place between the run and the check.
+                    out_f.flush()
+                    out_f.seek(0)
+                    envelope_bytes = out_f.read()
+                    # The same for stderr, which the print-timeout check reads.
+                    err_f.flush()
+                    err_f.seek(0)
+                    stderr_bytes = err_f.read()
+            except OSError as e:
+                die(f"FAILED: could not run {binary}: {e}", 2)
+            except ValueError as e:
+                die(f"FAILED: could not run {binary}: {e}", 2)
+
+            tried.append(effort if effort is not None else "n/a")
+
+            # The limit error arrives with either exit code, so it is inspected before the
+            # exit-code branch below: a retryable failure must not be reported as a dead end.
+            # Only THIS error is retried — every other one means running again changes
+            # nothing, and would just bill a second time for the same answer.
+            if hit_output_limit(
+                envelope_error_text(envelope_bytes.decode("utf-8", "replace"))
+            ):
+                nxt = lower_effort(effort) if steppable else None
+                if nxt is not None:
+                    print(
+                        f"warning: attempt {attempt} at --effort {effort} exceeded the "
+                        f"output token limit; retrying at --effort {nxt}. The failed "
+                        f"attempt is kept at {out_path}.",
+                        file=sys.stderr,
+                    )
+                    effort = nxt
+                    continue
+                die(
+                    f"FAILED: {limit_guidance(model, tried, args.no_retry)}\n"
+                    f"— see {err_path}"
+                )
+            break
+    finally:
+        if grant is not None:
+            grant.release()
+            # The grant is gone; a signal held back while it was being taken out is
+            # delivered now and ends the run with 128 + signum, as it was meant to.
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, GRANT_SIGNALS)
 
     # A non-zero exit is reported with its code before any envelope complaint, so the
     # real failure is never masked by "empty output file".
@@ -638,12 +1278,25 @@ def main():
             pass
         die(f"FAILED: agy exited {rc}{detail} — see {err_path}")
 
+    # Seen on agy 1.3.5 (a --repo review at gemini-4-argon, effort high): at the print
+    # timeout agy says "returning partial output" on stderr and still reports SUCCESS.
+    # Whatever the response holds then is a review cut off mid-turn, never a whole one.
+    # Read through the descriptor agy wrote to, never by pathname: a file swapped or
+    # removed in a writable --out must not hide the marker.
+    if PRINT_TIMEOUT_MARKER in stderr_bytes.decode("utf-8", "replace").lower():
+        die(
+            f"FAILED: agy hit --print-timeout {timeout} with the turn still in progress "
+            "and returned partial output, so there is no complete review. Re-run with a "
+            f"longer --timeout (a --repo review reads files first and takes longer) — see "
+            f"{err_path}"
+        )
+
     try:
         envelope_text = envelope_bytes.decode("utf-8")
     except UnicodeDecodeError as e:
         die(f"FAILED: {out_path} is not valid UTF-8 ({e}) — see {err_path}")
     env = envelope_from_text(envelope_text, f" — see {err_path}")
-    response, env = validate(out_path, err_path, env=env)
+    response, env = validate(out_path, err_path, env=env, repo=repo)
 
     usage = env.get("usage") or {}
     print(
