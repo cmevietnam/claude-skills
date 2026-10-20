@@ -1,6 +1,6 @@
 ---
 name: codex
-description: Use when the user asks to run Codex CLI (codex exec, codex resume, codex fork, codex review) or references OpenAI Codex for code analysis, code review, refactoring, or automated editing. Runs OpenAI's Codex agent non-interactively; the default model comes from ~/.codex/config.toml (currently gpt-5.6-sol), with gpt-6-astra available for the hardest work.
+description: Use when the user asks to run Codex CLI (codex exec, codex resume, codex fork, codex review) or references OpenAI Codex for code analysis, code review, refactoring, or automated editing. Runs OpenAI's Codex agent non-interactively on gpt-6.1-sol at effort xhigh by default, pinned on every call rather than taken from ~/.codex/config.toml.
 ---
 
 # Codex
@@ -9,7 +9,7 @@ Codex is consulted precisely because its verdict may differ from mine. Everythin
 this skill follows from that: the run is the cheap part, and **getting Codex's words to
 the user intact, before any diff, is the whole point**.
 
-Verified against Codex CLI **v0.153.4** (2026-09-05). Flags and models move between
+Verified against Codex CLI **v0.162.1** (2026-10-20). Flags and models move between
 releases — after `brew upgrade --cask codex` or `codex update`, re-verify with
 `codex exec --help` and re-read `~/.codex/models_cache.json`.
 
@@ -37,19 +37,21 @@ Full protocol and the incident behind it: `references/reporting-findings.md`.
 
 ## Running a task
 
-- **Model**: omit `-m` to take the default from `~/.codex/config.toml`
-  (`gpt-5.6-sol`). Pass `-m gpt-6-astra` — OpenAI's frontier model since 2026-09-03, and
-  first in the `/model` list — for the hardest work, or `-m gpt-5.6-luna` for a cheaper,
-  faster run. Astra needs a CLI that knows it (`0.149.1` did not; `0.153.4` does), so
-  `codex update` if a run is rejected for the model. To confirm what an omitted `-m` will
-  actually pick: `grep '^model' ~/.codex/config.toml` — it does not follow new releases
-  on its own.
-- **Effort**: ask via `AskUserQuestion`. On `gpt-6-astra` and `gpt-5.6-sol`/`-terra` the
-  ladder is `ultra`, `max`, `xhigh`, `high`, `medium`, `low` (Luna stops at `max`;
-  `gpt-5.5` and `gpt-5.4-mini` stop at `xhigh`). Pass as
-  `-c model_reasoning_effort="<effort>"`. Astra and Sol both ship `low` as their own
-  default and are strong there — start lower and raise it, rather than defaulting to the
-  top of the ladder.
+- **Model**: always pass `-m gpt-6.1-sol` — OpenAI's latest workhorse, first in the
+  `/model` list as of 2026-10-20 — unless the user names another model. Never omit `-m`:
+  an omitted `-m` takes `model =` from `~/.codex/config.toml`, which does not follow new
+  releases and still said `gpt-5.6-sol` on 2026-10-20. Use `-m gpt-6-astra` (frontier
+  model) or `-m gpt-6-luna` (fast and cheap) only when the user asks for them. If a run is
+  rejected for the model, `codex update`: 0.162.1 runs `gpt-6.1-sol`; older builds were
+  not tried.
+- **Effort**: always pass `-c model_reasoning_effort="xhigh"` unless the user names
+  another effort; don't ask. Never omit it: the model's own default is `low`, and
+  `model_reasoning_effort` in `~/.codex/config.toml` (`medium` on 2026-10-20) overrides
+  that. On the Sol, Terra and Astra lines the ladder is `ultra`, `max`, `xhigh`, `high`,
+  `medium`, `low`; the Luna line stops at `max`.
+- **Check the banner**: stderr opens with `model:`, `sandbox:` and `reasoning effort:`
+  lines. When a run fails or an answer looks off, rerun with `2>&1` and report those
+  three lines as they were.
 - **Sandbox**: `read-only` by default; `workspace-write` to let it edit;
   `danger-full-access` only when network or broad access is genuinely required, and only
   after asking.
@@ -64,69 +66,87 @@ Full protocol and the incident behind it: `references/reporting-findings.md`.
 ```bash
 # Read-only review or analysis (safe default)
 codex exec --skip-git-repo-check --sandbox read-only \
-  -c model_reasoning_effort="medium" -o /tmp/codex-out.md \
+  -m gpt-6.1-sol -c model_reasoning_effort="xhigh" -o /tmp/codex-out.md \
   "your prompt" </dev/null 2>/dev/null
 
 # Apply local edits
 codex exec --skip-git-repo-check --sandbox workspace-write \
+  -m gpt-6.1-sol -c model_reasoning_effort="xhigh" \
   "your prompt" </dev/null 2>/dev/null
 
-# Another directory + a cheaper model
-codex exec --skip-git-repo-check -C /path/to/repo -m gpt-5.6-luna \
+# Another directory + a cheaper model, when the user asks for one
+codex exec --skip-git-repo-check -C /path/to/repo -m gpt-6-luna \
+  -c model_reasoning_effort="xhigh" \
   "your prompt" </dev/null 2>/dev/null
 ```
 
 ## Continuing a session
 
 ```bash
-codex exec resume --last "follow-up prompt" </dev/null 2>/dev/null
-codex exec resume <SESSION_ID> "follow-up prompt" </dev/null 2>/dev/null
-codex exec fork --last "branch the session here" </dev/null 2>/dev/null
+codex exec resume --skip-git-repo-check <SESSION_ID> \
+  -m gpt-6.1-sol -c model_reasoning_effort="xhigh" -c sandbox_mode="read-only" \
+  "follow-up prompt" </dev/null 2>/dev/null
+codex exec resume --skip-git-repo-check --last \
+  -m gpt-6.1-sol -c model_reasoning_effort="xhigh" -c sandbox_mode="read-only" \
+  "follow-up prompt" </dev/null 2>/dev/null
+codex exec fork --skip-git-repo-check --last \
+  -m gpt-6.1-sol -c model_reasoning_effort="xhigh" -s read-only \
+  "branch the session here" </dev/null 2>/dev/null
 ```
 
-Sessions are filtered by cwd; `--all` disables that. `-m` / `-c` are accepted on resume,
-but omit them — the session inherits its model, effort, and sandbox. `--last` cannot find
-a run made with `--ephemeral`.
+**A resume does not inherit the first run's model or effort.** On 0.162.1 a session
+started on `gpt-6.1-sol` at `xhigh` resumed without flags as `gpt-5.6-sol` at `medium`,
+the config values. Repeat `-m` and `-c model_reasoning_effort` on every resume, and pass
+the sandbox the first run had: `resume` has no `-s`, so use `-c sandbox_mode="..."`.
+Without `--skip-git-repo-check`, a resume outside a trusted directory exits 1 with
+"Not inside a trusted directory". Sessions are filtered by cwd; `--all` disables that.
+`--last` cannot find a run made with `--ephemeral`.
 
 After a run finishes, tell the user they can resume it at any time.
 
 ## Reviewing a repository
 
+`codex review` has no `-m`, so the model goes in as `-c model="..."`:
+
 ```bash
-codex review --uncommitted 2>/dev/null              # staged + unstaged + untracked
-codex review --base main 2>/dev/null                # against a base branch
-codex review --commit <SHA> 2>/dev/null             # one commit
-codex review --base main "focus on security" 2>/dev/null
+# staged + unstaged + untracked
+codex review --uncommitted -c model="gpt-6.1-sol" -c model_reasoning_effort="xhigh" 2>/dev/null
+# against a base branch, with custom instructions
+codex review --base main -c model="gpt-6.1-sol" -c model_reasoning_effort="xhigh" \
+  "focus on security" 2>/dev/null
+# one commit
+codex review --commit <SHA> -c model="gpt-6.1-sol" -c model_reasoning_effort="xhigh" 2>/dev/null
 ```
 
 The same reporting rule applies: the review's findings reach the user before any fix does.
 
 ## Models
 
-Snapshot from `~/.codex/models_cache.json` (fetched 2026-09-05) — that file and `/model`
-in an interactive session are authoritative. The cache only refreshes on a real run, not
-from `codex doctor`, so a model can be missing simply because nothing has run since the
-upgrade. Prices drift; do not hardcode them.
+Snapshot from `~/.codex/models_cache.json` (fetched 2026-10-20 by 0.162.0) — that file
+and `/model` in an interactive session are authoritative. The cache only refreshes on a
+real run, not from `codex doctor`, so a model can be missing simply because nothing has
+run since the upgrade. Prices drift; do not hardcode them.
 
-| Model | Notes | Efforts |
-|---|---|---|
-| `gpt-6-astra` | GPT-6 frontier model, for complex, demanding work — pass `-m` | low → ultra |
-| `gpt-5.6-sol` | **Config default**; reliable agentic workhorse | low → ultra |
-| `gpt-5.6-terra` | Balanced, for everyday work | low → ultra |
-| `gpt-5.6-luna` | Fast and affordable | low → max |
-| `gpt-5.5` | Proven previous generation | low → xhigh |
-| `gpt-5.4-mini` | Small and cheap; past its retirement date, migrate to Luna | low → xhigh |
-| `gpt-oss-120b/20b` | Local, via `--oss` + `--local-provider` | low → high |
+| Model              | Notes                                                                | Efforts     |
+| ------------------ | -------------------------------------------------------------------- | ----------- |
+| `gpt-6.1-sol`      | **Skill default** (pinned with `-m`); latest workhorse, 500k context | low → ultra |
+| `gpt-6-astra`      | Frontier model for the most demanding work, 272k context             | low → ultra |
+| `gpt-6-sol`        | Previous workhorse                                                   | low → ultra |
+| `gpt-6-luna`       | Fast and affordable, for easier tasks                                | low → max   |
+| `gpt-5.6-sol`      | Older workhorse; still the `model =` line in `~/.codex/config.toml`  | low → ultra |
+| `gpt-5.6-terra`    | Older balanced model                                                 | low → ultra |
+| `gpt-5.6-luna`     | Older fast model                                                     | low → max   |
+| `gpt-oss-120b/20b` | Local, via `--oss` + `--local-provider`                              | low → high  |
 
-Astra carries a 272k context window (872k max) and ships `low` as its own default effort,
-which `model_reasoning_effort = "medium"` in `~/.codex/config.toml` overrides.
-Plain `gpt-5.4` and the `gpt-5.3-codex` / `gpt-5.2-codex` line are gone from the list —
-don't reach for them.
+Every listed model has an 872k max context. `gpt-6.1-sol` and `gpt-6-astra` ship `low`
+as their own default effort, which the skill's `-c model_reasoning_effort="xhigh"`
+overrides. `gpt-5.5` and `gpt-5.4-mini` are gone from the list, like plain `gpt-5.4` and
+the `gpt-5.x-codex` line — don't reach for them.
 
-**Effort guide**: `ultra` hardest problems, auto-delegates subtasks (Astra, Sol, Terra) ·
-`max` maximum depth, no delegation · `xhigh` ultra-complex analysis · `high` refactoring,
-architecture, security · `medium` everyday work (the config default) · `low` quick fixes
-and docs — and, on Astra, plenty of real work too.
+**Effort guide**: `ultra` hardest problems, auto-delegates subtasks (Sol, Terra, Astra) ·
+`max` maximum depth, no delegation · `xhigh` deep analysis (the skill default) · `high`
+refactoring, architecture, security · `medium` everyday work · `low` quick fixes and docs.
+Go below `xhigh` only when the user asks for a faster or cheaper run.
 
 ## Production changes
 

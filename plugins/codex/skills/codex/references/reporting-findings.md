@@ -46,12 +46,12 @@ compressed into my own summary and implementation started immediately under an e
 "then fix it" go-ahead. The user could not review the actual findings before work began.
 
 The value of a second opinion is the part I would not have written myself. That part must
-reach the user intact, and must reach them *before* the diff does.
+reach the user intact, and must reach them _before_ the diff does.
 
 ## Shape of a good report
 
 ```
-## Codex findings (gpt-5.6-sol, effort=high, sandbox=read-only)
+## Codex findings (gpt-6.1-sol, effort=xhigh, sandbox=read-only)
 
 Raw output: /tmp/codex-review.md
 
