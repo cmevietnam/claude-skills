@@ -71,9 +71,10 @@ but no `-s`: set the sandbox with `-c sandbox_mode="..."`. `fork` also takes `-s
 
 A resume does **not** keep the first run's model or effort. On 0.162.1 a session started
 with `-m gpt-6.1-sol -c model_reasoning_effort="xhigh"` resumed without flags as
-`model: gpt-5.6-sol`, `reasoning effort: medium` (the config values); with both repeated
-it stayed on `gpt-6.1-sol` at `xhigh`. On 0.160.0 a session started `--sandbox read-only`
-resumed as `workspace-write`. Repeat all three on every resume and read the banner.
+`model: gpt-5.6-sol`, `reasoning effort: medium` (the config values at the time); with
+both repeated it stayed on `gpt-6.1-sol` at `xhigh`. On 0.160.0 a session started
+`--sandbox read-only` resumed as `workspace-write`. Repeat all three on every resume and
+read the banner.
 
 Without `--skip-git-repo-check`, a resume outside a trusted directory exits 1 with
 `Not inside a trusted directory and --skip-git-repo-check was not specified.`
@@ -128,7 +129,8 @@ for m in d['models']:
 Note that a model's own `default_reasoning_level` (`gpt-6.1-sol` and Astra ship `low`)
 is overridden by `model_reasoning_effort` in `~/.codex/config.toml`, and both are
 overridden by `-c model_reasoning_effort=...` on the command line. The same file's
-`model =` line decides which model an omitted `-m` selects — it was still `gpt-5.6-sol`
-(effort `medium`) on 2026-10-20, and it does not follow new releases on its own. That is
-why the skill pins `-m gpt-6.1-sol -c model_reasoning_effort="xhigh"` on every call
+`model =` line decides which model an omitted `-m` selects — it was `gpt-5.6-sol`
+(effort `medium`) until 2026-10-20, when it was set to `gpt-6.1-sol` / `xhigh` by hand; it
+does not follow new releases on its own, and other machines have their own. That is why
+the skill pins `-m gpt-6.1-sol -c model_reasoning_effort="xhigh"` on every call
 instead of relying on the config.

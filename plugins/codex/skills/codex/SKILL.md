@@ -40,13 +40,13 @@ Full protocol and the incident behind it: `references/reporting-findings.md`.
 - **Model**: always pass `-m gpt-6.1-sol` — OpenAI's latest workhorse, first in the
   `/model` list as of 2026-10-20 — unless the user names another model. Never omit `-m`:
   an omitted `-m` takes `model =` from `~/.codex/config.toml`, which does not follow new
-  releases and still said `gpt-5.6-sol` on 2026-10-20. Use `-m gpt-6-astra` (frontier
-  model) or `-m gpt-6-luna` (fast and cheap) only when the user asks for them. If a run is
-  rejected for the model, `codex update`: 0.162.1 runs `gpt-6.1-sol`; older builds were
-  not tried.
+  releases (it said `gpt-5.6-sol` until 2026-10-20) and differs between machines. Use
+  `-m gpt-6-astra` (frontier model) or `-m gpt-6-luna` (fast and cheap) only when the
+  user asks for them. If a run is rejected for the model, `codex update`: 0.162.1 runs
+  `gpt-6.1-sol`; older builds were not tried.
 - **Effort**: always pass `-c model_reasoning_effort="xhigh"` unless the user names
   another effort; don't ask. Never omit it: the model's own default is `low`, and
-  `model_reasoning_effort` in `~/.codex/config.toml` (`medium` on 2026-10-20) overrides
+  `model_reasoning_effort` in `~/.codex/config.toml` (`medium` until 2026-10-20) overrides
   that. On the Sol, Terra and Astra lines the ladder is `ultra`, `max`, `xhigh`, `high`,
   `medium`, `low`; the Luna line stops at `max`.
 - **Check the banner**: stderr opens with `model:`, `sandbox:` and `reasoning effort:`
@@ -96,11 +96,11 @@ codex exec fork --skip-git-repo-check --last \
 
 **A resume does not inherit the first run's model or effort.** On 0.162.1 a session
 started on `gpt-6.1-sol` at `xhigh` resumed without flags as `gpt-5.6-sol` at `medium`,
-the config values. Repeat `-m` and `-c model_reasoning_effort` on every resume, and pass
-the sandbox the first run had: `resume` has no `-s`, so use `-c sandbox_mode="..."`.
-Without `--skip-git-repo-check`, a resume outside a trusted directory exits 1 with
-"Not inside a trusted directory". Sessions are filtered by cwd; `--all` disables that.
-`--last` cannot find a run made with `--ephemeral`.
+the config values at the time. Repeat `-m` and `-c model_reasoning_effort` on every
+resume, and pass the sandbox the first run had: `resume` has no `-s`, so use
+`-c sandbox_mode="..."`. Without `--skip-git-repo-check`, a resume outside a trusted
+directory exits 1 with "Not inside a trusted directory". Sessions are filtered by cwd;
+`--all` disables that. `--last` cannot find a run made with `--ephemeral`.
 
 After a run finishes, tell the user they can resume it at any time.
 
@@ -133,7 +133,7 @@ run since the upgrade. Prices drift; do not hardcode them.
 | `gpt-6-astra`      | Frontier model for the most demanding work, 272k context             | low → ultra |
 | `gpt-6-sol`        | Previous workhorse                                                   | low → ultra |
 | `gpt-6-luna`       | Fast and affordable, for easier tasks                                | low → max   |
-| `gpt-5.6-sol`      | Older workhorse; still the `model =` line in `~/.codex/config.toml`  | low → ultra |
+| `gpt-5.6-sol`      | Older workhorse; the `model =` in `~/.codex/config.toml` until 10-20 | low → ultra |
 | `gpt-5.6-terra`    | Older balanced model                                                 | low → ultra |
 | `gpt-5.6-luna`     | Older fast model                                                     | low → max   |
 | `gpt-oss-120b/20b` | Local, via `--oss` + `--local-provider`                              | low → high  |
