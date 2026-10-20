@@ -30,8 +30,11 @@ is the intended shape — each reviewer's blind spot tends to be another's headl
 ## Requires
 
 Codex CLI on `PATH` (`brew install --cask codex`), authenticated via `codex login`.
-Verified against **0.153.4** on `gpt-6-astra`; the skill says which flags were checked and
-when. `gpt-6-astra` needs a recent CLI: 0.149.1 does not list it, 0.153.4 does.
+Every run uses **`gpt-6.1-sol` at effort `xhigh`** unless the user names another model or
+effort. The skill passes both on every call (`-m`, `-c model_reasoning_effort=...`), resumes
+included, so `model =` in `~/.codex/config.toml` no longer decides the model. Verified on
+**0.162.1** (2026-10-20); the skill says which flags were checked and when. Older builds
+were not tried with `gpt-6.1-sol`; `codex update` if a run is rejected for the model.
 
 ```bash
 codex --version
