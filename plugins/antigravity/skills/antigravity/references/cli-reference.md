@@ -180,16 +180,17 @@ discards the explanation of any failure.
 
 ## Models
 
-`agy models` prints `id<TAB>label`. Live list on 2026-10-14 (agy 1.3.4, a Google AI Ultra
-account), in the order printed:
+`agy models` prints `id<TAB>label`. Live list on 2026-11-01 (agy 1.4.10, a Google AI Ultra
+account), in the order printed. agy 1.3.4 listed the same ids on 2026-10-14, with the
+three Flash lines first:
 
 ```
-gemini-3.8-flash-high      Gemini 3.8 Flash (High)
-gemini-3.8-flash-medium    Gemini 3.8 Flash (Medium)
-gemini-3.8-flash-low       Gemini 3.8 Flash (Low)
 gemini-4-argon-medium      Gemini 4 Argon (Medium)
 gemini-4-argon-high        Gemini 4 Argon (High)
 gemini-4-argon-low         Gemini 4 Argon (Low)
+gemini-3.8-flash-high      Gemini 3.8 Flash (High)
+gemini-3.8-flash-medium    Gemini 3.8 Flash (Medium)
+gemini-3.8-flash-low       Gemini 3.8 Flash (Low)
 claude-opus-5-5-low/medium/high
 claude-sonnet-5-5-low/medium/high
 gpt-oss-120b-medium        GPT-OSS 120B (Medium)

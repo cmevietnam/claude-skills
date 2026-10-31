@@ -126,9 +126,9 @@ Then sign in **from a real terminal** — `agy` opens a TUI and there is no head
 sign-in (`bubbletea: could not open TTY`), so Claude Code's `!` prefix cannot do it.
 Headless runs afterwards reuse the cached credentials.
 
-Verified against **agy 1.1.27**, with the default model re-checked on agy 1.3.4 and `--repo` on agy 1.3.5; the
-skill says what was checked and when. `agy` self-updates in the background, so re-verify
-after a gap.
+Verified against **agy 1.1.27**, with the default model re-checked on agy 1.3.4, `--repo`
+on agy 1.3.5, and both again on agy 1.4.10; the skill says what was checked and when.
+`agy` self-updates in the background, so re-verify after a gap.
 
 ## Read
 

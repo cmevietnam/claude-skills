@@ -14,8 +14,9 @@ Gemini CLI path entirely: Google closed `gemini-cli` to personal Google accounts
 points them here (`references/why-not-gemini-cli.md`).
 
 Verified against **agy 1.1.27** (2026-09-05) by running every command below; the model
-list was re-checked on agy 1.2.11 (2026-09-25), and the default model, the model list and
-the effort rules again on agy 1.3.4 (2026-10-14). Re-verify after an upgrade — `agy`
+list was re-checked on agy 1.2.11 (2026-09-25), the default model, the model list and the
+effort rules on agy 1.3.4 (2026-10-14), and the model list, a default review and a
+`--repo` review on agy 1.4.10 (2026-11-01). Re-verify after an upgrade — `agy`
 self-updates in the background, so the version can move under you.
 
 ## Hard rule: present, then stop
@@ -74,7 +75,7 @@ a non-`SUCCESS` status, any `denied_actions`, or an empty/whitespace response �
 tells you where the raw `out.json` and `err.txt` are. Confirmed against the live CLI: a
 prompt that triggers an auto-deny gives `agy` exit 0 / SUCCESS and `agy-review` exit 1.
 
-`scripts/test-agy-review.sh` has 272 checks, 15 of them meta-tests that deliberately make
+`scripts/test-agy-review.sh` has 283 checks, 14 of them meta-tests that deliberately make
 each assertion helper fail — because a test that cannot go red proves nothing.
 
 Do not substitute `jq -r '.response // "failed"'`: on a zero-byte file `jq` prints
@@ -200,8 +201,8 @@ When a harder review or a second opinion is wanted, use a Claude id
 
 ### What `agy models` lists
 
-`agy models` is authoritative and needs auth. As of 2026-10-14 (agy 1.3.4, a Google AI
-Ultra account) it lists:
+`agy models` is authoritative and needs auth. As of 2026-11-01 (agy 1.4.10, a Google AI
+Ultra account; the same ids as on agy 1.3.4 on 2026-10-14) it lists:
 
 | Model                                                   | Notes                                                               |
 | ------------------------------------------------------- | ------------------------------------------------------------------- |
