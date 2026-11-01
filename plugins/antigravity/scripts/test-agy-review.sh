@@ -52,7 +52,7 @@ note_fail() { echo "FAIL  $1"; fail=$((fail + 1)); }
 run_bin() {
   # Drop any previous argv capture so a stale one cannot satisfy this run's assertions.
   case "$STUB_ARGV" in
-    "$TMP"/*) rm -f "$STUB_ARGV" "$STUB_ARGV".[0-9] ;;
+    "$TMP"/*) rm -f "$STUB_ARGV" "$STUB_ARGV".[0-9] "$STUB_ARGV".stdin "$STUB_ARGV".stdin.[0-9] ;;
     *) echo "FATAL: refusing to delete $STUB_ARGV, outside $TMP"; exit 1 ;;
   esac
   python3 "$BIN" "$@" >"$TMP/.stdout" 2>"$TMP/.stderr"
@@ -438,6 +438,39 @@ if [ -n "${STUB_SLEEP:-}" ]; then
     sleep 0.1
     i=$((i + 1))
   done
+fi
+# A multi-turn review: the turns arrive on stdin, one NDJSON message each. The stub keeps
+# them ($STUB_ARGV.stdin, and .stdin.<n> per attempt) and answers with STUB_STREAM_<n>,
+# else STUB_STREAM, else a stream of its own: READY to the first turn, REVIEW-PART-<k> to
+# turn k+1, each as the result event agy 1.4.12 writes.
+STREAM_IN=
+for a in "$@"; do [ "$a" = "--input-format" ] && STREAM_IN=1; done
+if [ -n "$STREAM_IN" ]; then
+  cat > "$STUB_ARGV.stdin.$N"
+  cp "$STUB_ARGV.stdin.$N" "$STUB_ARGV.stdin"
+  STREAM_VAR="STUB_STREAM_$N"
+  if [ -n "${!STREAM_VAR:-}" ]; then
+    cat "${!STREAM_VAR}"
+  elif [ -n "${STUB_STREAM:-}" ]; then
+    cat "$STUB_STREAM"
+  else
+    python3 - "$STUB_ARGV.stdin.$N" <<'PY'
+import json, sys
+print(json.dumps({"event": "init", "conversation_id": "stub-conv", "init": {}}))
+lines = [l for l in open(sys.argv[1], encoding="utf-8").read().split("\n") if l]
+for i, line in enumerate(lines, 1):
+    json.loads(line)
+    response = "READY" if i == 1 else f"REVIEW-PART-{i - 1}\n"
+    print(json.dumps({"event": "step_update", "step_update": {"index": i}}))
+    print(json.dumps({"event": "result", "result": {
+        "conversation_id": "stub-conv", "status": "SUCCESS", "response": response,
+        "duration_seconds": 1.0 * i, "num_turns": i,
+        "usage": {"input_tokens": 10, "output_tokens": i, "thinking_tokens": 0,
+                  "cache_read_tokens": 0, "total_tokens": 100 * i}}}))
+PY
+  fi
+  [ -n "${STUB_STDERR:-}" ] && cat "$STUB_STDERR" >&2
+  exit "${!RC_VAR:-${STUB_RC:-0}}"
 fi
 cat "${!OUT_VAR:-$STUB_STDOUT}"
 [ -n "${STUB_STDERR:-}" ] && cat "$STUB_STDERR" >&2
@@ -947,6 +980,271 @@ STUB_STDERR="$TMP/print-timeout.err" STUB_UNLINK_ERR="$TMP/run-print-timeout-2/e
   expect_fail "print timeout with err.txt removed" 1 "returned partial output" \
   --agy "$STUB" --out "$TMP/run-print-timeout-2" "$TMP/prompt.txt"
 
+# --- multi-turn: a git diff bigger than one part is one conversation -----------------
+# Turn 1 loads the whole diff, then one turn per part; the output budget is per turn.
+# Fixtures: four file sections of about 300, 300, 900 and 1500 bytes, so --part-kb 1 packs
+# them as [a.py b.py] [c.py] [d.py] — two files sharing a part, and one bigger than a part.
+
+python3 - "$TMP" <<'PY'
+import sys
+tmp = sys.argv[1]
+def section(name, size, extra=""):
+    head = (f"diff --git a/{name} b/{name}\nindex 1111111..2222222 100644\n"
+            f"--- a/{name}\n+++ b/{name}\n@@ -1 +1,40 @@\n")
+    body = extra
+    while len((head + body).encode()) < size:
+        body += f"+line {len(body)} of {name}\n"
+    return head + body
+def write(name, text):
+    with open(f"{tmp}/{name}", "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+instr = ("Review the diff below. Report file:line for each defect.\n"
+         "If you find nothing, reply with exactly: NO FINDINGS\n\n")
+diff = (section("a.py", 300, "+# café ✓\n") + section("b.py", 300)
+        + section("c.py", 900) + section("d.py", 1500))
+write("mt-instr.txt", instr)
+write("mt-diff.txt", diff)
+write("mt-prompt.txt", instr + diff)
+write("mt-big.txt", instr + section("big1.py", 30 * 1024) + section("big2.py", 30 * 1024))
+write("mt-huge.txt", instr + section("huge.py", 60 * 1024) + section("z.py", 300))
+crlf = (section("x.py", 700) + section("y.py", 700)).replace("\n", "\r\n")
+write("mt-crlf-diff.txt", crlf)
+write("mt-crlf.txt", "Review.\r\n" + crlf)
+PY
+
+# mkstream FILE JSON_ARRAY -- an init line, then one result event per array element.
+mkstream() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+with open(sys.argv[1], "w") as f:
+    f.write(json.dumps({"event": "init", "conversation_id": "c", "init": {}}) + "\n")
+    for r in json.loads(sys.argv[2]):
+        f.write(json.dumps({"event": "result", "result": r}) + "\n")
+PY
+}
+r_ok() { printf '{"conversation_id":"c","status":"SUCCESS","response":%s,"num_turns":1}' "$1"; }
+
+# stdin_check NAME PYTHON -- assertions over the turns the stub was sent (STDIN_FILE).
+stdin_check() {
+  local name="$1" code="$2"
+  if [ ! -s "$STUB_ARGV.stdin" ]; then
+    note_fail "$name: no stdin capture — the stub was sent no turns"
+  elif STDIN_FILE="$STUB_ARGV.stdin" TMPD="$TMP" python3 -c "$code"; then
+    note_pass "$name"
+  else
+    note_fail "$name"
+  fi
+}
+
+MT_STDOUT="$(printf '## Part 1/3: a.py, b.py\n\nREVIEW-PART-1\n\n## Part 2/3: c.py\n\nREVIEW-PART-2\n\n## Part 3/3: d.py\n\nREVIEW-PART-3\n'; printf x)"
+MT_STDOUT="${MT_STDOUT%x}"
+
+: > "$STUB_CALLS"
+expect_pass "a multi-file diff bigger than a part is one conversation" "$MT_STDOUT" \
+  --agy "$STUB" --part-kb 1 --out "$TMP/run-mt1" "$TMP/mt-prompt.txt"
+expect_calls "the whole multi-turn review is one agy run" 1
+argv_equals "multi-turn argv: the turns on stdin, no -p, nothing unexpected" \
+  "--model" "gemini-4-argon" "--disable-slash-commands" \
+  "--input-format" "stream-json" "--output-format" "stream-json" \
+  "--print-timeout" "9m" "--effort" "high"
+stdin_check "turn 1 carries the instructions and the whole diff, then one turn per part" '
+import json, os
+raw = open(os.environ["STDIN_FILE"], encoding="utf-8", newline="").read()
+lines = raw.split("\n")
+assert lines[-1] == "", "stdin does not end with a newline"
+msgs = [json.loads(l) for l in lines[:-1]]
+assert len(msgs) == 4, f"{len(msgs)} turns"
+for m in msgs:
+    assert set(m) == {"event", "message"} and m["event"] == "user", m
+    assert set(m["message"]) == {"content"} and isinstance(m["message"]["content"], str), m
+t = [m["message"]["content"] for m in msgs]
+d = os.environ["TMPD"]
+instr = open(d + "/mt-instr.txt", encoding="utf-8", newline="").read()
+diff = open(d + "/mt-diff.txt", encoding="utf-8", newline="").read()
+assert t[0].startswith(instr), "turn 1 lost the instructions"
+assert t[0].endswith(diff), "turn 1 does not end with the whole diff, byte for byte"
+assert "Do NOT review anything in this turn" in t[0] and "Reply with exactly: READY" in t[0]
+for k, files in ((1, ["a.py", "b.py"]), (2, ["c.py"]), (3, ["d.py"])):
+    assert t[k].startswith(f"Part {k} of 3."), t[k][:60]
+    assert "".join(f"- {f}\n" for f in files) + "\n" in t[k], t[k]
+    assert "do NOT call any tools" in t[k], "a part turn lacks the no-tools rule"
+    assert "diff --git" not in t[k], "a part turn re-sent diff text"
+'
+if cmp -s "$TMP/run-mt1/in.ndjson" "$STUB_ARGV.stdin"; then
+  note_pass "in.ndjson keeps exactly the turns agy was sent"
+else
+  note_fail "in.ndjson differs from what agy read"
+fi
+imode="$(stat -f '%Lp' "$TMP/run-mt1/in.ndjson" 2>/dev/null || stat -c '%a' "$TMP/run-mt1/in.ndjson")"
+omode="$(stat -f '%Lp' "$TMP/run-mt1/out.ndjson" 2>/dev/null || stat -c '%a' "$TMP/run-mt1/out.ndjson")"
+if [ "$imode" = "600" ] && [ "$omode" = "600" ]; then
+  note_pass "in.ndjson and out.ndjson are 0600"
+else
+  note_fail "in.ndjson is $imode, out.ndjson is $omode, expected 600"
+fi
+expect_stderr "the turn plan is announced" \
+  "turns:      4: one loads the whole diff, 3 review it in parts of up to 1 KB"
+expect_stderr "the summary names parts and turns" \
+  "model=gemini-4-argon effort=high attempts=1 parts=3 turns=4 conversation=stub-conv tokens=400"
+
+# The default part size: a small diff stays one turn, a big one is split by default.
+expect_pass "a diff within one default part is one turn" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-mt-small" "$TMP/mt-prompt.txt"
+argv_has "one-turn diff: -p carries it" "-p"
+argv_lacks "one-turn diff: no stream input" "--input-format"
+expect_pass "a 61 KB two-file diff is split by default" \
+  $'## Part 1/2: big1.py\n\nREVIEW-PART-1\n\n## Part 2/2: big2.py\n\nREVIEW-PART-2\n' \
+  --agy "$STUB" --out "$TMP/run-mt-big" "$TMP/mt-big.txt"
+argv_has "default split: the turns go on stdin" "--input-format" "stream-json"
+expect_stderr_absent "parts under 50 KB carry no size warning" "at --effort high"
+expect_pass "--single-turn keeps a big diff in one turn" "$GOOD_STDOUT" \
+  --agy "$STUB" --single-turn --out "$TMP/run-mt-single" "$TMP/mt-big.txt"
+argv_has "--single-turn: -p carries the prompt" "-p"
+argv_lacks "--single-turn: no stream input" "--input-format"
+expect_stderr "--single-turn: the whole-prompt size warning still applies" \
+  "KB of prompt at --effort high"
+expect_pass "a part over 50 KB still runs" \
+  $'## Part 1/2: huge.py\n\nREVIEW-PART-1\n\n## Part 2/2: z.py\n\nREVIEW-PART-2\n' \
+  --agy "$STUB" --out "$TMP/run-mt-huge" "$TMP/mt-huge.txt"
+expect_stderr "a part over 50 KB is flagged before the run" "warning: part 1 is 60 KB at --effort high"
+
+# A prompt that IS the diff, and a CRLF diff, split the same way.
+expect_pass "a prompt that is only a diff" "$MT_STDOUT" \
+  --agy "$STUB" --part-kb 1 --out "$TMP/run-mt-bare" "$TMP/mt-diff.txt"
+stdin_check "a bare diff: turn 1 starts with the conversation note" '
+import json, os
+t = [json.loads(l)["message"]["content"] for l in open(os.environ["STDIN_FILE"], encoding="utf-8").read().split("\n") if l]
+assert t[0].startswith("[agy-review] This review runs as one conversation"), t[0][:80]
+'
+expect_pass "a CRLF diff splits on its file headers" \
+  $'## Part 1/2: x.py\n\nREVIEW-PART-1\n\n## Part 2/2: y.py\n\nREVIEW-PART-2\n' \
+  --agy "$STUB" --part-kb 1 --out "$TMP/run-mt-crlf" "$TMP/mt-crlf.txt"
+stdin_check "a CRLF diff reaches turn 1 byte for byte" '
+import json, os
+t = [json.loads(l)["message"]["content"] for l in open(os.environ["STDIN_FILE"], encoding="utf-8").read().split("\n") if l]
+diff = open(os.environ["TMPD"] + "/mt-crlf-diff.txt", encoding="utf-8", newline="").read()
+assert "\r\n" in diff and t[0].endswith(diff), "CRLFs were not kept"
+assert t[0].startswith("Review.\r\n"), t[0][:40]
+'
+
+# --part-kb and --single-turn: options of a run, refused where they cannot apply.
+expect_fail "--part-kb 0" 2 "whole number of KB" \
+  --agy "$STUB" --part-kb 0 --out "$TMP/run-pk0" "$TMP/mt-prompt.txt"
+expect_fail "--part-kb abc" 2 "whole number of KB" \
+  --agy "$STUB" --part-kb abc --out "$TMP/run-pk1" "$TMP/mt-prompt.txt"
+expect_fail "--part-kb 1.5" 2 "whole number of KB" \
+  --agy "$STUB" --part-kb 1.5 --out "$TMP/run-pk2" "$TMP/mt-prompt.txt"
+expect_fail "--part-kb with an empty value" 2 "empty value" \
+  --agy "$STUB" --part-kb "" --out "$TMP/run-pk3" "$TMP/mt-prompt.txt"
+expect_fail "--part-kb with --single-turn" 2 "--single-turn has none" \
+  --agy "$STUB" --part-kb 4 --single-turn --out "$TMP/run-pk4" "$TMP/mt-prompt.txt"
+expect_fail "--check with --part-kb" 2 "takes no run options" \
+  --check "$TMP/good.json" --part-kb 4
+expect_fail "--check with --single-turn" 2 "takes no run options" \
+  --check "$TMP/good.json" --single-turn
+expect_fail "--restore with --part-kb" 2 "takes no other options" --restore --part-kb 4
+
+# Every turn passes the same checks as a single-turn envelope, and names itself when not.
+mkstream "$TMP/s-denied.ndjson" "[$(r_ok '"READY"'), $(r_ok '"x\n"'),
+  {\"status\":\"SUCCESS\",\"response\":\"\",\"denied_actions\":[{\"action\":\"command\"}]},
+  $(r_ok '"z\n"')]"
+STUB_STREAM="$TMP/s-denied.ndjson" expect_fail "a denied tool in one turn fails the review" 1 \
+  "turn 3 (part 2/3): the run was incomplete — these tools were auto-denied" \
+  --agy "$STUB" --part-kb 1 --out "$TMP/run-s1" "$TMP/mt-prompt.txt"
+mkstream "$TMP/s-empty.ndjson" "[$(r_ok '"READY"'), $(r_ok '""'), $(r_ok '"y"'), $(r_ok '"z"')]"
+STUB_STREAM="$TMP/s-empty.ndjson" expect_fail "an empty part answer fails the review" 1 \
+  "turn 2 (part 1/3): empty response" \
+  --agy "$STUB" --part-kb 1 --out "$TMP/run-s2" "$TMP/mt-prompt.txt"
+mkstream "$TMP/s-short.ndjson" "[$(r_ok '"READY"'), $(r_ok '"x"'), $(r_ok '"y"')]"
+STUB_STREAM="$TMP/s-short.ndjson" expect_fail "a missing turn fails the review" 1 \
+  "4 turns were sent and 3 answered" \
+  --agy "$STUB" --part-kb 1 --out "$TMP/run-s3" "$TMP/mt-prompt.txt"
+mkstream "$TMP/s-timeout.ndjson" "[$(r_ok '"READY"'), $(r_ok '"x"'),
+  {\"status\":\"SUCCESS\",\"response\":\"cut off mid\",\"finished_reason\":\"print_timeout\"},
+  $(r_ok '"z"')]"
+STUB_STREAM="$TMP/s-timeout.ndjson" expect_fail "a turn cut by the print timeout fails" 1 \
+  "turn 3 (part 2/3): the turn ended early (finished_reason=print_timeout)" \
+  --agy "$STUB" --part-kb 1 --out "$TMP/run-s4" "$TMP/mt-prompt.txt"
+{ printf '{"event":"init"}\nnot json\n'; } > "$TMP/s-garbage.ndjson"
+STUB_STREAM="$TMP/s-garbage.ndjson" expect_fail "a non-JSON stream line fails" 1 \
+  "stream line 2 is not JSON" \
+  --agy "$STUB" --part-kb 1 --out "$TMP/run-s5" "$TMP/mt-prompt.txt"
+printf '{"event":"result","result":"oops"}\n' > "$TMP/s-badresult.ndjson"
+STUB_STREAM="$TMP/s-badresult.ndjson" expect_fail "a result that is not an object fails" 1 \
+  "stream line 1: \`result\` is not a JSON object" \
+  --agy "$STUB" --part-kb 1 --out "$TMP/run-s6" "$TMP/mt-prompt.txt"
+STUB_STREAM="$TMP/zero-byte.json" expect_fail "an empty stream fails" 1 "empty output file" \
+  --agy "$STUB" --part-kb 1 --out "$TMP/run-s7" "$TMP/mt-prompt.txt"
+mkstream "$TMP/s-error.ndjson" "[$(r_ok '"READY"'),
+  {\"status\":\"ERROR\",\"response\":\"\",\"error\":\"invalid model selection: nope\"},
+  $(r_ok '"y"'), $(r_ok '"z"')]"
+: > "$STUB_CALLS"
+STUB_STREAM="$TMP/s-error.ndjson" expect_fail "an error in one turn fails the review" 1 \
+  "turn 2 (part 1/3): status=ERROR error=invalid model selection" \
+  --agy "$STUB" --part-kb 1 --out "$TMP/run-s8" "$TMP/mt-prompt.txt"
+expect_calls "a non-limit turn error is not retried" 1
+mkstream "$TMP/s-quota.ndjson" \
+  '[{"status":"ERROR","response":"","error":"Individual quota reached. Resets in 3h."}]'
+STUB_RC=3 STUB_STREAM="$TMP/s-quota.ndjson" expect_fail "a non-zero exit names the turn error" 1 \
+  "agy exited 3: Individual quota reached" \
+  --agy "$STUB" --part-kb 1 --out "$TMP/run-s9" "$TMP/mt-prompt.txt"
+STUB_STDERR="$TMP/print-timeout.err" expect_fail "the print-timeout marker fails a multi-turn run" 1 \
+  "returned partial output" --agy "$STUB" --part-kb 1 --out "$TMP/run-s10" "$TMP/mt-prompt.txt"
+
+# The load turn is meant to say READY; anything more is the reviewer's own words.
+mkstream "$TMP/s-chatty.ndjson" "[$(r_ok '"I already see a bug at a.py:1\n"'),
+  $(r_ok '"P1\n"'), $(r_ok '"P2\n"'), $(r_ok '"P3\n"')]"
+STUB_STREAM="$TMP/s-chatty.ndjson" expect_pass "a load turn that reviews is passed on first" \
+  $'## Load turn (the reviewer answered instead of acknowledging)\n\nI already see a bug at a.py:1\n\n## Part 1/3: a.py, b.py\n\nP1\n\n## Part 2/3: c.py\n\nP2\n\n## Part 3/3: d.py\n\nP3\n' \
+  --agy "$STUB" --part-kb 1 --out "$TMP/run-s11" "$TMP/mt-prompt.txt"
+expect_stderr "a chatty load turn is warned about" "the load turn answered with more than READY"
+mkstream "$TMP/s-ready.ndjson" "[$(r_ok '"ready.\n"'), $(r_ok '"P1"'), $(r_ok '"P2"'), $(r_ok '"P3"')]"
+STUB_STREAM="$TMP/s-ready.ndjson" expect_pass "ready. counts as the acknowledgement" \
+  $'## Part 1/3: a.py, b.py\n\nP1\n\n## Part 2/3: c.py\n\nP2\n\n## Part 3/3: d.py\n\nP3\n' \
+  --agy "$STUB" --part-kb 1 --out "$TMP/run-s12" "$TMP/mt-prompt.txt"
+expect_stderr_absent "an acknowledging load turn is not warned about" "answered with more than"
+
+# The output limit in any turn: the whole conversation again, a rung lower.
+mkstream "$TMP/s-limit.ndjson" "[$(r_ok '"READY"'), $(r_ok '"x"'),
+  {\"status\":\"ERROR\",\"response\":\"\",\"error\":\"Your previous response was cut off because it exceeded the output token limit.\"},
+  $(r_ok '"z"')]"
+: > "$STUB_CALLS"
+STUB_STREAM_1="$TMP/s-limit.ndjson" expect_pass "a limit failure in one turn is retried a rung lower" \
+  "$MT_STDOUT" --agy "$STUB" --part-kb 1 --out "$TMP/run-ml1" "$TMP/mt-prompt.txt"
+expect_calls "the multi-turn retry costs one more run" 2
+expect_stderr "the multi-turn retry is announced" \
+  "exceeded the output token limit; retrying at --effort medium"
+expect_stderr "the multi-turn summary names the effort that produced it" \
+  "effort=medium attempts=2 parts=3 turns=4"
+ARGV_FILE_OVERRIDE="$STUB_ARGV.2" argv_has "the multi-turn retry runs at medium" "--effort" "medium"
+if [ -f "$TMP/run-ml1/out.ndjson" ] && [ -f "$TMP/run-ml1/out-2.ndjson" ] \
+   && [ -f "$TMP/run-ml1/in.ndjson" ] && [ -f "$TMP/run-ml1/in-2.ndjson" ] \
+   && grep -q "output token limit" "$TMP/run-ml1/out.ndjson"; then
+  note_pass "each multi-turn attempt keeps its input and output"
+else
+  note_fail "a multi-turn attempt's raw files are missing or overwritten"
+fi
+: > "$STUB_CALLS"
+STUB_STREAM="$TMP/s-limit.ndjson" expect_fail "--no-retry names smaller parts" 1 \
+  "smaller parts: --part-kb 1" \
+  --agy "$STUB" --no-retry --part-kb 2 --out "$TMP/run-ml2" "$TMP/mt-prompt.txt"
+expect_calls "--no-retry on a multi-turn run runs once" 1
+STUB_STDOUT="$TMP/token-limit.json" expect_fail "a one-part diff over the limit is pointed at --part-kb" 1 \
+  "--part-kb 1, half the diff" \
+  --agy "$STUB" --no-retry --out "$TMP/run-ml3" "$TMP/mt-prompt.txt"
+STUB_STDOUT="$TMP/token-limit.json" expect_fail "--single-turn over the limit is pointed at multi-turn" 1 \
+  "drop --single-turn" \
+  --agy "$STUB" --no-retry --single-turn --out "$TMP/run-ml4" "$TMP/mt-big.txt"
+
+# finished_reason applies to a single-turn envelope too (agy 1.4.11 added the field).
+cat > "$TMP/finished-timeout.json" <<'EOF'
+{"conversation_id":"x","status":"SUCCESS","response":"cut off mid","finished_reason":"print_timeout"}
+EOF
+expect_fail "--check: finished_reason fails an envelope" 1 "finished_reason=print_timeout" \
+  --check "$TMP/finished-timeout.json"
+STUB_STDOUT="$TMP/finished-timeout.json" expect_fail "run: finished_reason fails a single turn" 1 \
+  "finished_reason=print_timeout" --agy "$STUB" --out "$TMP/run-fr" "$TMP/prompt.txt"
+
 # --- --repo: a read grant in agy's GLOBAL settings, for one run ----------------------
 # Every case runs with HOME pointed at a scratch directory: the real
 # ~/.gemini/antigravity-cli/settings.json is never read or written by this suite.
@@ -1047,6 +1345,17 @@ prompt_check "--repo tells the model not to run commands" has "do NOT run shell 
 prompt_check "--repo does not list an untracked .env" lacks ".env"
 argv_lacks "--repo widens nothing else on the command line" \
   "--add-dir" "--dangerously-skip-permissions"
+
+# --repo reviews in one turn: the reviewer reads what it needs, so a big diff is not split.
+reset_repo_state
+HOME="$RH" expect_pass "--repo keeps a big multi-file diff in one turn" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/repo-mt" --repo "$REPO" "$TMP/mt-big.txt"
+argv_has "--repo with a big diff: -p carries it" "-p"
+argv_lacks "--repo with a big diff: no stream input" "--input-format"
+expect_after "--repo with a big diff: the grant is gone" absent
+reset_repo_state
+HOME="$RH" expect_fail "--part-kb with --repo" 2 "--repo runs one turn" \
+  --agy "$STUB" --part-kb 4 --out "$TMP/repo-mt2" --repo "$REPO" "$TMP/mt-big.txt"
 
 # 2. An existing settings.json with other keys: merged for the run, then byte-identical,
 #    mode included.

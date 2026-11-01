@@ -164,6 +164,28 @@ NDJSON: one `init`, many `step_update`, one terminal `result`. Tool steps carry
 `tool_name`, `tool_info.parameters`, and `tool_info.output` or `tool_info.error`. Keep
 stderr separate — the `jetski:` auto-deny warning is not JSON.
 
+With `--input-format stream-json` (agy 1.4.12) every turn ends in its own `result`
+event, `{"event":"result","result":{...}}`, holding the fields of a `json` envelope.
+Its `num_turns`, `duration_seconds` and `usage` are cumulative for the session. A turn
+cut by `--print-timeout` still says `SUCCESS`, with a partial response and
+`"finished_reason":"print_timeout"` (the field arrived in agy 1.4.11); after a failed
+turn the session goes on to the next one.
+
+### `--input-format stream-json`
+
+Not in `agy --help`: found by probing agy 1.4.12, whose errors name the fields. One user
+turn per line:
+
+```json
+{ "event": "user", "message": { "content": "<the turn's text>" } }
+```
+
+A `content` list of `{"type":"text","text":...}` parts was accepted too. A line
+without `event` fails the run (`missing the "event" field`, exit 1); an unknown event
+is skipped with a warning (`ignoring unsupported stream input message event`), and a run
+of only those exits 0 having answered nothing. `--print-timeout` bounds each turn, not
+the session: three turns of about 3 s each finished under a 6 s timeout, 9 s in total.
+
 ### `--output-format text`
 
 The response prose alone on stdout. Diagnostics — errors, progress, permission notices —
@@ -175,8 +197,8 @@ discards the explanation of any failure.
 | Code | Meaning                                                                                |
 | ---- | -------------------------------------------------------------------------------------- |
 | 0    | `SUCCESS` — **including runs whose every tool was denied and whose response is empty** |
-| 1    | `ERROR` — bad flags, unknown model, not signed in                                      |
-| 2    | `ERROR` — unsupported stream message under `--input-format stream-json`                |
+| 1    | `ERROR` — bad flags, unknown model, not signed in, a stream-json line without `event`  |
+| 3    | `ERROR` — a model or agent API failure (a spent quota); stderr has `AGY_ERROR: {...}`  |
 
 ## Models
 
@@ -300,4 +322,5 @@ agy -p "follow-up" --conversation <ID> --output-format json </dev/null
 
 `conversation_id` is returned in every envelope. Multi-turn inside a single process needs
 `--input-format stream-json`, fed one NDJSON message per line; closing stdin ends the
-session.
+session. The message shape is under `--input-format stream-json` above; `agy-review`
+uses it for a diff bigger than one part.

@@ -137,49 +137,19 @@ is already spent. Thinking tokens dominate that budget (a successful 92 KB revie
 54977 of its 55850 output tokens thinking) and `agy --help` has no flag that raises it:
 only `--model` and `--effort` move it.
 
-`agy-review` retries a rung lower on its own. **To keep the effort, shrink the input** —
-the budget is spent per run, so half the diff is half the thinking:
+`agy-review` retries a rung lower on its own. **To keep the effort, give each turn less**:
+the budget is spent per turn, and a git diff bigger than one part (48 KB) is already
+reviewed as one conversation, a turn per part, with the whole diff in context. So:
 
-```bash
-set -euo pipefail
-S="$(mktemp -d)"
-BUDGET=$((40 * 1024))        # bytes of diff per part; 92 KB in one run hit the limit
-BASE=main                    # review scope, same as a single-run review
+- Pass a smaller `--part-kb N`. After a `--no-retry` failure the message names half the
+  current size.
+- A diff that is one huge file cannot be split across turns: review fewer hunks at a
+  time, with a narrower commit range.
 
-git diff "$BASE...HEAD" --name-only > "$S/files.txt"
-[ -s "$S/files.txt" ] || { echo "nothing to review"; exit 1; }
-
-part=1; size=0; : > "$S/part-1.diff"
-while IFS= read -r f; do
-  git diff "$BASE...HEAD" -- "$f" > "$S/one.diff"
-  fsize=$(wc -c < "$S/one.diff")
-  # A file bigger than the budget still goes in alone — splitting inside a file would
-  # hand the reviewer a hunk with no surrounding context.
-  if [ "$size" -gt 0 ] && [ $((size + fsize)) -gt "$BUDGET" ]; then
-    part=$((part + 1)); size=0; : > "$S/part-$part.diff"
-  fi
-  cat "$S/one.diff" >> "$S/part-$part.diff"
-  size=$((size + fsize))
-done < "$S/files.txt"
-
-for d in "$S"/part-*.diff; do
-  n="$(basename "$d" .diff)"
-  cat "$S/preamble.txt" "$S/instructions.txt" "$d" > "$S/$n.prompt"
-  # --no-retry: a part that still overruns must be reported, not quietly answered at a
-  # lower effort than its siblings — mixed efforts in one review are not comparable.
-  agy-review --effort high --no-retry --out "$S/$n" "$S/$n.prompt" > "$S/$n.review" \
-    || { echo "$n failed — see $S/$n/err.txt"; exit 1; }
-done
-```
-
-What this costs, and it is not nothing:
-
-- **Cross-file findings disappear.** Each part is reviewed alone, so an invariant broken
-  across two files in different parts is invisible. Group related files into the same part
-  when you know which they are.
-- **Every part is billed separately**, and the shared preamble is re-sent with each.
-- Report the findings **per part**, naming the part in the heading — merging them silently
-  hides that no reviewer saw the whole change.
+The hand-made split this section used to carry, one `agy-review` run per part, is no
+longer needed, and it cost cross-file findings: each run saw only its own files. In the
+conversation every turn sees all of them, and on 2026-11-01 each of two planted
+cross-file defects was found from both sides.
 
 The other way to keep the effort is a model with a different budget: a Claude id such as
 `claude-opus-5-5`. Never `gemini-3.1-pro`, which is banned and which

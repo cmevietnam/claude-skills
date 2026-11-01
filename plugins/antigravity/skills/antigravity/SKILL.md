@@ -16,8 +16,9 @@ points them here (`references/why-not-gemini-cli.md`).
 Verified against **agy 1.1.27** (2026-09-05) by running every command below; the model
 list was re-checked on agy 1.2.11 (2026-09-25), the default model, the model list and the
 effort rules on agy 1.3.4 (2026-10-14), and the model list, a default review and a
-`--repo` review on agy 1.4.10 (2026-11-01). Re-verify after an upgrade — `agy`
-self-updates in the background, so the version can move under you.
+`--repo` review on agy 1.4.10 (2026-11-01), and the multi-turn review on agy 1.4.12 the
+same day. Re-verify after an upgrade — `agy` self-updates in the background, so the
+version can move under you.
 
 ## Hard rule: present, then stop
 
@@ -65,17 +66,20 @@ print anything unless the envelope proves a review actually happened:
 ```bash
 agy-review [--model M] [--effort E] [--out DIR] PROMPT_FILE   # run, validate, print
 agy-review --no-retry [...] PROMPT_FILE                        # never step the effort down
+agy-review --part-kb N [...] PROMPT_FILE                      # parts of N KB (default 48)
+agy-review --single-turn [...] PROMPT_FILE                    # one turn, whatever the size
 agy-review --check out.json                                    # validate an existing run
 agy-review --repo DIR [...] PROMPT_FILE                       # let it read DIR for this run
 agy-review --restore                                           # drop grants of killed runs
 ```
 
 It exits 1 with a diagnosis on an empty output file, non-JSON output, a populated `error`,
-a non-`SUCCESS` status, any `denied_actions`, or an empty/whitespace response — and it
-tells you where the raw `out.json` and `err.txt` are. Confirmed against the live CLI: a
+a non-`SUCCESS` status, a `finished_reason` (a turn that ended early), any
+`denied_actions`, or an empty/whitespace response — in every turn of a multi-turn run —
+and it tells you where the raw `out.json` (or `out.ndjson`) and `err.txt` are. Confirmed against the live CLI: a
 prompt that triggers an auto-deny gives `agy` exit 0 / SUCCESS and `agy-review` exit 1.
 
-`scripts/test-agy-review.sh` has 283 checks, 14 of them meta-tests that deliberately make
+`scripts/test-agy-review.sh` has 347 checks, 14 of them meta-tests that deliberately make
 each assertion helper fail — because a test that cannot go red proves nothing.
 
 Do not substitute `jq -r '.response // "failed"'`: on a zero-byte file `jq` prints
@@ -107,10 +111,11 @@ tell the user what is in it** — that file is theirs, it may hold configuration
 this plugin, and removing rules is their call, not mine. If they authorise a temporary
 change, keep a copy and restore it afterwards.
 
-**The whole prompt travels in `agy`'s argv**, since `agy -p` does not read stdin — on a
-shared machine anyone who can list processes can read it, diff included. Check the bundle
-for an accidentally committed credential before sending it, and do not use this path for
-material that must not leak locally.
+**A single-turn prompt travels in `agy`'s argv**, since `agy -p` does not read stdin — on
+a shared machine anyone who can list processes can read it, diff included. A multi-turn
+review (below) sends its turns on stdin instead and keeps them in `in.ndjson` (0600)
+beside the output. Either way, check the bundle for an accidentally committed credential
+before sending it, and do not use this path for material that must not leak locally.
 
 ```bash
 set -euo pipefail                      # an empty diff.txt must not become a clean review
@@ -159,6 +164,42 @@ left for `agy` to pick the level. An **explicit** `--effort` is always forwarded
 
 `--disable-slash-commands` matters: a diff containing a line that starts with `/` would
 otherwise be expanded as a slash command.
+
+### A diff bigger than one part: one conversation, a turn per part
+
+The default since 0.8.0 (the owner's decision, 2026-11-01). When the prompt holds a git
+diff (lines starting `diff --git `) bigger than one part — 48 KB, `--part-kb N` to change
+it — `agy-review` runs it as **one conversation**: turn 1 carries the instructions and the
+whole diff and asks for `READY`, then one turn per part names that part's files and asks
+for the defects located in them, reading the rest of the diff as context. Whole files are
+packed in diff order; a file bigger than a part is a part of its own. The turns go to
+`agy --input-format stream-json` on stdin, one NDJSON message each
+(`{"event":"user","message":{"content":"..."}}`).
+
+Why: the output budget, thinking included, is per turn, so each part gets all of it while
+the model still sees every file. Measured on 2026-11-01 (agy 1.4.12, gemini-4-argon high,
+a 131 KB diff with two planted cross-file defects): the three review turns thought 18403,
+5909 and 7777 tokens, and each defect was found twice, once from each side. A single run
+on the same diff thought 23177 tokens and found both too; the conversation cost about
+1.7 times its tokens (119557 against 71855) and found one real defect the single run
+missed.
+
+What changes for you:
+
+- The review comes back **part by part**, each under `## Part k/N: <files>`. Report it
+  that way. A load turn that answered with more than `READY` is printed first, under its
+  own heading: those are the reviewer's words too.
+- Every turn passes the same checks as a single-turn envelope, plus "N turns were sent and
+  M answered". One bad turn fails the whole review (exit 1).
+- The summary line adds `parts=` and `turns=`. `--out` keeps `in.ndjson`, `out.ndjson`
+  and `err.txt` (`-2`, `-3` … per retry).
+- A limit failure in any turn reruns the whole conversation one effort rung lower, as a
+  single-turn run does. With `--no-retry` the message names `--part-kb` at half the size.
+- `--print-timeout` bounds each turn, not the session (agy 1.4.12: three turns of about
+  3 s each all finished under a 6 s timeout, 9 s in total).
+- `--single-turn` keeps the one-prompt run. `--repo` always runs one turn, since the
+  reviewer reads what it needs itself. A prompt without a git diff, or a diff within one
+  part, is one turn as before.
 
 More prompts: `references/review-prompts.md`.
 
@@ -291,7 +332,8 @@ which 63058 thinking, then `status: ERROR`) and succeeded on the retry at medium
 earlier pair of runs on a smaller bundle had gone the other way (47153 output tokens with
 the material in a 122 KB prompt, 35215 for the `--repo` session), so the size of the
 material, not the way it reaches the model, is what decides. agy reports usage per
-session, not per response.
+session, not per response. A `--repo` review is always one turn: the multi-turn split
+does not apply to it.
 
 What it refuses, before `agy` starts (exit 2, settings untouched):
 
@@ -348,8 +390,8 @@ like any other denied run; `--check` is what catches it.
 | Exit | Meaning                                                                 |
 | ---- | ----------------------------------------------------------------------- |
 | 0    | `SUCCESS` — but see the trap above; 0 does not mean the review happened |
-| 1    | `ERROR` — bad flags, unknown model, auth missing                        |
-| 2    | `ERROR` — unsupported stream message in `--input-format stream-json`    |
+| 1    | `ERROR` — bad flags, unknown model, auth missing, a bad stream message  |
+| 3    | an API failure such as a spent quota; stderr has an `AGY_ERROR:` line   |
 
 - **`Please sign in`** — headless cannot authenticate. The user runs `agy` in a **real
   terminal** (not `!` in Claude Code, which has no TTY: `bubbletea: could not open TTY`).
@@ -364,12 +406,12 @@ like any other denied run; `--check` is what catches it.
   `effort=… attempts=…` — the effort on that line is the one the findings are attributed
   to, not the one you asked for.
 
-  **To keep the effort, shrink the input.** The budget is per run, so half the diff is
-  half the thinking: `references/review-prompts.md` has the split-and-merge recipe, and
-  `--no-retry` turns the ladder off so a run either answers at the effort you asked for
-  or fails. A Claude id has a different budget, also at full effort (never
-  `gemini-3.1-pro`). Bounding the answer in the prompt buys little — the visible answer
-  was ~2% of that budget.
+  **To keep the effort, give each turn less.** The budget is per turn, so a git diff is
+  reviewed as one conversation in parts by default (see "A diff bigger than one part"
+  above), and `--part-kb` makes the parts smaller. `--no-retry` turns the ladder off so
+  a run either answers at the effort you asked for or fails. A Claude id has a different
+  budget, also at full effort (never `gemini-3.1-pro`). Bounding the answer in the
+  prompt buys little — the visible answer was ~2% of that budget.
 
   Invisible to anything that reads `.response` without checking `.error`; `agy-review`
   catches it.
@@ -377,7 +419,8 @@ like any other denied run; `--check` is what catches it.
 - **`print timeout ... returning partial output`** on stderr — `--print-timeout` ended the
   turn early, and agy still reports `SUCCESS`, with an empty or a cut-off response.
   `agy-review` refuses it (exit 1). Re-run with a longer `--timeout`; `--repo` reviews
-  need it most.
+  need it most. agy 1.4.11 and later also mark such a turn
+  `"finished_reason": "print_timeout"`, which `agy-review` refuses as well.
 
 - **stderr carries the diagnosis**, including the auto-deny warning. Never discard it —
   capture it to a file. Mixing it into stdout corrupts `stream-json` output with non-JSON
