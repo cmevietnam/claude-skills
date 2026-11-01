@@ -69,10 +69,12 @@ So `agy-review` steps the effort one rung down and runs again (high → medium �
 keeps every attempt's raw report, and prints which effort actually produced the review —
 findings are attributed to that, not to the effort you asked for.
 
-To keep the effort instead, shrink the input: the budget is spent per run, so half the
-diff is half the thinking. `--no-retry` turns the ladder off, and
-`skills/antigravity/references/review-prompts.md` carries the split-and-merge recipe
-along with what it costs (cross-file findings are the price).
+To keep the effort instead, give each turn less. The budget is spent per turn, and a git
+diff bigger than 48 KB is reviewed by default as one conversation: one turn loads the
+whole diff, then one turn per part reviews that part's files with the rest as context,
+so each part gets the whole budget and cross-file findings survive. `--part-kb N` sizes
+the parts, `--single-turn` keeps the one-prompt run, and `--no-retry` turns the ladder
+off.
 
 ## Letting the reviewer read the repo, for one run
 
@@ -127,8 +129,9 @@ sign-in (`bubbletea: could not open TTY`), so Claude Code's `!` prefix cannot do
 Headless runs afterwards reuse the cached credentials.
 
 Verified against **agy 1.1.27**, with the default model re-checked on agy 1.3.4, `--repo`
-on agy 1.3.5, and both again on agy 1.4.10; the skill says what was checked and when.
-`agy` self-updates in the background, so re-verify after a gap.
+on agy 1.3.5, both again on agy 1.4.10, and the multi-turn review on agy 1.4.12; the
+skill says what was checked and when. `agy` self-updates in the background, so re-verify
+after a gap.
 
 ## Read
 

@@ -27,10 +27,26 @@ Options:
   --timeout T    --print-timeout value (default: 9m)
   --agy PATH     agy binary: a bare name is resolved on PATH, a path is used as given
                  (default: agy, then ~/.local/bin/agy)
+  --part-kb N    the size of one part of a multi-turn review, in KB (default 48). See
+                 "Multi-turn review" below.
+  --single-turn  review the whole prompt in one turn, whatever its size
 
-The prompt is passed to `agy` as a command-line argument, because `agy -p` does not read
-stdin. On a shared machine that makes its full text visible to anyone who can list
-processes — do not put secrets in a review bundle.
+A single-turn prompt is passed to `agy` as a command-line argument, because `agy -p` does
+not read stdin. On a shared machine that makes its full text visible to anyone who can
+list processes — do not put secrets in a review bundle. A multi-turn review sends its
+turns on stdin instead, and keeps them in in.ndjson beside the output.
+
+Multi-turn review: a prompt holding a git diff (lines starting `diff --git `) bigger than
+one part is reviewed as ONE conversation through `--input-format stream-json`. Turn 1
+carries the instructions and the whole diff and asks for READY; then one turn per part
+names that part's files and asks for the defects located in them, the rest of the diff
+being context. Whole file sections are packed in diff order, a section bigger than a
+part being a part of its own. The output budget, thinking included, is per turn, so
+each part gets all of it while the model still sees every file. Every turn's result
+passes the same checks as a single-turn envelope, and the review is printed part by
+part under `## Part k/N: <files>`. --repo runs one turn (the reviewer reads what it
+needs), and so does --single-turn, a prompt without a git diff, or a diff within one
+part. The default since 0.8.0, by the owner's decision on 2026-11-01.
 
 Default model: pinned to gemini-4-argon at --effort high, by the owner's decision on
 2026-10-14 (it was gemini-3.8-flash from 2026-09-25). It is the unsuffixed base id so the
@@ -55,11 +71,11 @@ again, keeping every attempt's raw report, until the ladder runs out. It only st
 effort it passes as a FLAG: stepping a suffixed id down would mean inventing a sibling
 id that agy need not offer.
 
-To keep the effort instead, shrink the input: the budget is per run, so reviewing half a
-diff spends half the thinking at the same effort. `agy --help` has no budget flag — only
---model and --effort move it — and capping the visible answer buys little, since a
-measured run spent 54977 of its 55850 output tokens on thinking. Both routes are printed
-when a run cannot be retried.
+To keep the effort instead, give each turn less: the budget is per turn, so a smaller
+--part-kb spends less thinking per turn at the same effort. `agy --help` has no budget
+flag — only --model and --effort move it — and capping the visible answer buys little,
+since a measured run spent 54977 of its 55850 output tokens on thinking. Both routes are
+printed when a run cannot be retried.
 
 Effort handling: `agy` rejects --effort for ids that bake the level into the id
 (gemini-4-argon-high, claude-opus-5-5-low: "conflicts with --effort=high"), and takes it
@@ -98,7 +114,9 @@ says what to fix by hand.
 
 Print timeout: when --print-timeout ends a turn, agy prints "returning partial output" on
 stderr and still reports SUCCESS. That run is refused: whatever the response holds was cut
-off mid-turn.
+off mid-turn. agy 1.4.11 and later also set `finished_reason` on such a turn, and any
+finished_reason is refused the same way. In a multi-turn run the timeout bounds each
+turn, not the session.
 
 Exit codes: 0 review produced, 1 run failed or was incomplete (or the grant could not be
 undone), 2 usage or setup error.
@@ -146,6 +164,24 @@ EFFORT_LADDER = ("high", "medium", "low")
 # A 92 KB prompt at --effort high was observed to hit the limit twice, and to succeed at
 # medium. Warn a little below that, where the run is worth a heads-up but not a refusal.
 LARGE_PROMPT_BYTES = 50 * 1024
+
+# A git diff bigger than one part is reviewed as one conversation: a turn that loads the
+# whole diff, then one turn per part. The output budget is per turn, so each part gets the
+# whole budget while the model still sees every file. Measured on 2026-11-01 (agy 1.4.12,
+# gemini-4-argon high, a 131 KB diff in parts of 47.6, 49.5 and 34.2 KB): the review turns
+# thought 18403, 5909 and 7777 tokens, and both planted cross-file defects were found.
+DEFAULT_PART_KB = 48
+DIFF_HEADER = "diff --git "
+
+# The load turn's expected answer. Anything else is the reviewer's own words, which are
+# passed on rather than dropped.
+LOAD_ACK = "READY"
+
+# Each review turn repeats this: a tool call is denied headless and fails the review.
+TURN_NO_TOOLS = (
+    "Answer from the material in this conversation: do NOT call any tools, do NOT run "
+    "shell commands, do NOT read files."
+)
 
 # agy's global settings, where the --repo grant is written. Relative to $HOME, which is
 # where agy itself looks; the tests point HOME at a scratch directory.
@@ -257,19 +293,23 @@ def hit_output_limit(error_text):
     return OUTPUT_LIMIT_MARKER in error_text.lower()
 
 
-def limit_guidance(model, tried, no_retry):
+SPLIT_BY_HAND = (
+    "split the bundle and review it in parts — the budget is per run, so half the "
+    "diff is half the thinking, at the same effort"
+)
+
+
+def limit_guidance(model, tried, no_retry, keep_lever=SPLIT_BY_HAND):
     """Why the limit failure could not be retried away, and what is actually left.
 
     Ordered by what the measurements support rather than by what sounds plausible.
     `agy --help` exposes no budget flag at all — only --model and --effort move it — and
     thinking dominates the budget: a successful 92 KB review reported output_tokens
-    55850 of which thinking_tokens 54977. So shrinking the INPUT is the lever that keeps
-    the effort, and capping the visible answer is close to free of effect.
+    55850 of which thinking_tokens 54977. So shrinking what one turn reviews is the lever
+    that keeps the effort, and capping the visible answer is close to free of effect.
+    `keep_lever` says how to shrink it for the run that failed.
     """
-    keep = [
-        "split the bundle and review it in parts — the budget is per run, so half the "
-        "diff is half the thinking, at the same effort",
-    ]
+    keep = [keep_lever]
     if model is None or not model.lower().startswith("claude-"):
         keep.append(
             "switch to a model with a different budget at the same effort: a claude id "
@@ -372,24 +412,27 @@ def read_envelope(path, err_path=None):
     return envelope_from_text(raw, hint)
 
 
-def validate(path, err_path=None, env=None, repo=None):
-    """Return (response, envelope), or exit non-zero explaining why the run is unusable.
+def checked_response(env, hint, repo, where=""):
+    """The response of one envelope or turn result, or exit 1 saying why it is unusable.
 
-    `env` lets the caller supply an envelope it already read from its own file
-    descriptor, so a writable output directory cannot have the file swapped underneath
-    between the run and the check.
+    `where` names the turn in a multi-turn review ("turn 3 (part 2/4): "), so a failure
+    points at the part that had it.
     """
-    if env is None:
-        env = read_envelope(path, err_path)
-    hint = f" — see {err_path}" if err_path else ""
-
     if env.get("error"):
-        die(f"FAILED: status={env.get('status')} error={env['error']}")
+        die(f"FAILED: {where}status={env.get('status')} error={env['error']}")
     if env.get("status") != "SUCCESS":
-        die(f"FAILED: status={env.get('status')}{hint}")
+        die(f"FAILED: {where}status={env.get('status')}{hint}")
+    # agy 1.4.11 and later name why a turn ended early; the field is absent when it ended
+    # normally. A print timeout says SUCCESS with a cut-off response (seen on agy 1.4.12),
+    # so this is checked before the response is trusted.
+    if env.get("finished_reason"):
+        die(
+            f"FAILED: {where}the turn ended early (finished_reason="
+            f"{env['finished_reason']}), so its response is partial{hint}"
+        )
     if env.get("denied_actions"):
         die(
-            "FAILED: the run was incomplete — these tools were auto-denied: "
+            f"FAILED: {where}the run was incomplete — these tools were auto-denied: "
             f"{env['denied_actions']}\n"
             + (
                 f"With --repo only file reads under {repo} are allowed: the model "
@@ -404,14 +447,141 @@ def validate(path, err_path=None, env=None, repo=None):
     raw_response = env.get("response")
     if raw_response is not None and not isinstance(raw_response, str):
         die(
-            f"FAILED: `response` is {type(raw_response).__name__}, not a string{hint}"
+            f"FAILED: {where}`response` is {type(raw_response).__name__}, not a "
+            f"string{hint}"
         )
     # Strip ONLY to decide emptiness. The response itself is returned untouched — this
     # tool's whole premise is that the reviewer's words reach the user verbatim, and
     # leading whitespace can be the indentation of a markdown code block.
     if not (raw_response or "").strip():
-        die(f"FAILED: empty response, nothing was reviewed{hint}")
-    response = raw_response
+        die(f"FAILED: {where}empty response, nothing was reviewed{hint}")
+    return raw_response
+
+
+def stream_results(raw, hint):
+    """The `result` objects of a stream-json run, in order, or exit 1.
+
+    Every line must be a JSON object: stdout carries nothing else in stream-json mode,
+    so a stray line means the output is not what agy is known to write. Lines are split
+    on "\\n" only — str.splitlines would also break on U+2028, which JSON strings may hold.
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        die(f"FAILED: the stream output is not valid UTF-8 ({e}){hint}")
+    if not text.strip():
+        die(f"FAILED: empty output file, the run produced nothing{hint}")
+    results = []
+    for n, line in enumerate(text.split("\n"), 1):
+        if not line.strip():
+            continue
+        event = parse_json(line, f"stream line {n}", hint)
+        if not isinstance(event, dict):
+            die(f"FAILED: stream line {n} is not a JSON object{hint}")
+        if event.get("event") == "result":
+            result = event.get("result")
+            if not isinstance(result, dict):
+                die(f"FAILED: stream line {n}: `result` is not a JSON object{hint}")
+            results.append(result)
+    return results
+
+
+def stream_errors(raw):
+    """The `error` strings of every parseable result line, never raising.
+
+    Used on the failure paths (the limit check, a non-zero exit), where a parse problem
+    must not replace the failure being explained.
+    """
+    errors = []
+    for line in raw.decode("utf-8", "replace").split("\n"):
+        try:
+            event = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(event, dict) and isinstance(event.get("result"), dict):
+            error = event["result"].get("error")
+            if isinstance(error, str) and error:
+                errors.append(error)
+    return errors
+
+
+def diff_path(section):
+    """The path a `diff --git a/X b/Y` section changes (Y), for the turn that names it."""
+    first = section.split("\n", 1)[0].rstrip("\r")[len(DIFF_HEADER):]
+    return first.rsplit(" b/", 1)[1] if " b/" in first else first
+
+
+def split_review(prompt, part_bytes):
+    """Split a prompt holding a git diff into (instructions, diff, parts), or None.
+
+    `instructions` is everything before the first line that starts with `diff --git `,
+    `diff` the rest, both verbatim. `parts` is [(paths, bytes)]: whole file sections packed
+    in diff order up to `part_bytes` each, a section bigger than that being a part of its
+    own — splitting inside a file would hand the reviewer a hunk without its file. None
+    when there is no git diff or it fits in one part: one turn reviews that.
+    """
+    if prompt.startswith(DIFF_HEADER):
+        start = 0
+    else:
+        start = prompt.find("\n" + DIFF_HEADER)
+        if start < 0:
+            return None
+        start += 1
+    instructions, diff = prompt[:start], prompt[start:]
+    # Lines inside a section start with " ", "+", "-", "@" or "\", so only a file header
+    # starts with the header text.
+    bounds = [0] + [m.start() + 1 for m in re.finditer("\n" + re.escape(DIFF_HEADER), diff)]
+    sections = [diff[a:b] for a, b in zip(bounds, bounds[1:] + [len(diff)])]
+
+    parts, paths, size = [], [], 0
+    for section in sections:
+        n = len(section.encode("utf-8", "surrogateescape"))
+        if paths and size + n > part_bytes:
+            parts.append((paths, size))
+            paths, size = [], 0
+        paths.append(diff_path(section))
+        size += n
+    parts.append((paths, size))
+    if len(parts) < 2:
+        return None
+    return instructions, diff, parts
+
+
+def review_turns(instructions, diff, parts):
+    """The user turns of a multi-turn review: load the whole diff, then one per part."""
+    n = len(parts)
+    gap = "\n" if instructions and not instructions.endswith("\n\n") else ""
+    load = (
+        f"{instructions}{gap}"
+        f"[agy-review] This review runs as one conversation: the diff below is reviewed "
+        f"over the next {n} turns, one group of files per turn, and the instructions above "
+        f"apply to each of them. Do NOT review anything in this turn. Reply with exactly: "
+        f"{LOAD_ACK}\n\n{diff}"
+    )
+    turns = [load]
+    for k, (paths, _) in enumerate(parts, 1):
+        turns.append(
+            f"Part {k} of {n}. Review the changes to these files in the diff from the "
+            "first turn, following the instructions given there:\n"
+            + "".join(f"- {p}\n" for p in paths)
+            + "\nReport only defects located in these files. Read the rest of the diff as "
+            "context: a change in these files that contradicts a change in another file "
+            f"counts. {TURN_NO_TOOLS}"
+        )
+    return turns
+
+
+def validate(path, err_path=None, env=None, repo=None):
+    """Return (response, envelope), or exit non-zero explaining why the run is unusable.
+
+    `env` lets the caller supply an envelope it already read from its own file
+    descriptor, so a writable output directory cannot have the file swapped underneath
+    between the run and the check.
+    """
+    if env is None:
+        env = read_envelope(path, err_path)
+    hint = f" — see {err_path}" if err_path else ""
+    response = checked_response(env, hint, repo)
 
     # `usage` is cosmetic: it is reported, never trusted. A wrong type must not crash the
     # run — and must not discard a review that is otherwise complete either. Warn, drop it.
@@ -939,6 +1109,49 @@ def repo_prompt(repo, files, prompt):
     return rules + prompt + listing
 
 
+def finish_turns(raw, turns, parts, err_path, summary):
+    """Check every turn of a multi-turn review and print the review part by part.
+
+    Exits 1 unless every turn answered and passed the same checks as a single-turn
+    envelope. Each part's review is printed verbatim under a heading naming its files; a
+    load turn that answered with more than READY is printed first, since those are the
+    reviewer's words too.
+    """
+    hint = f" — see {err_path}"
+    results = stream_results(raw, hint)
+    if len(results) != len(turns):
+        die(
+            f"FAILED: {len(turns)} turns were sent and {len(results)} answered, so the "
+            f"review is incomplete{hint}"
+        )
+    n = len(parts)
+    wheres = ["turn 1 (load): "] + [f"turn {k + 1} (part {k}/{n}): " for k in range(1, n + 1)]
+    responses = [checked_response(r, hint, None, w) for r, w in zip(results, wheres)]
+
+    chunks = []
+    if responses[0].strip().rstrip(".").upper() != LOAD_ACK:
+        print(
+            f"warning: the load turn answered with more than {LOAD_ACK}; that answer is "
+            "printed first, verbatim",
+            file=sys.stderr,
+        )
+        chunks.append(
+            f"## Load turn (the reviewer answered instead of acknowledging)\n\n{responses[0]}"
+        )
+    for k, ((paths, _), response) in enumerate(zip(parts, responses[1:]), 1):
+        chunks.append(f"## Part {k}/{n}: {', '.join(paths)}\n\n{response}")
+
+    last = results[-1]
+    usage = last.get("usage") if isinstance(last.get("usage"), dict) else {}
+    print(
+        f"{summary} parts={n} turns={len(results)} "
+        f"conversation={last.get('conversation_id')} tokens={usage.get('total_tokens')}",
+        file=sys.stderr,
+    )
+    write_response("\n".join(c if c.endswith("\n") else c + "\n" for c in chunks))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("target", nargs="?")
@@ -952,6 +1165,8 @@ def main():
     ap.add_argument("--agy")
     ap.add_argument("--no-retry", action="store_true")
     ap.add_argument("--repo", default=None)
+    ap.add_argument("--single-turn", action="store_true")
+    ap.add_argument("--part-kb", default=None)
     ap.add_argument("--restore", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
     args = ap.parse_args()
@@ -965,10 +1180,20 @@ def main():
     for flag, value in (
         ("--check", args.check), ("--model", args.model), ("--effort", args.effort),
         ("--out", args.out), ("--timeout", args.timeout), ("--agy", args.agy),
-        ("--repo", args.repo),
+        ("--repo", args.repo), ("--part-kb", args.part_kb),
     ):
         if value is not None and not value.strip():
             die(f"usage: {flag} was given an empty value", 2)
+
+    part_kb = DEFAULT_PART_KB
+    if args.part_kb is not None:
+        if not re.fullmatch(r"[0-9]+", args.part_kb.strip()) or int(args.part_kb) < 1:
+            die(f"usage: --part-kb takes a whole number of KB, 1 or more, got {args.part_kb!r}", 2)
+        part_kb = int(args.part_kb)
+        if args.single_turn:
+            die("usage: --part-kb sizes the parts of a multi-turn review; --single-turn has none", 2)
+        if args.repo is not None:
+            die("usage: --part-kb sizes the parts of a multi-turn review; --repo runs one turn", 2)
 
     if args.model is not None and BANNED_MODEL_RE.match(args.model.strip()):
         die(
@@ -986,6 +1211,7 @@ def main():
                 ("--out", args.out), ("--agy", args.agy), ("--effort", args.effort),
                 ("--model", args.model), ("--timeout", args.timeout),
                 ("--no-retry", args.no_retry or None), ("--repo", args.repo),
+                ("--single-turn", args.single_turn or None), ("--part-kb", args.part_kb),
             )
             if value is not None
         ]
@@ -1027,6 +1253,8 @@ def main():
                 ("--timeout", args.timeout),
                 ("--no-retry", args.no_retry or None),
                 ("--repo", args.repo),
+                ("--single-turn", args.single_turn or None),
+                ("--part-kb", args.part_kb),
             )
             if value is not None
         ]
@@ -1063,6 +1291,36 @@ def main():
         repo = resolve_repo(args.repo)
         prompt = repo_prompt(repo, list_repo_files(repo), prompt)
 
+    # A git diff bigger than one part is reviewed as one conversation, one turn per part.
+    # --repo keeps one turn: its prompt is the repo listing wrapped around the user's text,
+    # and the reviewer reads what it needs itself.
+    split = None
+    if repo is None and not args.single_turn:
+        split = split_review(prompt, part_kb * 1024)
+    turns = None if split is None else review_turns(*split)
+    parts = None if split is None else split[2]
+
+    # What keeps the effort when an answer overruns the output budget: a smaller turn.
+    many_files = split_review(prompt, 1) is not None
+    if turns is not None:
+        keep_lever = (
+            f"smaller parts: --part-kb {max(1, part_kb // 2)} — each turn has its own "
+            "output budget, so half the part is about half the thinking, at the same effort"
+        )
+    elif args.single_turn and many_files:
+        keep_lever = (
+            "drop --single-turn: a git diff bigger than one part is then reviewed as one "
+            "conversation, a turn per part, each turn with its own output budget"
+        )
+    elif repo is None and many_files:
+        keep_lever = (
+            f"--part-kb {max(1, len(prompt.encode('utf-8', 'surrogateescape')) // 2048)}, "
+            "half the diff: it is then reviewed as one conversation, a turn per part, "
+            "each turn with its own output budget"
+        )
+    else:
+        keep_lever = SPLIT_BY_HAND
+
     binary = find_agy(args.agy)
 
     # Default to a private 0700 directory. A predictable shared path under /tmp would
@@ -1087,13 +1345,25 @@ def main():
     except OSError as e:
         die(f"FAILED: cannot use output directory {args.out or '(temp)'}: {e}", 2)
 
-    out_path = os.path.join(out_dir, "out.json")
-    err_path = os.path.join(out_dir, "err.txt")
+    def report_paths(attempt):
+        """(out, in, err) of one attempt; `in` is None for a single-turn run. The first
+        attempt keeps the plain names."""
+        sfx = "" if attempt == 1 else f"-{attempt}"
+        err = os.path.join(out_dir, f"err{sfx}.txt")
+        if turns is None:
+            return os.path.join(out_dir, f"out{sfx}.json"), None, err
+        return (
+            os.path.join(out_dir, f"out{sfx}.ndjson"),
+            os.path.join(out_dir, f"in{sfx}.ndjson"),
+            err,
+        )
+
+    out_path, in_path, err_path = report_paths(1)
 
     # Refuse to clobber a previous run's raw report: two models written to one --out
     # would destroy the first, and an attacker-planted symlink would be followed.
-    for path in (out_path, err_path):
-        if os.path.lexists(path):
+    for path in (out_path, in_path, err_path):
+        if path is not None and os.path.lexists(path):
             die(
                 f"FAILED: {path} already exists — pick a different --out so an earlier "
                 "run's raw report is not overwritten",
@@ -1130,7 +1400,7 @@ def main():
     steppable = takes_effort(model) and not args.no_retry
 
     prompt_bytes = len(prompt.encode("utf-8", "surrogateescape"))
-    if prompt_bytes >= LARGE_PROMPT_BYTES and effort == "high":
+    if turns is None and prompt_bytes >= LARGE_PROMPT_BYTES and effort == "high":
         print(
             f"warning: {prompt_bytes // 1024} KB of prompt at --effort high. Thinking "
             "tokens count against the output budget: a 92 KB bundle exceeded the output "
@@ -1138,6 +1408,23 @@ def main():
             "retried a rung lower.",
             file=sys.stderr,
         )
+    elif turns is not None and effort == "high":
+        k, (_, size) = max(enumerate(parts, 1), key=lambda kp: kp[1][1])
+        if size >= LARGE_PROMPT_BYTES:
+            print(
+                f"warning: part {k} is {size // 1024} KB at --effort high. Its turn has "
+                "the whole output budget, but thinking tokens count against it; a limit "
+                "failure here is retried a rung lower.",
+                file=sys.stderr,
+            )
+
+    # Each turn of a multi-turn review is one NDJSON message on agy's stdin. The shape
+    # is not in agy's --help: it was found by probing agy 1.4.12, whose errors name the
+    # fields ("missing the \"event\" field", "\"user\" message is missing the
+    # \"message\" field", "has no content").
+    turn_input = None if turns is None else "".join(
+        json.dumps({"event": "user", "message": {"content": t}}) + "\n" for t in turns
+    ).encode("ascii")
 
     tried = []
     grant = None
@@ -1166,24 +1453,36 @@ def main():
             if attempt > 1:
                 # Each attempt keeps its own raw report: the failed one is the evidence that
                 # the retry was warranted, and overwriting it would destroy that.
-                out_path = os.path.join(out_dir, f"out-{attempt}.json")
-                err_path = os.path.join(out_dir, f"err-{attempt}.txt")
-                for path in (out_path, err_path):
-                    if os.path.lexists(path):
+                out_path, in_path, err_path = report_paths(attempt)
+                for path in (out_path, in_path, err_path):
+                    if path is not None and os.path.lexists(path):
                         die(
                             f"FAILED: {path} already exists — pick a different --out so an "
                             "earlier run's raw report is not overwritten",
                             2,
                         )
 
-            cmd = [
-                binary,
-                "-p", prompt,
-                "--model", model,
-                "--disable-slash-commands",
-                "--output-format", "json",
-                "--print-timeout", timeout,
-            ]
+            if turns is None:
+                cmd = [
+                    binary,
+                    "-p", prompt,
+                    "--model", model,
+                    "--disable-slash-commands",
+                    "--output-format", "json",
+                    "--print-timeout", timeout,
+                ]
+            else:
+                # No -p: the turns arrive on stdin. --print-timeout bounds each turn, not
+                # the session (agy 1.4.12: three turns of ~3 s each all finished under a
+                # 6 s timeout, 9 s in total).
+                cmd = [
+                    binary,
+                    "--model", model,
+                    "--disable-slash-commands",
+                    "--input-format", "stream-json",
+                    "--output-format", "stream-json",
+                    "--print-timeout", timeout,
+                ]
             if effort is not None:
                 cmd += ["--effort", effort]
 
@@ -1196,12 +1495,28 @@ def main():
                 + (f", effort {effort}" if effort is not None else ""),
                 file=sys.stderr,
             )
+            if turns is not None:
+                print(
+                    f"turns:      {len(turns)}: one loads the whole diff, {len(parts)} "
+                    f"review it in parts of up to {part_kb} KB",
+                    file=sys.stderr,
+                )
+                print(f"raw input:  {in_path}", file=sys.stderr)
             print(f"raw output: {out_path}", file=sys.stderr)
             print(f"stderr:     {err_path}", file=sys.stderr)
 
             envelope_bytes = None
             try:
-                with private_create(out_path) as out_f, private_create(err_path) as err_f:
+                with contextlib.ExitStack() as files:
+                    out_f = files.enter_context(private_create(out_path))
+                    err_f = files.enter_context(private_create(err_path))
+                    stdin = subprocess.DEVNULL
+                    if turns is not None:
+                        # Kept beside the output: what each turn asked is part of the record.
+                        stdin = files.enter_context(private_create(in_path))
+                        stdin.write(turn_input)
+                        stdin.flush()
+                        stdin.seek(0)
                     # agy inherits the signal mask, so it is lifted for exactly the
                     # child's lifetime: Ctrl-C reaches agy, and a signal that arrived
                     # while blocked is delivered here, inside the `try`.
@@ -1209,7 +1524,7 @@ def main():
                         signal.pthread_sigmask(signal.SIG_UNBLOCK, GRANT_SIGNALS)
                     try:
                         rc = subprocess.call(
-                            cmd, stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f
+                            cmd, stdin=stdin, stdout=out_f, stderr=err_f
                         )
                     finally:
                         if grant is not None:
@@ -1236,9 +1551,15 @@ def main():
             # exit-code branch below: a retryable failure must not be reported as a dead end.
             # Only THIS error is retried — every other one means running again changes
             # nothing, and would just bill a second time for the same answer.
-            if hit_output_limit(
-                envelope_error_text(envelope_bytes.decode("utf-8", "replace"))
-            ):
+            if turns is None:
+                limit_hit = hit_output_limit(
+                    envelope_error_text(envelope_bytes.decode("utf-8", "replace"))
+                )
+            else:
+                # A stream-json session warns and goes on to the next turn after a failed
+                # one, so the limit can sit in any turn's result.
+                limit_hit = any(hit_output_limit(e) for e in stream_errors(envelope_bytes))
+            if limit_hit:
                 nxt = lower_effort(effort) if steppable else None
                 if nxt is not None:
                     print(
@@ -1250,7 +1571,7 @@ def main():
                     effort = nxt
                     continue
                 die(
-                    f"FAILED: {limit_guidance(model, tried, args.no_retry)}\n"
+                    f"FAILED: {limit_guidance(model, tried, args.no_retry, keep_lever)}\n"
                     f"— see {err_path}"
                 )
             break
@@ -1268,14 +1589,18 @@ def main():
         # reading or parsing the envelope is swallowed rather than replacing it — but it
         # must not become a traceback either, hence the same guards as the --check path.
         detail = ""
-        try:
-            raw = read_text(out_path).strip()
-            if raw:
-                parsed = json.loads(raw)
-                if isinstance(parsed, dict) and parsed.get("error"):
-                    detail = f": {parsed['error']}"
-        except (OSError, UnicodeDecodeError, ValueError, RecursionError):
-            pass
+        if turns is not None:
+            errors = stream_errors(envelope_bytes or b"")
+            detail = f": {errors[0]}" if errors else ""
+        else:
+            try:
+                raw = read_text(out_path).strip()
+                if raw:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict) and parsed.get("error"):
+                        detail = f": {parsed['error']}"
+            except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+                pass
         die(f"FAILED: agy exited {rc}{detail} — see {err_path}")
 
     # Seen on agy 1.3.5 (a --repo review at gemini-4-argon, effort high): at the print
@@ -1289,6 +1614,12 @@ def main():
             "and returned partial output, so there is no complete review. Re-run with a "
             f"longer --timeout (a --repo review reads files first and takes longer) — see "
             f"{err_path}"
+        )
+
+    if turns is not None:
+        return finish_turns(
+            envelope_bytes, turns, parts, err_path,
+            f"model={model} effort={tried[-1]} attempts={len(tried)}",
         )
 
     try:
