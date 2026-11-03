@@ -1,0 +1,9 @@
+{
+  "name": "deepseek-review-dsh",
+  "private": true,
+  "description": "The pinned DeepSeek Harness (dsh) that deepseek-review runs. Installed with npm ci --ignore-scripts from the lockfile beside this file.",
+  "license": "MIT",
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.2.1-rc.5"
+  }
+}

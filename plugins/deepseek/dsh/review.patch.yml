@@ -1,0 +1,110 @@
+# deepseek-review overlay for the pinned dsh 0.2.1-rc.5 headless profile.
+#
+# Every row id below was read from `dsh --profile headless --dump-config` on 0.2.1-rc.5
+# (2026-11-01). A patch replaces a row's whole `config`, so the rows that set config list every
+# field they keep. The per-run model, effort, token budget and endpoint live in run-N.patch.yml,
+# which the wrapper writes for each attempt.
+#
+# Uploads and telemetry: the Session-log upload, the plugin-package inventory and both OTel
+# rows are off.
+# Extra model calls: the session-title LLM call is off.
+# Tools: everything except read, glob, grep and todo_write is off: bash, jobs, subagents, PTC
+# (code execution), web search and fetch, MCP, skills, goals, plan mode, cd.
+# Inputs: AGENTS.md/CLAUDE.md loading is off.
+# Policy: the file sandbox is read-only and calls that need approval are rejected (headless has
+# no one to ask). The `review` preset matches that pair, so the permission service activates.
+- id: session-log-deepseek
+  disabled: true
+- id: plugin-package-inventory-deepseek
+  disabled: true
+- id: session-title-llm
+  disabled: true
+- id: llm-pi-ai
+  disabled: true
+- id: llm-deepseek-account
+  disabled: true
+- id: otel
+  disabled: true
+- id: session-telemetry-otel
+  disabled: true
+- id: tool-bash
+  disabled: true
+- id: tool-pwsh
+  disabled: true
+- id: jobs
+  disabled: true
+- id: tool-jobs
+  disabled: true
+- id: agent-instructions
+  disabled: true
+- id: skill
+  disabled: true
+- id: skill-filesystem
+  disabled: true
+- id: tool-skill
+  disabled: true
+- id: goal
+  disabled: true
+- id: goal-round-driver
+  disabled: true
+- id: command-goal
+  disabled: true
+- id: tool-goal
+  disabled: true
+- id: subagent
+  disabled: true
+- id: subagent-spawn-in-process
+  disabled: true
+- id: subagent-fork-in-process
+  disabled: true
+- id: tool-subagent-control
+  disabled: true
+- id: tool-subagent-list-agents
+  disabled: true
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: ptc-runtime
+  disabled: true
+- id: workflow-ptc
+  disabled: true
+- id: tool-workflow
+  disabled: true
+- id: web
+  disabled: true
+- id: web-search-deepseek
+  disabled: true
+- id: web-deepseek-api
+  disabled: true
+- id: web-fetch-http
+  disabled: true
+- id: tool-web
+  disabled: true
+- id: mcp-resources
+  disabled: true
+- id: tool-fs
+  config:
+    read: true
+    readImage: false
+    write: false
+    edit: false
+    applyPatch: false
+- id: sandbox-policy
+  config:
+    mode: read-only
+    workspaceRoot: !!js process.cwd()
+- id: approval
+  config:
+    policy: never
+- id: plan-mode
+  disabled: true
+- id: tool-working-directory
+  disabled: true
+- id: permission
+  config:
+    presets:
+      review:
+        sandbox: read-only
+        approval: never
+    defaultPreset: review

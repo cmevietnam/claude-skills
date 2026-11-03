@@ -1,0 +1,14 @@
+# TEST ONLY. Points llm-deepseek at the loopback mock (fixtures/mock-messages.py) for the
+# real-dsh section of test-deepseek-review.sh, which runs dsh directly, never through the
+# wrapper (one case runs it under a test copy of the wrapper's fence-1.sb, with this patch in
+# <out>/home). The harness replaces __PORT__ with the mock's port in a copy under its temp dir.
+# The wrapper has no flag or env var that adds a patch or changes the endpoint.
+# A config row replaces the whole config, so this row also restates the default effort and
+# output budget; the wire check of those two values therefore pins dsh's mapping of
+# reasoningEffort/maxTokens onto the request, while --dump-config pins the wrapper's own values.
+- id: llm-deepseek
+  config:
+    baseURL: http://127.0.0.1:__PORT__
+    apiKeyEnv: DEEPSEEK_API_KEY
+    reasoningEffort: max
+    maxTokens: 393216

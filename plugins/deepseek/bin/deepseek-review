@@ -1,0 +1,1714 @@
+#!/usr/bin/env -S -u DEVELOPER_DIR /usr/bin/python3 -I
+"""Run one DeepSeek review through a pinned, sandboxed DeepSeek Harness (dsh), and refuse to
+call it a review unless the run proves it.
+
+Usage:
+  deepseek-review [--model M] [--effort low|high|max] [--max-tokens N] [--repo DIR]
+                  [--expect-read PATH]... [--out DIR] [--timeout T]
+                  [--node PATH] [--dsh-dir DIR] PROMPT_FILE
+  deepseek-review --continue OUT_DIR [--repo DIR] [--expect-read PATH]... PROMPT_FILE
+  deepseek-review --check OUT_DIR [--attempt N]
+  deepseek-review --print-invocation [run options] PROMPT_FILE
+  deepseek-review --install [--dsh-dir DIR] [--node PATH]
+  deepseek-review --doctor [--dsh-dir DIR] [--node PATH]
+
+What a run does:
+  - dsh 0.2.1-rc.5 (PINNED_VERSION) runs headless from its own install dir, never from PATH,
+    started as `<node> <dsh-dir>/node_modules/@deepseek-ai/dsh/lib/bin.js` with an absolute node.
+  - It runs under /usr/bin/sandbox-exec with a generated profile that denies every file read
+    except the macOS runtime, node, dsh, the repo and the run's own home/tmp, denies the repo's
+    .env-like files (.env*, *.env), and denies every write except home/tmp. It never allows a
+    home, a dir above or directly under one, a secret dir or a broad system dir whole. Those
+    refusals fold letter case and Unicode normalization, as APFS and Seatbelt do.
+  - The interpreter, git and otool are fixed paths: the caller's PATH, PYTHONPATH and
+    DEVELOPER_DIR pick none of them, and git and otool get a minimal env without the key.
+  - dsh/review.patch.yml (beside this script's plugin) turns off every dsh tool but read, glob,
+    grep and todo_write, and turns off the Session-log upload, telemetry and the title call.
+    run-N.patch.yml pins model, effort, max_tokens and the official endpoint for the attempt.
+  - The child env is an allowlist; the caller's other variables never reach dsh.
+  - The prompt goes on stdin with a closing block that asks for a per-attempt nonce line.
+
+A run is a review (exit 0, answer on stdout) only if: dsh exited 0 and was not cancelled; the
+NDJSON stream is well formed (session first, final last, no error event); the last turn ended
+`completed`; the answer ends with this attempt's VERDICT line exactly once; with --repo, a read
+inside the repo succeeded and every --expect-read file was read; and dsh composed every overlay
+row. Anything else is exit 1 with one `deepseek-review: FAIL <CODE>` line per failed check.
+Setup and usage errors exit 2 (`deepseek-review: ERROR <CODE>`) before anything is sent.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import pwd
+import re
+import secrets
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unicodedata
+
+PINNED_VERSION = "0.2.1-rc.5"
+DEFAULT_MODEL = "deepseek-flash"  # DeepSeek-V4.1-Flash (user decision, 2026-11-02)
+DEFAULT_EFFORT = "max"
+EFFORTS = ("low", "high", "max")
+MAX_TOKENS_CAP = 393216  # the API's maximum for one response (api-docs.deepseek.com, 2026-10-31)
+DEFAULT_TIMEOUT = 1800
+BASE_URL = "https://api.deepseek.com/anthropic"
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+GIT = "/usr/bin/git"  # never from the caller's PATH
+CHILD_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+KILL_GRACE = 6.0  # dsh drains for 5 s on SIGTERM
+SECRET_DIRS = (".ssh", ".gnupg", ".aws", ".config", ".dsh", ".claude", ".codex", ".gemini",
+               ".kimi-code", "Library")
+PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+DSH_SRC = os.path.join(PLUGIN_ROOT, "dsh")
+REVIEW_PATCH = os.path.join(DSH_SRC, "review.patch.yml")
+BIN_REL = os.path.join("node_modules", "@deepseek-ai", "dsh", "lib", "bin.js")
+MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9.\-]{0,63}$")
+VERDICT_LIKE = re.compile(r"VERDICT-[0-9a-f]{16}:")
+COMPOSE_RES = (re.compile(r"\d+ entr(?:y|ies) did not activate"),
+               re.compile(r"patch: entry \".*\" not found"))
+# Read-allow prefixes the fence never grants whole: a node prefix that resolves to one of these
+# is narrowed to node's own bin dir.
+BROAD = {"/", "/usr", "/usr/local", "/opt", "/opt/homebrew", "/Users", "/private", "/var", "/tmp",
+         "/etc", "/private/var", "/private/tmp", "/private/etc"}
+
+
+def _excepthook(etype, value, tb):
+    # Never print an exception's text or traceback: the child env holds the API key.
+    print(f"deepseek-review: internal error ({etype.__name__})", file=sys.stderr)
+    sys.exit(2)
+
+
+sys.excepthook = _excepthook
+
+
+class SetupError(Exception):
+    def __init__(self, code: str, text: str, rc: int = 2):
+        super().__init__(code)
+        self.code, self.text, self.rc = code, text, rc
+
+
+class UsageError(Exception):
+    pass
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise UsageError(message)
+
+
+# ---------------------------------------------------------------------------------------------
+# small helpers
+
+
+def real(p: str) -> str:
+    # realpath resolves each component before it applies the next "..", as the kernel does;
+    # abspath first would drop "link/.." as text and check a path the kernel never opens.
+    return canon(os.path.realpath(os.path.expanduser(p)))
+
+
+def as_given(p: str) -> str:
+    """p joined to the cwd but not normalised: "link/.." keeps the meaning the kernel gives it."""
+    return os.path.join(os.getcwd(), os.path.expanduser(p))
+
+
+def canon(p: str) -> str:
+    """p as the volume stores it. realpath keeps the caller's letter case and Unicode form
+    (/users/ME stays so) while dsh, git and Seatbelt see the stored one, so an existing dir or
+    regular file is respelled from F_GETPATH. Only the case and normalization may change: any
+    other answer (a hard link's other name), a missing path or an error returns p."""
+    try:
+        st = os.stat(p)
+        if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
+            return p
+        fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+    except OSError:
+        return p
+    try:
+        got = fd_path(fd)
+    finally:
+        os.close(fd)
+    return got if got and os.path.isabs(got) and fold(got) == fold(p) else p
+
+
+def fd_path(fd: int) -> str | None:
+    """The path the volume stores for an open file (F_GETPATH), or None."""
+    try:
+        got = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0]
+        return got.decode("utf-8", errors="surrogateescape")
+    except (OSError, ValueError):
+        return None
+
+
+def inside(child: str, parent: str) -> bool:
+    """True when child is parent or below it (both realpaths)."""
+    return child == parent or child.startswith(parent.rstrip("/") + "/")
+
+
+def overlaps(a: str, b: str) -> bool:
+    return inside(a, b) or inside(b, a)
+
+
+def fold(p: str) -> str:
+    """A path as APFS compares it: case- and normalization-insensitive. realpath keeps the caller's
+    spelling (/users/ME stays so) while Seatbelt matches a rule on the real dir in any case, so every
+    check that REFUSES on a match compares folded paths. A check that allows on a match does not."""
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", p).casefold())
+
+
+def inside_ci(child: str, parent: str) -> bool:
+    return inside(fold(child), fold(parent))
+
+
+def overlaps_ci(a: str, b: str) -> bool:
+    return overlaps(fold(a), fold(b))
+
+
+BROAD_FOLDED = {fold(b) for b in BROAD}
+
+
+def in_secret_dir(p: str) -> str | None:
+    """The secret dir of a home that p is in (folded compare), or None."""
+    for h in homes():
+        for s in SECRET_DIRS:
+            for sd in {os.path.join(h, s), real(os.path.join(h, s))}:
+                if inside_ci(p, sd):
+                    return sd
+    return None
+
+
+def home_dir() -> str:
+    h = os.environ.get("HOME") or os.path.expanduser("~")
+    return real(h)
+
+
+def account_home() -> str:
+    """The account's home from the password database; an inherited HOME cannot move it."""
+    try:
+        pw = pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:
+        pw = ""
+    return real(pw) if pw else home_dir()
+
+
+def homes() -> list:
+    """Every dir the home-based refusals apply to: realpath($HOME) when it is set, and the
+    account's home, so a spoofed HOME cannot move the refusals away from the real one."""
+    hs = [home_dir()] if os.environ.get("HOME") else []
+    acct = account_home()
+    if acct not in hs:
+        hs.append(acct)
+    return hs
+
+
+def unsafe_dir(d: str, home_child_ok: bool = False) -> bool:
+    """True for a dir the fence must never allow whole: a broad system prefix, a home or a dir
+    above one, a direct child of a home (~/.local, ~/Documents) unless home_child_ok (node's own
+    bin and lib dirs, ~/bin and ~/lib), or a dir that overlaps one of a home's secret dirs."""
+    if fold(d) in BROAD_FOLDED:
+        return True
+    for h in homes():
+        if inside_ci(h, d) or (fold(os.path.dirname(d)) == fold(h) and not home_child_ok):
+            return True
+        for s in SECRET_DIRS:
+            for sd in {os.path.join(h, s), real(os.path.join(h, s))}:
+                if overlaps_ci(d, sd):
+                    return True
+    return False
+
+
+def has_ctrl(s: str) -> bool:
+    return any(ord(c) < 32 or ord(c) == 127 for c in s)
+
+
+def which_abs(name: str) -> str | None:
+    """First ABSOLUTE PATH entry holding an executable `name`; relative/empty entries skipped."""
+    for d in (os.environ.get("PATH") or "").split(os.pathsep):
+        if not d or not os.path.isabs(d):
+            continue
+        cand = os.path.join(d, name)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def parse_timeout(v: str) -> int:
+    m = re.fullmatch(r"(\d+)([smh]?)", v or "")
+    if not m or int(m.group(1)) <= 0:
+        raise UsageError(f"--timeout must be a positive integer of seconds or <n>s|m|h, got {v!r}")
+    secs = int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)]
+    if secs > TIMEOUT_MAX:
+        raise UsageError(f"--timeout must be at most {TIMEOUT_MAX // 3600}h, got {v!r}")
+    return secs
+
+
+TIMEOUT_MAX = 24 * 3600
+
+
+def write_private(path: str, data, mode: str = "w") -> None:
+    """Create a new file at 0600; never overwrite."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, mode if "b" in mode else "w", **({} if "b" in mode else {"encoding": "utf-8"})) as f:
+        f.write(data)
+
+
+def sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+SECRETS = []  # values never to print: the API key, registered as soon as it is seen
+
+
+def remember_secret(value: str | None) -> None:
+    if value and len(value) >= 8 and value not in SECRETS:
+        SECRETS.append(value)
+
+
+def scrub(text: str) -> str:
+    """Replace any registered secret in text the wrapper prints (dsh's messages included)."""
+    for value in SECRETS:
+        text = text.replace(value, "[REDACTED]")
+    return text
+
+
+def err(code: str, text: str) -> None:
+    print(scrub(f"deepseek-review: ERROR {code}: {text}"), file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------------------------
+# validation of options and scope (setup errors, first wins in the contract's order)
+
+
+ENV_NAME = re.compile(r"\.env[^/]*|[^/]*\.env", re.IGNORECASE)  # the fence's .env-like names
+
+
+def user_symlink_on_the_way(path: str) -> str | None:
+    """The first directory component of path, as given, that is a symlink not owned by root (the
+    last component is O_NOFOLLOW's). Root's links (/tmp, /var, /etc) are the system's own. A
+    prefix that cannot be checked (longer than PATH_MAX under a deep cwd) refuses the file."""
+    parts = as_given(path).split("/")
+    cur = ""
+    for part in parts[1:-1]:
+        cur += "/" + part
+        if part in ("", "."):
+            continue
+        try:
+            st = os.lstat(cur)
+        except OSError as e:
+            raise SetupError("PROMPT_UNSAFE", f"cannot check the prompt file's path at {cur} "
+                                              f"({e.strerror}); pass a shorter real path") from None
+        if stat.S_ISLNK(st.st_mode) and st.st_uid != 0:
+            return cur
+    return None
+
+
+def prompt_target_problem(p: str) -> str | None:
+    """What makes the file actually opened unfit to send, or None."""
+    sd = in_secret_dir(p)
+    if sd:
+        return f"{p} resolves into {sd}"
+    for h in homes():
+        if fold(os.path.dirname(p)) == fold(h) and os.path.basename(p).startswith("."):
+            return f"{p} is a dotfile directly in the home {h}"
+    for part in p.split("/"):
+        if part and ENV_NAME.fullmatch(part):
+            return f"{p} matches the .env pattern ({part})"
+    return None
+
+
+def read_prompt(path: str) -> str:
+    if not path or not os.path.isfile(path):
+        raise SetupError("PROMPT_MISSING", f"prompt file not found: {path}")
+    link = user_symlink_on_the_way(path)
+    if link:
+        raise SetupError("PROMPT_UNSAFE", f"the prompt file's path goes through a symlink you own "
+                                          f"({link}); pass the file's real path")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise SetupError("PROMPT_UNSAFE", f"the prompt file is a symlink: {path}; pass the file "
+                                              f"itself") from None
+        raise SetupError("PROMPT_MISSING", f"cannot read the prompt file: {path}") from None
+    with os.fdopen(fd, "rb") as f:
+        # Judge the file the kernel opened, not the path it was named by.
+        opened = fd_path(f.fileno())
+        problem = (prompt_target_problem(opened) if opened
+                   else f"{path} cannot be located (F_GETPATH failed)")
+        if problem:
+            raise SetupError("PROMPT_UNSAFE", f"the prompt file {problem}; write what you mean to "
+                                              f"send into a file elsewhere")
+        raw = f.read()
+    text = raw.decode("utf-8", errors="replace")
+    if not text.strip():
+        raise SetupError("PROMPT_EMPTY", f"prompt file is empty or whitespace only: {path}")
+    return text
+
+
+def check_model(model: str) -> None:
+    if not MODEL_RE.match(model):
+        raise SetupError("MODEL_INVALID", "model id must match [a-z0-9][a-z0-9.-]{0,63}")
+
+
+def check_effort(effort: str) -> None:
+    if effort not in EFFORTS:
+        raise SetupError("EFFORT_INVALID",
+                         f"effort must be one of {', '.join(EFFORTS)} (the API silently maps other "
+                         f"values, which would misattribute the review)")
+
+
+def check_max_tokens(v: str) -> int:
+    if not re.fullmatch(r"\d+", v or "") or not (1 <= int(v) <= MAX_TOKENS_CAP):
+        raise SetupError("MAX_TOKENS_INVALID", f"--max-tokens must be an integer in 1..{MAX_TOKENS_CAP}")
+    return int(v)
+
+
+KEY_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
+
+
+def key_problem(key: str) -> str | None:
+    """None for a key of letters, digits, '.', '_' and '-' (DeepSeek's are sk- and hex: no form of
+    it needs escaping, so the scrub sees every copy); otherwise its length and bad positions,
+    never its value."""
+    bad = [i for i, c in enumerate(key) if c not in KEY_CHARS]
+    if not bad:
+        return None if len(key) >= 8 else f"length {len(key)}, shorter than 8"
+    return f"length {len(key)}, bad positions [{', '.join(str(i) for i in bad)}]"
+
+
+def read_key() -> str:
+    key = os.environ.get("DEEPSEEK_API_KEY")
+    if not key:
+        raise SetupError("KEY_MISSING",
+                         "DEEPSEEK_API_KEY is not set; run through `opgate exec "
+                         "DEEPSEEK_API_KEY=op://… -- deepseek-review …`")
+    problem = key_problem(key)
+    if problem:
+        raise SetupError("KEY_INVALID", problem)
+    return key
+
+
+def git_env() -> dict:
+    """git gets a fixed PATH and the account's home only: no caller variable (the API key, GIT_*,
+    DEVELOPER_DIR) reaches it."""
+    return {"PATH": CHILD_PATH, "HOME": account_home()}
+
+
+def check_repo(arg: str) -> str:
+    hs = homes()
+    repo = real(arg)
+    if not os.path.isdir(repo):
+        raise SetupError("REPO_NOT_DIR", f"--repo is not a directory: {arg}")
+    if repo == "/":
+        raise SetupError("REPO_IS_ROOT", "--repo must not be /")
+    for home in hs:
+        if inside_ci(home, repo):
+            raise SetupError("REPO_HOME_OR_ABOVE", f"--repo must not be HOME or above it: {repo}")
+    for home in hs:
+        for d in SECRET_DIRS:
+            for sd in {os.path.join(home, d), real(os.path.join(home, d))}:
+                if overlaps_ci(repo, sd):
+                    raise SetupError("REPO_SECRET_OVERLAP", f"--repo overlaps {sd}")
+    try:
+        top = subprocess.run([GIT, "-C", repo, "rev-parse", "--show-toplevel"], env=git_env(),
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        raise SetupError("REPO_NOT_GIT", f"cannot run git to check {repo}") from None
+    if top.returncode != 0 or not top.stdout.strip():
+        raise SetupError("REPO_NOT_GIT", f"--repo is not inside a git work tree: {repo}")
+    if fold(real(top.stdout.strip())) in {fold(h) for h in hs}:
+        raise SetupError("REPO_DOTFILES", "--repo is in a git work tree rooted at HOME (a dotfiles repo)")
+    if not os.access(repo, os.R_OK | os.X_OK):
+        # Its spelling could not be checked (canon needs to open it), and the reviewer could not
+        # list it either.
+        raise SetupError("REPO_UNREADABLE", f"--repo is not a directory you can list: {repo}")
+    if has_ctrl(arg) or has_ctrl(repo) or '"' in repo:
+        raise SetupError("REPO_BAD_CHARS", "--repo path holds a control character or a double quote")
+    return repo
+
+
+def check_expect(paths: list, repo: str | None) -> list:
+    if not paths:
+        return []
+    if repo is None:
+        raise SetupError("EXPECT_READ_NEEDS_REPO", "--expect-read needs --repo")
+    out = []
+    for p in paths:
+        rp = real(p)
+        if not os.path.isfile(rp) or not inside(rp, repo) or rp == repo:
+            raise SetupError("EXPECT_READ_OUTSIDE_REPO", f"--expect-read is not a file inside the repo: {p}")
+        out.append(rp)
+    return out
+
+
+def default_dsh_dir() -> str:
+    """Under the account's home from the password database: an inherited HOME cannot pick it."""
+    return os.path.join(account_home(), ".local", "share", "deepseek-review", f"dsh-{PINNED_VERSION}")
+
+
+NODE_ROOTS = ("/opt/homebrew", "/usr/local")  # Homebrew (Apple silicon, Intel)
+NODE_HOME_ROOTS = (".nvm/versions", ".volta", ".asdf/installs")
+
+
+def node_roots() -> list:
+    """Where a node found through PATH may live: Homebrew's prefixes and the version managers'
+    dirs under the account's home. Anything else needs --node."""
+    ah = account_home()
+    roots = []
+    for r in (*NODE_ROOTS, *(os.path.join(ah, x) for x in NODE_HOME_ROOTS)):
+        rr = real(r)  # a symlinked ~/.nvm counts where it leads, spelled as stored
+        # A root that resolves to / or to a home (or above one) would trust every node.
+        if rr != "/" and not any(inside_ci(h, rr) for h in homes()):
+            roots.append(rr)
+    return roots
+
+
+def resolve_out(arg: str | None, repo: str | None, dsh_dir: str) -> str | None:
+    if arg is None:
+        return None
+    a = as_given(arg).rstrip("/") or "/"
+    parent, name = os.path.dirname(a), os.path.basename(a)
+    if name in ("", ".", ".."):
+        raise SetupError("OUT_EXISTS", f"--out must name a new directory: {arg}")
+    if os.path.lexists(a):
+        raise SetupError("OUT_EXISTS", f"--out must not exist yet: {a}")
+    if not os.path.isdir(parent):
+        raise SetupError("OUT_PARENT_MISSING", f"the parent of --out does not exist: {parent}")
+    out = os.path.join(real(parent), name)
+    check_out_overlap(out, repo, dsh_dir)
+    return out
+
+
+def check_out_overlap(out: str, repo: str | None, dsh_dir: str) -> None:
+    if repo and overlaps_ci(out, repo):
+        raise SetupError("OUT_OVERLAP", "the out dir must not be inside, or contain, the repo")
+    if any(inside_ci(h, out) for h in homes()):
+        raise SetupError("OUT_OVERLAP", "the out dir must not be HOME or above it")
+    if overlaps_ci(out, real(dsh_dir)):
+        raise SetupError("OUT_OVERLAP", "the out dir must not be inside, or contain, the dsh dir")
+
+
+def check_out_node(out: str, node_dirs: list) -> None:
+    """The fence lets node read its dirs whole; the out dir must not be one of them, or in one."""
+    for d in node_dirs:
+        if overlaps_ci(out, d):
+            raise SetupError("OUT_OVERLAP", f"the out dir must not be inside, or contain, {d}, "
+                                            f"which the fence lets node read")
+
+
+def resolve_node(arg: str | None, scopes: list) -> str:
+    if arg:
+        cand = as_given(arg)
+        if not (os.path.isfile(cand) and os.access(cand, os.X_OK)):
+            raise SetupError("NODE_NOT_FOUND", f"--node is not an executable file: {arg}")
+    else:
+        cand = which_abs("node")
+        if not cand:
+            raise SetupError("NODE_NOT_FOUND", "no node on an absolute PATH entry (pass --node)")
+    node = real(cand)
+    for s in scopes:
+        if s and inside_ci(node, s):
+            raise SetupError("NODE_IN_SCOPE", f"node resolves inside {s}: {node}")
+    if not arg and not any(inside(node, r) for r in node_roots()):
+        raise SetupError("NODE_UNTRUSTED",
+                         f"node from PATH resolves to {node}, outside the known install locations "
+                         f"({', '.join(node_roots())}); pass --node to use it")
+    bindir = os.path.dirname(node)
+    if unsafe_dir(os.path.dirname(bindir)) and unsafe_dir(bindir, home_child_ok=True):
+        raise SetupError("NODE_DIR_UNSAFE",
+                         f"the fence would have to allow all of {bindir} (a home, a dir above or "
+                         f"directly under one, a secret dir or a broad system dir); pass --node "
+                         f"with a node installed elsewhere")
+    return node
+
+
+def check_dsh(dsh_dir: str, repo: str | None) -> tuple:
+    d = real(dsh_dir)
+    binjs = os.path.join(d, BIN_REL)
+    if not os.path.isdir(d) or not os.path.isfile(binjs):
+        raise SetupError("DSH_MISSING", f"dsh is not installed in {d}; run `deepseek-review --install`")
+    st = os.stat(d)
+    if st.st_uid != os.getuid() or st.st_mode & 0o022:
+        raise SetupError("DSH_DIR_UNSAFE", f"{d} must be owned by you and not group/world-writable")
+    if unsafe_dir(d):
+        raise SetupError("DSH_DIR_UNSAFE",
+                         f"{d} is a home, a dir above or directly under one, a secret dir or a broad "
+                         f"system dir: the fence would allow all of it")
+    if repo and overlaps_ci(d, repo):
+        raise SetupError("DSH_DIR_UNSAFE", f"{d} must not overlap the repo")
+    if not inside(real(binjs), d):
+        raise SetupError("DSH_DIR_UNSAFE", f"dsh's bin.js resolves outside {d}")
+    # dsh imports its other packages through node_modules: none of them may come from elsewhere.
+    stack = [d]
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                entries = list(it)
+        except OSError:
+            raise SetupError("DSH_DIR_UNSAFE", f"cannot list {cur}") from None
+        for e in entries:
+            if e.is_symlink():
+                if not inside(real(e.path), d):
+                    raise SetupError("DSH_DIR_UNSAFE", f"{e.path} is a symlink that resolves outside {d}")
+            elif e.is_dir(follow_symlinks=False):
+                stack.append(e.path)
+    return d, binjs
+
+
+def check_sandbox() -> None:
+    if sys.platform != "darwin" or not os.path.isfile(SANDBOX_EXEC):
+        raise SetupError("NO_SANDBOX", f"{SANDBOX_EXEC} is required (macOS only)")
+
+
+def check_out_dir_perms(out: str) -> str:
+    o = real(out)
+    try:
+        st = os.stat(o)
+    except OSError:
+        raise SetupError("OUT_PERMS", f"not a directory: {out}") from None
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o700:
+        raise SetupError("OUT_PERMS", f"{o} must be a directory you own with mode 0700")
+    return o
+
+
+# ---------------------------------------------------------------------------------------------
+# the launch: patches, fence, env, argv
+
+
+def run_patch(model: str, effort: str, max_tokens: int) -> str:
+    return ("# deepseek-review run patch: model, effort, output budget and endpoint for one attempt.\n"
+            "- id: agent-default-model\n"
+            "  config:\n"
+            "    provider: deepseek-official\n"
+            f"    model: {model}\n"
+            "- id: llm-deepseek\n"
+            "  config:\n"
+            f"    baseURL: {BASE_URL}\n"
+            "    apiKeyEnv: DEEPSEEK_API_KEY\n"
+            f"    reasoningEffort: {effort}\n"
+            f"    maxTokens: {max_tokens}\n")
+
+
+def review_patch_text() -> str:
+    with open(REVIEW_PATCH, encoding="utf-8") as f:
+        return f.read()
+
+
+def child_env(out: str, key: str | None) -> dict:
+    env = {"PATH": CHILD_PATH, "HOME": os.path.join(out, "home"), "DSH_HOME": os.path.join(out, "home"),
+           "TMPDIR": os.path.join(out, "tmp"), "DSH_TELEMETRY_DISABLED": "1",
+           "DSH_PERMISSION_MODE": "read-only"}
+    if key is not None:
+        env["DEEPSEEK_API_KEY"] = key
+    if os.environ.get("LANG"):
+        env["LANG"] = os.environ["LANG"]
+    return env
+
+
+def child_env_names() -> list:
+    names = ["PATH", "HOME", "DSH_HOME", "TMPDIR", "DSH_TELEMETRY_DISABLED", "DSH_PERMISSION_MODE",
+             "DEEPSEEK_API_KEY"]
+    if os.environ.get("LANG"):
+        names.append("LANG")
+    return sorted(names)
+
+
+def launch_argv(out: str, n: int, node: str, binjs: str, session_id: str | None) -> list:
+    argv = [SANDBOX_EXEC, "-f", os.path.join(out, f"fence-{n}.sb"), node, binjs, "--profile", "headless",
+            "--patch", os.path.join(out, "review.patch.yml"), "--patch", os.path.join(out, f"run-{n}.patch.yml"),
+            "--json"]
+    if session_id:
+        argv += ["--session-id", session_id]
+    return argv + ["-"]
+
+
+def sb_str(p: str) -> str:
+    return '"' + p.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def ere_escape(p: str) -> str:
+    return re.sub(r'([.\[\](){}*+?|^$\\])', r"\\\1", p)
+
+
+def node_read_dirs(node: str) -> list:
+    """Dirs node needs to start: its prefix (bin + lib) when that is safe to allow whole, else its
+    bin dir and <prefix>/lib; the dylib dirs otool lists; Homebrew's OpenSSL config dir (node
+    aborts without it). No dir unsafe_dir() names is ever added."""
+    dirs = []
+    bindir = os.path.dirname(node)
+    prefix = os.path.dirname(bindir)
+    if not unsafe_dir(prefix):
+        dirs.append(prefix)
+    else:
+        if not unsafe_dir(bindir, home_child_ok=True):
+            dirs.append(bindir)
+        libdir = os.path.join(prefix, "lib")
+        if os.path.isdir(libdir) and not unsafe_dir(libdir, home_child_ok=True) and fold(prefix) not in ("/", "/usr"):
+            dirs.append(libdir)
+    try:
+        out = subprocess.run(["/usr/bin/otool", "-L", node], capture_output=True, text=True,
+                             stdin=subprocess.DEVNULL, timeout=30, env={"PATH": CHILD_PATH}).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    for line in out.splitlines()[1:]:
+        lib = line.strip().split(" (")[0]
+        if not lib.startswith("/") or lib.startswith("/usr/lib/") or lib.startswith("/System/"):
+            continue
+        d = os.path.dirname(real(lib))
+        if not unsafe_dir(d) and d not in dirs:
+            dirs.append(d)
+        m = re.match(r"^(.*)/Cellar/openssl@3/", real(lib))
+        if m:
+            etc = os.path.join(m.group(1), "etc", "openssl@3")
+            if os.path.isdir(etc) and not unsafe_dir(etc) and etc not in dirs:
+                dirs.append(etc)
+                cert = os.path.join(etc, "cert.pem")
+                if os.path.exists(cert):
+                    cd = os.path.dirname(real(cert))
+                    if not unsafe_dir(cd) and cd not in dirs:
+                        dirs.append(cd)
+    return dirs
+
+
+def fence_profile(out: str, repo: str | None, dsh_dir: str, node: str, n: int = 1) -> str:
+    home_d, tmp_d, work_d = (os.path.join(out, x) for x in ("home", "tmp", "work"))
+    reads = ["/System/Library", "/usr/lib", "/usr/share", "/private/var/db/dyld",
+             "/System/Volumes/Preboot/Cryptexes", *node_read_dirs(node), dsh_dir,
+             repo if repo else work_d, home_d, tmp_d]
+    literals = ["/", "/private/etc/ssl/cert.pem", "/private/etc/resolv.conf", "/private/etc/hosts",
+                "/private/etc/localtime", "/dev/null", "/dev/urandom", "/dev/random", "/dev/tty",
+                "/dev/dtracehelper"]
+    lines = [
+        ";; deepseek-review fence: read only what node, dsh and the review need; write only home/tmp.",
+        "(version 1)",
+        "(allow default)",
+        "(deny file-read*)",
+        "(allow file-read-metadata)",
+    ]
+    seen = set()
+    for p in reads:
+        if p not in seen:
+            seen.add(p)
+            lines.append(f"(allow file-read* (subpath {sb_str(p)}))")
+    lines += [f"(allow file-read* (literal {sb_str(p)}))" for p in literals]
+    # dsh reads its --patch overlays, which sit at the top of <out>: exactly this attempt's two,
+    # never the rest of <out> (prompts, streams, status, other attempts' patches).
+    lines += [f"(allow file-read* (literal {sb_str(os.path.join(out, name))}))"
+              for name in ("review.patch.yml", f"run-{n}.patch.yml")]
+    if repo:
+        # Names that start with .env (.env, .envrc, .env-prod, .environment) or end in .env
+        # (prod.env), at any depth, and everything under a dir so named (.env.d/key); Seatbelt
+        # matches them case-insensitively (.ENV too).
+        lines.append(f'(deny file-read* (regex #"^{ere_escape(repo)}/(.*/)?(\\.env[^/]*|[^/]*\\.env)(/.*)?$"))')
+    lines += [
+        "(deny file-write*)",
+        f"(allow file-write* (subpath {sb_str(home_d)}))",
+        f"(allow file-write* (subpath {sb_str(tmp_d)}))",
+        '(allow file-write* (literal "/dev/null"))',
+        '(allow file-write* (literal "/dev/tty"))',
+        '(allow file-write* (literal "/dev/dtracehelper"))',
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def verdict_block(nonce: str) -> str:
+    return ("\n---\nEnd your answer with exactly one final line, and nothing after it:\n"
+            f"VERDICT-{nonce}: FINDINGS\nor\nVERDICT-{nonce}: NO FINDINGS\n")
+
+
+# ---------------------------------------------------------------------------------------------
+# validation of a finished attempt (shared by the live run and --check)
+
+
+def status_problem(status: dict) -> str | None:
+    """None when repo_mode, repo and expect_read have the shapes the wrapper writes; otherwise
+    what is wrong (the checks would not know which repo to hold the run to)."""
+    rm, rp, ex = status.get("repo_mode"), status.get("repo"), status.get("expect_read")
+    if not isinstance(rm, bool):
+        return "repo_mode is not true or false"
+    if rm and not (isinstance(rp, str) and os.path.isabs(rp) and "\x00" not in rp):
+        return "repo_mode is true but repo is not an absolute path"
+    if not isinstance(ex, list) or not all(isinstance(x, str) and "\x00" not in x for x in ex):
+        return "expect_read is not a list of paths"
+    nonce = status.get("nonce")
+    if not (isinstance(nonce, str) and re.fullmatch(r"[0-9a-f]{16}", nonce)):
+        return "nonce is not 16 hex digits"
+    for k in ("exit_code", "signal"):
+        v = status.get(k)
+        if v is not None and not is_int(v):
+            return f"{k} is not an integer or null"
+    if not isinstance(status.get("cancelled"), bool):
+        return "cancelled is not true or false"
+    m = status.get("model")
+    if not (isinstance(m, str) and MODEL_RE.match(m)):
+        return "model is not a model id"
+    if status.get("effort") not in EFFORTS:
+        return "effort is not one of " + ", ".join(EFFORTS)
+    mt = status.get("max_tokens")
+    if not (is_int(mt) and 1 <= mt <= MAX_TOKENS_CAP):
+        return f"max_tokens is not an integer in 1..{MAX_TOKENS_CAP}"
+    return None
+
+
+def is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def parse_events(stream: bytes) -> list | None:
+    """The stream's events, or None when a non-empty line is not a JSON object."""
+    events = []
+    try:
+        text = stream.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    for line in text.split("\n"):
+        if not line.strip():
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            return None
+        if not isinstance(ev, dict):
+            return None
+        events.append(ev)
+    return events
+
+
+def collect_reads(events: list) -> tuple:
+    """(paths read successfully, denied tool calls). A tool_result pairs with the latest
+    tool_call of its callId that came EARLIER in the stream; a field of the wrong type is
+    treated as absent (the read does not count), never trusted or raised on."""
+    first = events[0] if events else {}
+    session_cwd = first.get("cwd") if first.get("type") == "session" else None
+    if not isinstance(session_cwd, str) or "\x00" in session_cwd or not os.path.isabs(session_cwd):
+        session_cwd = None
+    calls = {}
+    read_ok, denied = [], []
+    for e in events:
+        if e.get("type") == "tool_call":
+            if call_id_ok(e.get("callId")):
+                calls[e.get("callId")] = e
+            continue
+        if e.get("type") != "tool_result":
+            continue
+        call = calls.get(e.get("callId")) if call_id_ok(e.get("callId")) else None
+        inp = call.get("input") if call else None
+        inp = inp if isinstance(inp, dict) else {}
+        status_s = e.get("status")
+        result = e.get("result")
+        if status_s == "error" and isinstance(result, str) and "EPERM" in result:
+            target = inp.get("file_path") or inp.get("path") or inp.get("pattern") or json.dumps(inp)
+            denied.append(f"{(call or {}).get('tool', '?')} {target}")
+        if status_s != "completed" or not call or call.get("tool") != "read":
+            continue
+        # dsh's read answers with the file in its envelope (dsh-tool-fs formatReadOutput): any
+        # other text is no read.
+        if not isinstance(result, str) or not READ_ENVELOPE.fullmatch(result):
+            continue
+        fp = inp.get("file_path")
+        if not isinstance(fp, str) or not fp or "\x00" in fp:
+            continue
+        if not os.path.isabs(fp):
+            if not session_cwd:
+                continue
+            fp = os.path.join(session_cwd, fp)
+        # A path from the stream is taken as written: never `~`-expanded or joined to our cwd.
+        read_ok.append(canon(os.path.realpath(fp)))
+    return read_ok, denied
+
+
+def prior_reads(out: str, n: int) -> list:
+    """Paths that earlier attempts of the same review read and that count for attempt n: the
+    successful reads of each attempt K < n whose status records verdict PASS and whose files still
+    validate (with the reads of the attempts before it). A failed attempt's reads never count."""
+    got = []
+    for k in attempts_in(out, started_only=True):
+        if k >= n:
+            continue
+        try:
+            with open(os.path.join(out, f"status-{k}.json"), encoding="utf-8") as f:
+                st = json.load(f)
+            with open(os.path.join(out, f"run-{k}.jsonl"), "rb") as f:
+                stream = f.read()
+            with open(os.path.join(out, f"err-{k}.txt"), encoding="utf-8", errors="replace") as f:
+                err_k = f.read()
+        except (OSError, ValueError):
+            continue
+        if not isinstance(st, dict) or st.get("verdict") != "PASS" or status_problem(st):
+            continue
+        if validate(stream, err_k, st, list(got))[0]:
+            continue
+        events = parse_events(stream)
+        if events:
+            got += collect_reads(events)[0]
+    return got
+
+
+def validate(stream: bytes, err_text: str, status: dict, prior: list = ()) -> tuple:
+    """Return (failures [(code, text)], final_text, denied [str], usage {}). prior: paths that
+    earlier PASS attempts of the same review read (they count for a follow-up)."""
+    fails = []
+    denied = []
+    usage = {}
+    final_text = ""
+
+    problem = status_problem(status)
+    if problem:
+        fails.append(("STATUS_INVALID", f"the status record is malformed: {problem}"))
+    if status.get("signal") is not None:
+        fails.append(("DSH_EXIT_NONZERO", f"dsh was killed by signal {status['signal']}"))
+    elif not (is_int(status.get("exit_code")) and status.get("exit_code") == 0):
+        fails.append(("DSH_EXIT_NONZERO", f"dsh exited with code {status.get('exit_code')}"))
+    if status.get("cancelled"):
+        fails.append(("CANCELLED", f"the run was cancelled ({status.get('cancel_reason')}); "
+                                   f"a cancelled run is never a review"))
+    for rx in COMPOSE_RES:
+        m = rx.search(err_text or "")
+        if m:
+            fails.append(("COMPOSE_WARNING", f"dsh did not compose the overlay as written: {m.group(0)}"))
+            break
+
+    if not stream:
+        fails.append(("STREAM_EMPTY", "dsh wrote nothing on stdout"))
+        return fails, final_text, denied, usage
+    events = []
+    try:
+        text = stream.decode("utf-8")
+    except UnicodeDecodeError as e:
+        fails.append(("STREAM_NOT_JSON", f"stdout is not valid UTF-8 (byte {e.start})"))
+        return fails, final_text, denied, usage
+    for i, line in enumerate(text.split("\n"), 1):
+        if not line.strip():
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            ev = None
+        if not isinstance(ev, dict):
+            fails.append(("STREAM_NOT_JSON", f"stdout line {i} is not a JSON object"))
+            return fails, final_text, denied, usage
+        events.append(ev)
+    if not events:
+        fails.append(("STREAM_EMPTY", "dsh wrote no events"))
+        return fails, final_text, denied, usage
+
+    if events[0].get("type") != "session":
+        fails.append(("SESSION_NOT_FIRST", "the first event is not the session event"))
+    else:
+        cwd, sid = events[0].get("cwd"), events[0].get("sessionId")
+        if not (isinstance(cwd, str) and os.path.isabs(cwd) and "\x00" not in cwd):
+            fails.append(("SESSION_INVALID", "the session event has no absolute cwd"))
+        elif not (isinstance(sid, str) and SESSION_ID_RE.fullmatch(sid)):
+            fails.append(("SESSION_INVALID", "the session event has no valid sessionId"))
+    if events[-1].get("type") != "final":
+        fails.append(("FINAL_NOT_LAST", "the last event is not the final event"))
+    if any(e.get("type") == "error" for e in events):
+        msg = next(e for e in events if e.get("type") == "error").get("message", "")
+        fails.append(("ERROR_EVENT", f"dsh reported an error: {str(msg)[:200]}"))
+    # Each tool_call has its own valid callId, and each tool_result answers exactly one earlier call.
+    seen_calls, answered = set(), set()
+    for e in events:
+        kind = e.get("type")
+        if kind not in ("tool_call", "tool_result"):
+            continue
+        cid = e.get("callId")
+        if not call_id_ok(cid):
+            fails.append(("CALL_ID_INVALID", f"a {kind} has no valid callId"))
+            break
+        if kind == "tool_call":
+            if cid in seen_calls:
+                fails.append(("CALL_ID_INVALID", f"two tool_calls share the callId {str(cid)[:40]!r}"))
+                break
+            seen_calls.add(cid)
+        elif cid not in seen_calls:
+            fails.append(("RESULT_WITHOUT_CALL", f"a tool_result (callId {str(cid)[:40]!r}) has no "
+                                                 f"earlier tool_call with its callId"))
+            break
+        elif cid in answered:
+            fails.append(("CALL_ID_INVALID", f"two tool_results answer the callId {str(cid)[:40]!r}"))
+            break
+        else:
+            answered.add(cid)
+    turn_ends = [e for e in events if e.get("type") == "status" and e.get("phase") == "turn_end"]
+    if not turn_ends:
+        fails.append(("NO_TURN_END", "no turn_end event: the turn outcome is unknown"))
+    else:
+        reason = turn_ends[-1].get("reason")
+        kind = reason.get("kind") if isinstance(reason, dict) else None
+        if kind != "completed":
+            fails.append(("TURN_NOT_COMPLETED", f"the last turn ended {kind!r}, not 'completed'"))
+    for e in events:
+        if e.get("type") == "status" and e.get("phase") == "step_end" and isinstance(e.get("usage"), dict):
+            for k, v in e["usage"].items():
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    usage[k] = usage.get(k, 0) + v
+
+    finals = [e for e in events if e.get("type") == "final"]
+    if len(finals) > 1:
+        fails.append(("FINAL_NOT_UNIQUE", f"the stream holds {len(finals)} final events, not one"))
+    if finals:
+        t = finals[-1].get("text")
+        final_text = t if isinstance(t, str) else ""
+        if not final_text.strip():
+            fails.append(("FINAL_EMPTY", "the final answer is empty"))
+        else:
+            lines = [ln.rstrip() for ln in final_text.rstrip().split("\n")]
+            nonce = status.get("nonce")
+            nonce = nonce if isinstance(nonce, str) and re.fullmatch(r"[0-9a-f]{16}", nonce) else None
+            want = re.compile(r"^VERDICT-" + (nonce or "-") + r": (FINDINGS|NO FINDINGS)$")
+            if not want.match(lines[-1]):
+                fails.append(("VERDICT_MISSING", "the answer does not end with this attempt's VERDICT line"))
+            elif any(VERDICT_LIKE.search(ln) for ln in lines[:-1]):
+                fails.append(("VERDICT_DUPLICATE", "the answer holds more than one VERDICT line"))
+
+    read_ok, denied = collect_reads(events)
+    if not problem and status["repo_mode"]:
+        repo = status["repo"]
+        seen = read_ok + list(prior)
+        if not any(inside(p, repo) and p != repo for p in seen):
+            fails.append(("REPO_NOT_READ", "no file inside the repo was read: the reviewer could not read the repo"))
+        for want_p in status["expect_read"]:
+            if want_p not in seen:
+                fails.append(("EXPECTED_READ_MISSING", f"never read: {want_p}"))
+    return fails, final_text, denied, usage
+
+
+READ_ENVELOPE = re.compile(r"<path>[^\n]*</path>\n<type>file</type>\n<content>\n[\s\S]*\n</content>")
+SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}")
+
+
+def call_id_ok(cid) -> bool:
+    return isinstance(cid, (str, int)) and not isinstance(cid, bool) and cid != ""
+
+
+def report(fails: list, final_text: str, denied: list) -> int:
+    for d in denied:
+        print(scrub(f"denied: {d}"), file=sys.stderr)
+    if fails:
+        for code, text in fails:
+            print(scrub(f"deepseek-review: FAIL {code}: {text}"), file=sys.stderr)
+        return 1
+    sys.stdout.write(scrub(final_text.rstrip("\n")) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------
+# running one attempt
+
+
+class Cancel:
+    reason = None
+
+    @classmethod
+    def handler(cls, signum, frame):
+        if cls.reason is None:
+            cls.reason = signal.Signals(signum).name
+
+
+def kill_group(proc, deadline_grace: float) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    end = time.monotonic() + deadline_grace
+    while proc.poll() is None and time.monotonic() < end:
+        time.sleep(0.1)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    proc.wait()
+
+
+def feed_stdin(pipe, data: bytes) -> None:
+    try:
+        pipe.write(data)
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+    finally:
+        try:
+            pipe.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+
+SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def trap_signals() -> dict:
+    Cancel.reason = None
+    return {s: signal.signal(s, Cancel.handler) for s in SIGNALS}
+
+
+def restore_signals(old: dict) -> None:
+    for s, h in old.items():
+        signal.signal(s, h)
+
+
+def reap(proc) -> None:
+    """Collect a killed child; a pipe some escaped process still holds open is closed after 5 s."""
+    try:
+        proc.communicate(timeout=5)
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                pipe.close()
+            except OSError:
+                pass
+        proc.wait()
+
+
+def run_group(argv: list, cwd: str, env: dict, limit: float) -> tuple:
+    """Run a fenced check in its own process group and collect its output: (finished, returncode,
+    stdout, stderr). The caller has trap_signals() in place; the loop stops on a signal or after
+    `limit` seconds, and the group is killed either way (the whole check, or what it left)."""
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, start_new_session=True)
+    end = time.monotonic() + limit
+    so = se = b""
+    done = False
+    while Cancel.reason is None and time.monotonic() < end:
+        try:
+            so, se = proc.communicate(timeout=0.2)
+            done = True
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    if not done:
+        reap(proc)
+    return done, proc.returncode, so, se
+
+
+def version_ok(node: str, binjs: str, out: str, n: int, cwd: str, env: dict, limit: float) -> tuple:
+    """Run `dsh --version` under the attempt's fence with the child env minus the API key; return
+    (version, why). The caller has trap_signals() in place: a signal kills the check's process
+    group and cancels the run before anything is sent (SetupError CANCELLED); past `limit`
+    seconds the group is killed and the version reads as nothing."""
+    argv = [SANDBOX_EXEC, "-f", os.path.join(out, f"fence-{n}.sb"), node, binjs, "--version"]
+    venv = {k: v for k, v in env.items() if k != "DEEPSEEK_API_KEY"}
+    try:
+        done, rc, so, se = run_group(argv, cwd, venv, limit)
+    except OSError as e:
+        return "", type(e).__name__
+    if Cancel.reason is not None:
+        raise SetupError("CANCELLED", f"cancelled by {Cancel.reason} during the dsh version check; "
+                                      f"nothing was sent")
+    if not done:
+        return "", (f"dsh --version timed out after {limit:g}s (the limit is the smaller of 120 s and "
+                    f"--timeout); its process group was killed")
+    tail = " ".join(se.decode("utf-8", errors="replace").split())[-300:]
+    return (so.decode("utf-8", errors="replace").strip(),
+            f"exit {rc}" + (f", stderr: {tail}" if tail else ""))
+
+
+def run_attempt(**kw) -> int:
+    """One attempt with SIGINT/SIGTERM/SIGHUP trapped from before the version check to the end: a
+    signal before dsh starts cancels the attempt (exit 2, nothing sent); one after it kills dsh's
+    group and the attempt FAILs CANCELLED."""
+    old = trap_signals()
+    try:
+        return _run_attempt(**kw)
+    finally:
+        restore_signals(old)
+
+
+def _run_attempt(*, out: str, n: int, prompt: str, repo: str | None, expect: list, model: str,
+                 model_source: str, effort: str, max_tokens: int, node: str, dsh_dir: str, binjs: str,
+                 key: str, timeout: int, session_id: str | None) -> int:
+    env = child_env(out, key)
+    cwd = repo if repo else os.path.join(out, "work")
+    for name in (f"prompt-{n}.txt", f"run-{n}.patch.yml", f"fence-{n}.sb", f"run-{n}.jsonl",
+                 f"err-{n}.txt", f"status-{n}.json"):
+        if os.path.lexists(os.path.join(out, name)):
+            raise SetupError("OUT_EXISTS", f"attempt {n} files already exist in {out}")
+    write_private(os.path.join(out, f"fence-{n}.sb"), fence_profile(out, repo, dsh_dir, node, n))
+    rp = run_patch(model, effort, max_tokens)
+    write_private(os.path.join(out, f"run-{n}.patch.yml"), rp)
+    ver, why = version_ok(node, binjs, out, n, cwd, env, min(120, timeout))
+    if ver != PINNED_VERSION:
+        links = os.stat(node).st_nlink
+        if links > 1:
+            # macOS may hand dyld any of a hard-linked file's names, so @loader_path can point at
+            # a lib dir the fence never allowed.
+            why += f"; node has {links} hard links, and dyld may load its libraries through another name"
+        raise SetupError("DSH_VERSION_MISMATCH",
+                         f"dsh reports {ver or 'nothing'!r}, pinned {PINNED_VERSION} ({why})")
+    nonce = secrets.token_hex(8)
+    stdin_text = prompt + verdict_block(nonce)
+    write_private(os.path.join(out, f"prompt-{n}.txt"), stdin_text)
+    argv = launch_argv(out, n, node, binjs, session_id)
+    with open(os.path.join(out, "review.patch.yml"), encoding="utf-8") as f:
+        review_text = f.read()
+    status = {
+        "attempt": n, "dsh_version": ver, "model": model, "model_source": model_source, "effort": effort,
+        "max_tokens": max_tokens, "nonce": nonce, "repo": repo, "repo_mode": bool(repo),
+        "expect_read": expect, "session_id": None, "argv": argv,
+        "patch_sha256": {"review.patch.yml": sha256_text(review_text), f"run-{n}.patch.yml": sha256_text(rp)},
+        "started_at": now_iso(), "ended_at": None, "wall_seconds": None, "exit_code": None, "signal": None,
+        "cancelled": False, "cancel_reason": None, "verdict": None, "reasons": [], "usage": {},
+    }
+    print(f"model: {model} ({'--model' if model_source == '--model' else 'default'}), effort {effort}, "
+          f"max_tokens {max_tokens}, endpoint api.deepseek.com", file=sys.stderr)
+    print(f"out: {out} (attempt {n})", file=sys.stderr)
+
+    t0 = time.monotonic()
+    out_fd = os.open(os.path.join(out, f"run-{n}.jsonl"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    err_fd = os.open(os.path.join(out, f"err-{n}.txt"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=out_fd,
+                                stderr=err_fd, start_new_session=True)
+        # Feed stdin from a thread: a child that never reads it must not block the timeout and
+        # the signal handling below on a full pipe.
+        feeder = threading.Thread(target=feed_stdin, args=(proc.stdin, stdin_text.encode("utf-8")),
+                                  daemon=True)
+        feeder.start()
+        deadline = t0 + timeout
+        while proc.poll() is None:
+            if Cancel.reason is None and time.monotonic() >= deadline:
+                Cancel.reason = "timeout"
+            if Cancel.reason is not None:
+                kill_group(proc, KILL_GRACE)
+                break
+            time.sleep(0.1)
+        # Anything the child left in its group (a grep it started, say) goes too.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    finally:
+        os.close(out_fd)
+        os.close(err_fd)
+    # dsh's captures and everything it left in its home (sessions, startup logs), on every outcome.
+    scrub_tree(out, key)
+    rc = proc.returncode
+    status["exit_code"] = rc if rc is not None and rc >= 0 else None
+    status["signal"] = -rc if rc is not None and rc < 0 else None
+    status["cancelled"] = Cancel.reason is not None
+    status["cancel_reason"] = Cancel.reason
+    status["ended_at"] = now_iso()
+    status["wall_seconds"] = round(time.monotonic() - t0, 3)
+    with open(os.path.join(out, f"run-{n}.jsonl"), "rb") as f:
+        stream = f.read()
+    with open(os.path.join(out, f"err-{n}.txt"), encoding="utf-8", errors="replace") as f:
+        err_text = f.read()
+    sid = session_from_stream(stream)
+    status["session_id"] = sid
+    fails, final_text, denied, usage = validate(stream, err_text, status, prior_reads(out, n))
+    # A signal up to here cancels the attempt; from here on the signals wait until the verdict is
+    # recorded and printed, so the record and the output always agree.
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+    try:
+        if Cancel.reason is not None and not status["cancelled"]:
+            status["cancelled"] = True
+            status["cancel_reason"] = Cancel.reason
+            fails.append(("CANCELLED", f"the run was cancelled ({Cancel.reason}) while it was being "
+                                       f"checked; a cancelled run is never a review"))
+        status["usage"] = usage
+        status["verdict"] = "FAIL" if fails else "PASS"
+        status["reasons"] = [c for c, _ in fails]
+        write_private(os.path.join(out, f"status-{n}.json"), json.dumps(status, indent=2) + "\n")
+        tok = (f"tokens in {usage.get('inputTokens', 0)} (cached {usage.get('cacheReadTokens', 0)}) "
+               f"out {usage.get('outputTokens', 0)}") if usage else "tokens: n/a"
+        print(f"attempt {n}: {status['verdict']} in {status['wall_seconds']}s, {tok}", file=sys.stderr)
+        return report(fails, final_text, denied)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+
+
+def scrub_file(path: str, key: str) -> None:
+    """Replace the key in a file dsh wrote (as written, and as JSON escapes it) with [REDACTED].
+    The file is opened without following a symlink, and rewritten through a new file renamed over
+    it, so a hard link's other name keeps its bytes."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as f:
+        data = f.read()
+    new = data
+    for form in sorted({key, json.dumps(key)[1:-1]}, key=len, reverse=True):
+        new = new.replace(form.encode("utf-8"), b"[REDACTED]")
+    if new != data:
+        tfd, tmp = tempfile.mkstemp(prefix=".scrub-", dir=os.path.dirname(path))
+        try:
+            with os.fdopen(tfd, "wb") as f:
+                f.write(new)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
+def scrub_tree(root: str, key: str) -> None:
+    """scrub_file on every regular file under root. Symlinks are never followed, into a dir or to
+    a file: a link dsh left in its home must not get a file outside root rewritten. A file that
+    cannot be scrubbed is named on stderr."""
+    for dirpath, _dirs, files in os.walk(root, followlinks=False):
+        for name in files:
+            p = os.path.join(dirpath, name)
+            try:
+                if not stat.S_ISREG(os.lstat(p).st_mode):
+                    continue
+                if not os.access(p, os.R_OK):
+                    os.chmod(p, 0o600)
+                scrub_file(p, key)
+            except OSError as e:
+                print(scrub(f"deepseek-review: WARNING: could not scrub {p}: {e.strerror}"),
+                      file=sys.stderr)
+
+
+def session_from_stream(stream: bytes) -> str | None:
+    for line in stream.decode("utf-8", errors="replace").split("\n"):
+        if not line.strip():
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            return None
+        if isinstance(ev, dict) and ev.get("type") == "session" and isinstance(ev.get("sessionId"), str) \
+                and SESSION_ID_RE.fullmatch(ev["sessionId"]):
+            return ev["sessionId"]
+        return None
+    return None
+
+
+ATTEMPT_FILE = re.compile(r"(?:status-(\d+)\.json|run-(\d+)\.jsonl|run-(\d+)\.patch\.yml"
+                          r"|err-(\d+)\.txt|prompt-(\d+)\.txt|fence-(\d+)\.sb)")
+
+
+def attempts_in(out: str, started_only: bool = False) -> list:
+    """Attempt numbers with any file in out (a failed setup leaves fence-N.sb and run-N.patch.yml,
+    which must still move the next attempt on), or with started_only, those whose dsh run began."""
+    ns = set()
+    for name in os.listdir(out):
+        m = ATTEMPT_FILE.fullmatch(name)
+        if not m:
+            continue
+        if started_only and not (name.startswith("status-") or name.endswith(".jsonl")):
+            continue
+        ns.add(int(next(g for g in m.groups() if g)))
+    return sorted(ns)
+
+
+def temp_base() -> str:
+    """The per-user temp dir from getconf, never the inherited TMPDIR (python 3.9's os.confstr
+    does not know DARWIN_USER_TEMP_DIR); /private/tmp when getconf has no answer."""
+    try:
+        r = subprocess.run(["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"], env={}, capture_output=True,
+                           text=True, stdin=subprocess.DEVNULL, timeout=10)
+        base = r.stdout.strip()
+        if r.returncode == 0 and os.path.isabs(base) and os.path.isdir(base):
+            return real(base)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "/private/tmp"
+
+
+def make_out(out: str | None, repo: str | None, dsh_dir: str, node_dirs: list) -> str:
+    try:
+        if out is None:
+            out = real(tempfile.mkdtemp(prefix="deepseek-review-", dir=temp_base()))
+            try:
+                check_out_overlap(out, repo, dsh_dir)
+                check_out_node(out, node_dirs)
+            except SetupError:
+                os.rmdir(out)
+                raise
+        else:
+            os.mkdir(out, 0o700)
+        os.chmod(out, 0o700)
+        for sub in ("home", "tmp", "work"):
+            os.mkdir(os.path.join(out, sub), 0o700)
+    except OSError as e:
+        raise SetupError("OUT_NOT_CREATED", f"cannot create the out dir {out}: {e.strerror}") from None
+    return out
+
+
+# ---------------------------------------------------------------------------------------------
+# modes
+
+
+def mode_run(a) -> int:
+    prompt = read_prompt(a.prompt)
+    model = a.model or DEFAULT_MODEL
+    check_model(model)
+    check_effort(a.effort)
+    max_tokens = check_max_tokens(a.max_tokens)
+    key = read_key()
+    repo = check_repo(a.repo) if a.repo is not None else None
+    expect = check_expect(a.expect_read, repo)
+    dsh_dir = real(a.dsh_dir or default_dsh_dir())
+    out = resolve_out(a.out, repo, dsh_dir)
+    node = resolve_node(a.node, [repo, out])
+    node_dirs = node_read_dirs(node)
+    if out is not None:
+        check_out_node(out, node_dirs)
+    dsh_dir, binjs = check_dsh(dsh_dir, repo)
+    check_sandbox()
+    out = make_out(out, repo, dsh_dir, node_dirs)
+    write_private(os.path.join(out, "review.patch.yml"), review_patch_text())
+    return run_attempt(out=out, n=1, prompt=prompt, repo=repo, expect=expect, model=model,
+                       model_source="--model" if a.model else "default", effort=a.effort,
+                       max_tokens=max_tokens, node=node, dsh_dir=dsh_dir, binjs=binjs, key=key,
+                       timeout=a.timeout, session_id=None)
+
+
+def load_status(out: str, n: int) -> dict:
+    p = os.path.join(out, f"status-{n}.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        raise SetupError("OUT_PERMS", f"cannot read {p}") from None
+    if not isinstance(st, dict):
+        raise SetupError("OUT_PERMS", f"{p} is not a JSON object")
+    return st
+
+
+def check_continue_overlay(out: str, first: dict) -> None:
+    """The overlay a follow-up runs with is the plugin's current one, unchanged since attempt 1:
+    <out>/review.patch.yml must match it, and so must the hash status-1.json recorded."""
+    path = os.path.join(out, "review.patch.yml")
+    current = review_patch_text()
+    recorded = first.get("patch_sha256")
+    recorded = recorded.get("review.patch.yml") if isinstance(recorded, dict) else None
+    if recorded is not None and recorded != sha256_text(current):
+        raise SetupError("CONTINUE_PATCH_CHANGED",
+                         "the plugin's overlay changed since attempt 1; start a new review")
+    try:
+        with open(path, encoding="utf-8") as f:
+            on_disk = f.read()
+    except FileNotFoundError:
+        write_private(path, current)
+        return
+    except (OSError, ValueError):
+        raise SetupError("CONTINUE_PATCH_CHANGED", f"cannot read {path}") from None
+    if on_disk != current:
+        raise SetupError("CONTINUE_PATCH_CHANGED", f"{path} differs from the plugin's overlay")
+
+
+def mode_continue(a) -> int:
+    out = check_out_dir_perms(a.cont)
+    first = load_status(out, 1)
+    prompt = read_prompt(a.prompt)
+    key = read_key()
+    problem = status_problem(first)
+    if problem:
+        raise SetupError("STATUS_INVALID", f"status-1.json is malformed: {problem}")
+    rec_repo = first["repo"] if first["repo_mode"] else None
+    if a.repo is not None:
+        given = real(a.repo)
+        if given != rec_repo:
+            raise SetupError("CONTINUE_REPO_MISMATCH",
+                             f"--repo {given} differs from the recorded repo {rec_repo}")
+    repo = None
+    if rec_repo is not None:
+        if not os.path.isdir(rec_repo):
+            raise SetupError("REPO_NOT_DIR", f"the recorded repo is gone: {rec_repo}")
+        # Every scope check again: the path may now be a symlink to a secret dir.
+        repo = check_repo(rec_repo)
+        if repo != rec_repo:
+            raise SetupError("CONTINUE_REPO_MISMATCH",
+                             f"the recorded repo {rec_repo} now resolves to {repo}")
+    # The files every earlier attempt had to read stay required: a follow-up cannot drop them.
+    carried = list(first["expect_read"])
+    for k in attempts_in(out, started_only=True):
+        if k == 1 or not os.path.exists(os.path.join(out, f"status-{k}.json")):
+            continue  # an attempt killed before its record has no list to carry
+        st = load_status(out, k)
+        problem = status_problem(st)
+        if problem:
+            raise SetupError("STATUS_INVALID", f"status-{k}.json is malformed: {problem}")
+        carried += st["expect_read"]
+    expect = check_expect(list(dict.fromkeys(carried + list(a.expect_read))), repo)
+    dsh_dir = real(a.dsh_dir or default_dsh_dir())
+    check_out_overlap(out, repo, dsh_dir)
+    node = resolve_node(a.node, [repo, out])
+    check_out_node(out, node_read_dirs(node))
+    dsh_dir, binjs = check_dsh(dsh_dir, repo)
+    check_sandbox()
+    try:
+        with open(os.path.join(out, "run-1.jsonl"), "rb") as f:
+            sid = session_from_stream(f.read())
+    except OSError:
+        sid = None
+    if not sid:
+        raise SetupError("CONTINUE_NO_SESSION", "run-1.jsonl holds no session id to continue")
+    check_continue_overlay(out, first)
+    # A key an earlier, killed attempt left on disk is gone before the next one can read its home.
+    scrub_tree(out, key)
+    n = (attempts_in(out) or [0])[-1] + 1
+    model, effort, max_tokens = first["model"], first["effort"], first["max_tokens"]  # status_problem checked them
+    return run_attempt(out=out, n=n, prompt=prompt, repo=repo, expect=expect, model=model,
+                       model_source=first.get("model_source") or "default", effort=effort,
+                       max_tokens=max_tokens, node=node, dsh_dir=dsh_dir, binjs=binjs, key=key,
+                       timeout=a.timeout, session_id=sid)
+
+
+def mode_check(a) -> int:
+    out = check_out_dir_perms(a.check)
+    ns = attempts_in(out, started_only=True)
+    n = a.attempt if a.attempt is not None else (ns[-1] if ns else 1)
+    fails = []
+    raw = {}
+    for name in (f"status-{n}.json", f"run-{n}.jsonl", f"err-{n}.txt"):
+        try:
+            with open(os.path.join(out, name), "rb") as f:
+                raw[name] = f.read()
+        except OSError:
+            fails.append(("ATTEMPT_INCOMPLETE", f"cannot read {name}: the attempt did not finish, "
+                                                f"or one of its files is gone"))
+    status = None
+    if f"status-{n}.json" in raw:
+        try:
+            status = json.loads(raw[f"status-{n}.json"].decode("utf-8"))
+        except ValueError:
+            status = None
+        if not isinstance(status, dict):
+            fails.append(("STATUS_INVALID", f"status-{n}.json is not a JSON object"))
+            status = None
+    print(f"check: attempt {n} in {out}", file=sys.stderr)
+    if status is None:
+        return report(fails, "", [])
+    v_fails, final_text, denied, _ = validate(
+        raw.get(f"run-{n}.jsonl", b""), raw.get(f"err-{n}.txt", b"").decode("utf-8", errors="replace"),
+        status, prior_reads(out, n))
+    fails += v_fails
+    if status.get("verdict") == "FAIL":
+        # A recorded failure stands even when the evidence for it is gone (an emptied err file).
+        rec = status.get("reasons")
+        rec = [c for c in rec if isinstance(c, str) and re.fullmatch(r"[A-Z][A-Z_]{0,63}", c)] \
+            if isinstance(rec, list) else []
+        codes = {c for c, _ in fails}
+        for c in rec or ["RECORDED_FAIL"]:
+            if c not in codes:
+                fails.append((c, "recorded by the run"))
+                codes.add(c)
+    return report(fails, final_text, denied)
+
+
+def mode_print(a) -> int:
+    read_prompt(a.prompt)
+    model = a.model or DEFAULT_MODEL
+    check_model(model)
+    check_effort(a.effort)
+    max_tokens = check_max_tokens(a.max_tokens)
+    repo = check_repo(a.repo) if a.repo is not None else None
+    check_expect(a.expect_read, repo)
+    dsh_dir = real(a.dsh_dir or default_dsh_dir())
+    node = resolve_node(a.node, [repo])
+    out = "{OUT}"
+    review = review_patch_text()
+    rp = run_patch(model, effort=a.effort, max_tokens=max_tokens)
+    doc = {
+        "argv": launch_argv(out, 1, node, os.path.join(dsh_dir, BIN_REL), None),
+        "cwd": repo if repo else f"{out}/work",
+        "env_names": child_env_names(),
+        "patches": {"review.patch.yml": {"sha256": sha256_text(review), "content": review},
+                    "run-1.patch.yml": {"sha256": sha256_text(rp), "content": rp}},
+    }
+    print(json.dumps(doc, indent=2))
+    return 0
+
+
+INSTALL_ENTRIES = {"package.json", "package-lock.json", "node_modules"}
+
+
+def mode_install(a) -> int:
+    d = real(a.dsh_dir or default_dsh_dir())
+    # Nothing is written before the dir is known to be a fresh or earlier dsh install.
+    if unsafe_dir(d):
+        raise SetupError("DSH_DIR_UNSAFE", f"{d} is a home, a dir above or directly under one, a secret "
+                                           f"dir or a broad system dir: --install will not write there")
+    if os.path.lexists(d):
+        if not os.path.isdir(d):
+            raise SetupError("DSH_DIR_UNSAFE", f"{d} exists and is not a dir")
+        st = os.stat(d)
+        if st.st_uid != os.getuid() or st.st_mode & 0o022:
+            raise SetupError("DSH_DIR_UNSAFE", f"{d} must be owned by you and not group/world-writable")
+        extra = sorted(set(os.listdir(d)) - INSTALL_ENTRIES)
+        if extra:
+            raise SetupError("INSTALL_DIR_NOT_EMPTY",
+                             f"{d} holds files that are not a dsh install ({', '.join(extra[:5])}); "
+                             f"pick a new or empty dir")
+    # npm is the one beside node (PATH is never searched for it), with a minimal env: no key, no
+    # npm_config_* or NODE_OPTIONS of the caller's.
+    node = resolve_node(a.node, [])
+    npm = os.path.join(os.path.dirname(node), "npm")
+    if not (os.path.isfile(npm) and os.access(npm, os.X_OK)) or \
+            not inside(real(npm), os.path.dirname(os.path.dirname(node))):
+        raise SetupError("INSTALL_FAILED", f"no npm beside node in {os.path.dirname(node)}", rc=1)
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        os.chmod(d, 0o700)
+    except OSError as e:
+        raise SetupError("DSH_DIR_UNSAFE", f"cannot create {d}: {e.strerror}") from None
+    for name in ("package.json", "package-lock.json"):
+        dst = os.path.join(d, name)
+        if os.path.lexists(dst):
+            os.unlink(dst)
+        shutil.copyfile(os.path.join(DSH_SRC, name), dst)
+    env = {"PATH": f"{os.path.dirname(node)}:{CHILD_PATH}", "HOME": account_home()}
+    if os.environ.get("LANG"):
+        env["LANG"] = os.environ["LANG"]
+    argv = [npm, "ci", "--ignore-scripts", "--no-audit", "--no-fund"]
+    print(f"install: {' '.join(argv[1:])} in {d} (npm {npm})", file=sys.stderr)
+    r = subprocess.run(argv, cwd=d, env=env, stdin=subprocess.DEVNULL)
+    if r.returncode != 0:
+        raise SetupError("INSTALL_FAILED", f"npm ci exited {r.returncode}", rc=1)
+    print(f"install: done; run `deepseek-review --doctor` to verify", file=sys.stderr)
+    return 0
+
+
+def mode_doctor(a) -> int:
+    ok = True
+    key = os.environ.get("DEEPSEEK_API_KEY")
+    problem = key_problem(key) if key else None
+    if not key:
+        print("key: missing")
+    elif problem:
+        print(f"key: invalid ({problem})")
+    else:
+        print(f"key: present (length {len(key)})")
+    ok &= bool(key) and not problem
+    sandbox = sys.platform == "darwin" and os.path.isfile(SANDBOX_EXEC)
+    print(f"sandbox-exec: {'present' if sandbox else 'missing'}")
+    ok &= sandbox
+    try:
+        node = resolve_node(a.node, [])
+        print(f"node: {node}")
+    except SetupError as e:
+        print(f"node: {e.code} ({e.text})")
+        return 1
+    dsh_dir = real(a.dsh_dir or default_dsh_dir())
+    try:
+        dsh_dir, binjs = check_dsh(dsh_dir, None)
+    except SetupError as e:
+        print(f"dsh: {e.code} ({e.text})")
+        return 1
+    if not sandbox:
+        return 1
+    tmp = real(tempfile.mkdtemp(prefix="deepseek-review-doctor-", dir=temp_base()))
+    try:
+        for sub in ("home", "tmp", "work"):
+            os.mkdir(os.path.join(tmp, sub), 0o700)
+        write_private(os.path.join(tmp, "fence-1.sb"), fence_profile(tmp, None, dsh_dir, node, 1))
+        write_private(os.path.join(tmp, "review.patch.yml"), review_patch_text())
+        write_private(os.path.join(tmp, "run-1.patch.yml"), run_patch(DEFAULT_MODEL, DEFAULT_EFFORT, MAX_TOKENS_CAP))
+        env = child_env(tmp, None)
+        argv = [SANDBOX_EXEC, "-f", os.path.join(tmp, "fence-1.sb"), node, binjs, "--profile", "headless",
+                "--patch", os.path.join(tmp, "review.patch.yml"), "--patch", os.path.join(tmp, "run-1.patch.yml"),
+                "--dump-config"]
+        old = trap_signals()
+        try:
+            ver, why = version_ok(node, binjs, tmp, 1, os.path.join(tmp, "work"), env, 120)
+            print(scrub(f"dsh: {dsh_dir} version {ver or '?'} (pinned {PINNED_VERSION}) "
+                        f"{'OK' if ver == PINNED_VERSION else 'MISMATCH (' + why + ')'}"))
+            ok &= ver == PINNED_VERSION
+            try:
+                done, rc, _, se = run_group(argv, os.path.join(tmp, "work"), env, 120)
+            except OSError as e:
+                done, rc, se = True, None, type(e).__name__.encode()
+            if Cancel.reason is not None:
+                raise SetupError("CANCELLED", f"cancelled by {Cancel.reason} during --dump-config")
+        finally:
+            restore_signals(old)
+        stderr = se.decode("utf-8", errors="replace")
+        drift = [m.group(0) for rx in COMPOSE_RES for m in [rx.search(stderr)] if m]
+        composed = done and rc == 0 and not drift
+        if composed:
+            print("overlay: composes cleanly under the fence")
+        elif not done:
+            print("overlay: PROBLEM: --dump-config timed out after 120s; its process group was killed")
+        else:
+            tail = " ".join(stderr.split())[-400:]
+            print(scrub(f"overlay: PROBLEM: {drift[0] if drift else f'exit {rc}'} (stderr: {tail or 'empty'})"))
+        ok &= composed
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------------------------
+
+
+def build_parser() -> Parser:
+    p = Parser(prog="deepseek-review", allow_abbrev=False, add_help=True,
+               description="Run one DeepSeek review through a pinned, sandboxed dsh.")
+    m = p.add_mutually_exclusive_group()
+    m.add_argument("--continue", dest="cont", metavar="OUT_DIR")
+    m.add_argument("--check", metavar="OUT_DIR")
+    m.add_argument("--print-invocation", action="store_true")
+    m.add_argument("--install", action="store_true")
+    m.add_argument("--doctor", action="store_true")
+    p.add_argument("--model")
+    p.add_argument("--effort", default=DEFAULT_EFFORT)
+    p.add_argument("--max-tokens", default=str(MAX_TOKENS_CAP))
+    p.add_argument("--repo")
+    p.add_argument("--expect-read", action="append", default=[])
+    p.add_argument("--out")
+    p.add_argument("--timeout", default=str(DEFAULT_TIMEOUT))
+    p.add_argument("--node")
+    p.add_argument("--dsh-dir")
+    p.add_argument("--attempt", type=int)
+    p.add_argument("prompt", nargs="?")
+    return p
+
+
+def main(argv: list) -> int:
+    os.umask(0o077)
+    remember_secret(os.environ.get("DEEPSEEK_API_KEY"))
+    p = build_parser()
+    try:
+        a = p.parse_args(argv)
+        a.timeout = parse_timeout(a.timeout)
+        if a.check is not None:
+            if a.prompt is not None:
+                raise UsageError("--check takes no PROMPT_FILE")
+            return mode_check(a)
+        if a.install:
+            return mode_install(a)
+        if a.doctor:
+            return mode_doctor(a)
+        if a.prompt is None:
+            raise UsageError("PROMPT_FILE is required")
+        if a.attempt is not None:
+            raise UsageError("--attempt goes with --check")
+        if a.cont is not None:
+            return mode_continue(a)
+        if a.print_invocation:
+            return mode_print(a)
+        return mode_run(a)
+    except UsageError as e:
+        print(f"deepseek-review: usage error: {e}", file=sys.stderr)
+        print(p.format_usage().rstrip(), file=sys.stderr)
+        return 2
+    except SetupError as e:
+        err(e.code, e.text)
+        return e.rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
