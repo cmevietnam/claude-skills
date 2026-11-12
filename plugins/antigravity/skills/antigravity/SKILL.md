@@ -17,8 +17,9 @@ Verified against **agy 1.1.27** (2026-09-05) by running every command below; the
 list was re-checked on agy 1.2.11 (2026-09-25), the default model, the model list and the
 effort rules on agy 1.3.4 (2026-10-14), and the model list, a default review and a
 `--repo` review on agy 1.4.10 (2026-11-01), and the multi-turn review on agy 1.4.12 the
-same day. Re-verify after an upgrade — `agy` self-updates in the background, so the
-version can move under you.
+same day; the message cut was read from agy's own records, up to agy 1.5.7 (2026-11-12).
+Re-verify after an upgrade — `agy` self-updates in the background, so the version can
+move under you.
 
 ## Hard rule: present, then stop
 
@@ -78,14 +79,16 @@ a non-`SUCCESS` status, a `finished_reason` (a turn that ended early), any
 `denied_actions`, or an empty/whitespace response — in every turn of a multi-turn run —
 and it tells you where the raw `out.json` (or `out.ndjson`) and `err.txt` are. Confirmed against the live CLI: a
 prompt that triggers an auto-deny gives `agy` exit 0 / SUCCESS and `agy-review` exit 1.
+It exits 2 before running anything when a message it would send is over 170 KB, since
+`agy` would cut it (see the next section).
 
-`scripts/test-agy-review.sh` has 347 checks, 14 of them meta-tests that deliberately make
+`scripts/test-agy-review.sh` has 374 checks, 14 of them meta-tests that deliberately make
 each assertion helper fail — because a test that cannot go red proves nothing.
 
 Do not substitute `jq -r '.response // "failed"'`: on a zero-byte file `jq` prints
 **nothing and exits 0**, so the fallback never fires and the failure reads as silence.
 
-## Two more traps
+## Three more traps
 
 **`-p` does not read stdin.** Piping a diff into `agy -p "review this"` reviews _nothing_
 and reports SUCCESS. Verified with a marker string: the answer was `NONE`. Content must go
@@ -93,6 +96,19 @@ into the prompt argument, or through `--input-format stream-json` on stdin.
 
 **`agy` does not run tools in your shell's working directory.** A relative `cat README.md`
 resolved somewhere under `~/.gemini/antigravity-cli`. Use absolute paths, or `--add-dir`.
+
+**`agy` cuts a long message and still says SUCCESS.** It wraps each message for the
+model (`<USER_REQUEST>` tags, the local time, on the first one a note naming the model),
+keeps the first 192000 bytes of that, and puts `<truncated N bytes>` in place of the
+rest. Nothing in the envelope or on stderr says so, and the model mentions it, if at all,
+only in the turns whose files fell in the cut part: a noscam.pro review on 2026-11-12
+lost 103636 bytes of its diff that way. agy's own records
+(`~/.gemini/antigravity-cli/conversations`) showed 40 of 501 conversations with a
+message cut, `-p` prompts and stream-json turns alike, from 2026-09-09 to agy 1.5.7.
+So `agy-review` refuses, with exit 2 and before anything runs, any message over 170 KB:
+the single-turn prompt (with `--repo`, its file list included) or any turn of a
+multi-turn review. Split the material into bundles under 170 KB and review each in its
+own run.
 
 ## Reviewing a diff — the default shape
 
@@ -197,6 +213,9 @@ What changes for you:
   single-turn run does. With `--no-retry` the message names `--part-kb` at half the size.
 - `--print-timeout` bounds each turn, not the session (agy 1.4.12: three turns of about
   3 s each all finished under a 6 s timeout, 9 s in total).
+- Turn 1 carries the whole diff, so a diff over 170 KB is refused (exit 2) whatever
+  `--part-kb` says: `agy` would cut that turn (see "Three more traps"). Split it into
+  bundles under 170 KB, each file whole, and review each in its own run.
 - `--single-turn` keeps the one-prompt run. `--repo` always runs one turn, since the
   reviewer reads what it needs itself. A prompt without a git diff, or a diff within one
   part, is one turn as before.
@@ -380,7 +399,9 @@ agy-review --check "$S/out2.json"
 ```
 
 A follow-up that reaches for a tool exits 0 with `SUCCESS` and an empty response exactly
-like any other denied run; `--check` is what catches it.
+like any other denied run; `--check` is what catches it. A follow-up message over 170 KB
+is cut like any other (see "Three more traps"), and `--check` cannot see that: the
+envelope does not carry the prompt.
 
 `conversation_id` comes back in every JSON envelope. Note that `num_turns`,
 `duration_seconds` and `usage` are **cumulative over the session**, not per-turn.
@@ -421,6 +442,11 @@ like any other denied run; `--check` is what catches it.
   `agy-review` refuses it (exit 1). Re-run with a longer `--timeout`; `--repo` reviews
   need it most. agy 1.4.11 and later also mark such a turn
   `"finished_reason": "print_timeout"`, which `agy-review` refuses as well.
+
+- **`<truncated N bytes>`** quoted in a reviewer's answer, when the material you sent does
+  not hold that text — `agy` cut a message. `agy-review` refuses any message over 170 KB
+  before it runs (exit 2), so through it this means `agy` lowered its limit: re-measure
+  from its records and lower `MAX_MESSAGE_BYTES` in `bin/agy-review`.
 
 - **stderr carries the diagnosis**, including the auto-deny warning. Never discard it —
   capture it to a file. Mixing it into stdout corrupts `stream-json` output with non-JSON

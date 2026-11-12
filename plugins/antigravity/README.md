@@ -26,11 +26,15 @@ unless you look at `denied_actions` and at `response` being empty.
 and exits 0, so the fallback never fires. The skill ships a Python check that treats empty
 output, a populated `error`, and any `denied_actions` as hard failures.
 
-Two more, both verified:
+Three more, all verified:
 
 - **`-p` does not read stdin.** Piping a diff in reviews nothing and reports success.
 - **`agy` does not run tools in your shell's working directory** — a relative path resolved
   under `~/.gemini/antigravity-cli`. Use absolute paths or `--add-dir`.
+- **`agy` cuts a message past 192000 bytes**, its own wrapping included, puts
+  `<truncated N bytes>` in place of the rest and still reports SUCCESS: a review that saw
+  half the diff looks like a whole one. `agy-review` refuses any message over 170 KB
+  before it runs.
 
 ## Why not Gemini CLI
 
@@ -74,7 +78,8 @@ diff bigger than 48 KB is reviewed by default as one conversation: one turn load
 whole diff, then one turn per part reviews that part's files with the rest as context,
 so each part gets the whole budget and cross-file findings survive. `--part-kb N` sizes
 the parts, `--single-turn` keeps the one-prompt run, and `--no-retry` turns the ladder
-off.
+off. The turn that loads the diff carries all of it, so a diff over 170 KB is refused
+before it runs: `agy` would cut that turn.
 
 ## Letting the reviewer read the repo, for one run
 
@@ -129,9 +134,9 @@ sign-in (`bubbletea: could not open TTY`), so Claude Code's `!` prefix cannot do
 Headless runs afterwards reuse the cached credentials.
 
 Verified against **agy 1.1.27**, with the default model re-checked on agy 1.3.4, `--repo`
-on agy 1.3.5, both again on agy 1.4.10, and the multi-turn review on agy 1.4.12; the
-skill says what was checked and when. `agy` self-updates in the background, so re-verify
-after a gap.
+on agy 1.3.5, both again on agy 1.4.10, the multi-turn review on agy 1.4.12, and the
+message cut on agy 1.5.7; the skill says what was checked and when. `agy` self-updates in
+the background, so re-verify after a gap.
 
 ## Read
 

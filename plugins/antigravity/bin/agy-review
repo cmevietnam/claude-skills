@@ -118,8 +118,21 @@ off mid-turn. agy 1.4.11 and later also set `finished_reason` on such a turn, an
 finished_reason is refused the same way. In a multi-turn run the timeout bounds each
 turn, not the session.
 
+Message size: agy cuts a long message without a word. It wraps each message for the model
+(`<USER_REQUEST>` tags, the local time, on the first one a note naming the model), keeps
+the first 192000 bytes of that, puts `<truncated N bytes>` in place of the rest, and still
+reports SUCCESS; the model mentions the cut, if at all, only where it lands on the files
+it was asked about. So every message this wrapper would send, the single-turn prompt or
+any turn, is held to 170 KB, and a bigger one exits 2 before agy runs. A multi-turn
+review's first turn carries the whole diff, which --part-kb does not shrink: split the
+diff into bundles and review each in its own run. Measured on 2026-11-12 from the requests
+agy itself recorded under ~/.gemini/antigravity-cli/conversations: every message cut from
+2026-09-09 to agy 1.5.7, -p prompts and stream-json turns alike, kept 192000 bytes (one
+191998, to end on a whole UTF-8 character), and no longer one in those records reached
+the model whole.
+
 Exit codes: 0 review produced, 1 run failed or was incomplete (or the grant could not be
-undone), 2 usage or setup error.
+undone), 2 usage or setup error, a message agy would cut included.
 """
 
 import argparse
@@ -172,6 +185,19 @@ LARGE_PROMPT_BYTES = 50 * 1024
 # thought 18403, 5909 and 7777 tokens, and both planted cross-file defects were found.
 DEFAULT_PART_KB = 48
 DIFF_HEADER = "diff --git "
+
+# What agy keeps of one message: it wraps the message as `<USER_REQUEST>\n` + the message +
+# `</USER_REQUEST>` and metadata blocks, keeps this many bytes of that, and appends
+# `\n<truncated N bytes>`, all under a SUCCESS status. Read on 2026-11-12 from the requests
+# agy recorded in ~/.gemini/antigravity-cli/conversations/*.db (table gen_metadata): of
+# 501 conversations, 40 had a message cut, 39 to exactly this length and one to 191998 (a
+# whole UTF-8 character less), from 2026-09-09 to agy 1.5.7; the longest message sent whole
+# was 191568 bytes wrapped. A noscam.pro review lost 103636 bytes of its diff this way.
+AGY_KEEP_BYTES = 192000
+# The cap on every message this wrapper sends. agy's wrapping took 419 bytes on a first
+# message (the tags, the local time, a note naming the model); the rest is headroom for
+# wrapping that grows with what agy adds, which can change with any background update.
+MAX_MESSAGE_BYTES = 170 * 1024
 
 # The load turn's expected answer. Anything else is the reviewer's own words, which are
 # passed on rather than dropped.
@@ -569,6 +595,54 @@ def review_turns(instructions, diff, parts):
             f"counts. {TURN_NO_TOOLS}"
         )
     return turns
+
+
+def oversized_message(messages):
+    """(k, bytes) of the first message over MAX_MESSAGE_BYTES, k counting from 1, or None.
+
+    Counted in UTF-8 bytes, as agy counts them: a prompt of 60000 three-byte characters is
+    180000 bytes, not 60000.
+    """
+    for k, message in enumerate(messages, 1):
+        size = len(message.encode("utf-8", "surrogateescape"))
+        if size > MAX_MESSAGE_BYTES:
+            return k, size
+    return None
+
+
+def oversize_diagnosis(k, size, multi_turn, repo):
+    """Why a message over the cap is refused, and how to send the material instead."""
+    what = (
+        "turn 1, which loads the whole diff," if multi_turn and k == 1
+        else f"turn {k}" if multi_turn
+        else "the prompt"
+    )
+    cap_kb = MAX_MESSAGE_BYTES // 1024
+    lines = [
+        f"FAILED: {what} is {size} bytes, over the {cap_kb} KB ({MAX_MESSAGE_BYTES} bytes) "
+        "this wrapper sends in one message. agy keeps only the first "
+        f"{AGY_KEEP_BYTES} bytes of a message, its own wrapping included, puts "
+        "`<truncated N bytes>` in place of the rest and still reports SUCCESS: the "
+        "reviewer would see part of the material and need not say so. Nothing was run."
+    ]
+    if multi_turn and k == 1:
+        lines.append(
+            "--part-kb does not shrink this turn: each part is reviewed against the whole "
+            f"diff. Split the diff into bundles under {cap_kb} KB, keeping each file whole, "
+            "and review each bundle in its own run."
+        )
+    elif repo is not None:
+        lines.append(
+            "With --repo the prompt also carries the list of tracked files: pass a smaller "
+            "subdirectory as --repo, or put less of the material in the prompt and let the "
+            "reviewer read it from the repo."
+        )
+    else:
+        lines.append(
+            f"Split the material into bundles under {cap_kb} KB and review each in its "
+            "own run."
+        )
+    return "\n".join(lines)
 
 
 def validate(path, err_path=None, env=None, repo=None):
@@ -1299,6 +1373,12 @@ def main():
         split = split_review(prompt, part_kb * 1024)
     turns = None if split is None else review_turns(*split)
     parts = None if split is None else split[2]
+
+    # agy would cut a message over its limit and still say SUCCESS, so the review would
+    # cover part of the material. Refused here, before anything runs or is billed.
+    big = oversized_message([prompt] if turns is None else turns)
+    if big is not None:
+        die(oversize_diagnosis(*big, turns is not None, repo), 2)
 
     # What keeps the effort when an answer overruns the output budget: a smaller turn.
     many_files = split_review(prompt, 1) is not None
