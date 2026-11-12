@@ -145,11 +145,14 @@ reviewed as one conversation, a turn per part, with the whole diff in context. S
   current size.
 - A diff that is one huge file cannot be split across turns: review fewer hunks at a
   time, with a narrower commit range.
+- The turn that loads the diff carries all of it, and `agy` cuts any message past
+  192000 bytes, so `agy-review` refuses a diff over 170 KB before it runs. Split it into
+  bundles under 170 KB, each file whole, one run each.
 
 The hand-made split this section used to carry, one `agy-review` run per part, is no
-longer needed, and it cost cross-file findings: each run saw only its own files. In the
-conversation every turn sees all of them, and on 2026-11-01 each of two planted
-cross-file defects was found from both sides.
+longer needed below 170 KB, and it cost cross-file findings: each run saw only its own
+files. In the conversation every turn sees all of them, and on 2026-11-01 each of two
+planted cross-file defects was found from both sides.
 
 The other way to keep the effort is a model with a different budget: a Claude id such as
 `claude-opus-5-5`. Never `gemini-3.1-pro`, which is banned and which

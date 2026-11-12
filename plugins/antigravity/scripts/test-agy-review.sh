@@ -1245,6 +1245,116 @@ expect_fail "--check: finished_reason fails an envelope" 1 "finished_reason=prin
 STUB_STDOUT="$TMP/finished-timeout.json" expect_fail "run: finished_reason fails a single turn" 1 \
   "finished_reason=print_timeout" --agy "$STUB" --out "$TMP/run-fr" "$TMP/prompt.txt"
 
+# --- message size: agy cuts a message past 192000 bytes and still says SUCCESS --------
+# Every message the wrapper would send is held to 170 KB (174080 bytes), counted in UTF-8
+# bytes. A bigger one exits 2 before agy runs, and leaves no output directory behind.
+
+python3 - "$TMP" <<'PY'
+import sys
+tmp = sys.argv[1]
+CAP = 170 * 1024
+def write(name, text):
+    with open(f"{tmp}/{name}", "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+def filler(n):  # exactly n ASCII bytes, no diff header in them
+    line = "Review this text for defects; it is padding.\n"
+    body = line * (n // len(line))
+    return body + "x" * (n - len(body) - 1) + "\n"
+def section(name, size):
+    head = (f"diff --git a/{name} b/{name}\nindex 1111111..2222222 100644\n"
+            f"--- a/{name}\n+++ b/{name}\n@@ -1 +1,40 @@\n")
+    body = ""
+    while len((head + body).encode()) < size:
+        body += f"+line {len(body)} of {name}\n"
+    return head + body
+instr = "Review the diff below. Report file:line for each defect.\n\n"
+write("size-cap.txt", filler(CAP))
+write("size-over.txt", filler(CAP + 1))
+write("size-repo.txt", filler(CAP - 100))   # under the cap until --repo adds its text
+write("size-utf8.txt", chr(0x2713) * 60000 + "\n")   # 60001 characters, 180001 bytes
+write("size-mt-ok.txt", instr + "".join(section(f"s{i}.py", 45 * 1024) for i in (1, 2, 3)))
+write("size-mt-over.txt", instr + "".join(section(f"s{i}.py", 45 * 1024) for i in (1, 2, 3, 4)))
+# 50 bytes under the cap as a file; the load turn adds the conversation note and goes over.
+edge = "".join(section(f"e{i}.py", 56 * 1024) for i in (1, 2, 3))
+write("size-mt-edge.txt", filler(CAP - 50 - len(edge.encode())) + edge)
+PY
+for f in size-cap:174080 size-over:174081 size-repo:173980 size-utf8:180001 size-mt-edge:174030; do
+  if [ "$(wc -c < "$TMP/${f%%:*}.txt" | tr -d ' ')" != "${f##*:}" ]; then
+    echo "FATAL: fixture ${f%%:*}.txt is not ${f##*:} bytes"; exit 1
+  fi
+done
+
+: > "$STUB_CALLS"
+expect_pass "a prompt of exactly 170 KB runs" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-size-cap" "$TMP/size-cap.txt"
+if argv_capture_ok "a 170 KB prompt reaches agy whole" && ARGV_FILE="$(argv_file)" python3 -c '
+import os, sys
+a = open(os.environ["ARGV_FILE"], "rb").read().split(b"\0")
+sys.exit(0 if a[a.index(b"-p") + 1] == open(sys.argv[1], "rb").read() else 1)' "$TMP/size-cap.txt"
+then
+  note_pass "a 170 KB prompt reaches agy whole"
+else
+  note_fail "a 170 KB prompt did not reach agy byte for byte"
+fi
+
+: > "$STUB_CALLS"
+expect_fail "a prompt one byte over 170 KB is refused" 2 \
+  "the prompt is 174081 bytes, over the 170 KB (174080 bytes)" \
+  --agy "$STUB" --out "$TMP/run-size-over" "$TMP/size-over.txt"
+expect_stderr "the refusal says what agy would do" \
+  "agy keeps only the first 192000 bytes of a message"
+expect_stderr "the refusal names agy's marker" "<truncated N bytes>"
+expect_stderr "a plain prompt over the cap is told to split" "Split the material into bundles under 170 KB"
+expect_calls "an oversized prompt never reaches agy" 0
+if [ ! -e "$TMP/run-size-over" ]; then
+  note_pass "an oversized prompt leaves no output directory"
+else
+  note_fail "an oversized prompt created $TMP/run-size-over"
+fi
+
+: > "$STUB_CALLS"
+expect_fail "the cap counts UTF-8 bytes, not characters" 2 "the prompt is 180001 bytes" \
+  --agy "$STUB" --out "$TMP/run-size-utf8" "$TMP/size-utf8.txt"
+expect_calls "an oversized UTF-8 prompt never reaches agy" 0
+
+: > "$STUB_CALLS"
+expect_pass "a 135 KB diff in three parts runs" \
+  $'## Part 1/3: s1.py\n\nREVIEW-PART-1\n\n## Part 2/3: s2.py\n\nREVIEW-PART-2\n\n## Part 3/3: s3.py\n\nREVIEW-PART-3\n' \
+  --agy "$STUB" --out "$TMP/run-size-mt-ok" "$TMP/size-mt-ok.txt"
+stdin_check "every turn of the 135 KB review is under the cap" '
+import json, os
+t = [json.loads(l)["message"]["content"] for l in open(os.environ["STDIN_FILE"], encoding="utf-8").read().split("\n") if l]
+assert len(t) == 4, f"{len(t)} turns"
+sizes = [len(x.encode()) for x in t]
+assert 135 * 1024 < sizes[0] <= 170 * 1024, sizes
+'
+: > "$STUB_CALLS"
+expect_fail "a load turn over 170 KB is refused" 2 "turn 1, which loads the whole diff, is " \
+  --agy "$STUB" --out "$TMP/run-size-mt-over" "$TMP/size-mt-over.txt"
+expect_stderr "the load-turn refusal says --part-kb cannot help" \
+  "--part-kb does not shrink this turn"
+expect_calls "an oversized load turn never reaches agy" 0
+: > "$STUB_CALLS"
+expect_fail "--part-kb does not get a big diff past the cap" 2 "turn 1, which loads the whole diff, is " \
+  --agy "$STUB" --part-kb 8 --out "$TMP/run-size-mt-pk" "$TMP/size-mt-over.txt"
+expect_calls "--part-kb with an oversized diff: agy never ran" 0
+: > "$STUB_CALLS"
+expect_fail "the cap counts the load turn, not just the prompt file" 2 \
+  "turn 1, which loads the whole diff, is " \
+  --agy "$STUB" --out "$TMP/run-size-mt-edge" "$TMP/size-mt-edge.txt"
+edge_size="$(printf '%s' "$STDERR" | sed -n 's/.*loads the whole diff, is \([0-9]*\) bytes.*/\1/p' | head -1)"
+if [ -n "$edge_size" ] && [ "$edge_size" -gt 174080 ]; then
+  note_pass "the refusal reports the load turn's size ($edge_size bytes), not the file's"
+else
+  note_fail "the refusal reported '${edge_size}' bytes, expected the load turn's size over 174080"
+fi
+expect_calls "a load turn pushed over the cap never reaches agy" 0
+: > "$STUB_CALLS"
+expect_fail "--single-turn over the cap is refused as one prompt" 2 "the prompt is " \
+  --agy "$STUB" --single-turn --out "$TMP/run-size-st" "$TMP/size-mt-over.txt"
+expect_stderr "--single-turn over the cap is told to split" "Split the material into bundles"
+expect_calls "--single-turn over the cap: agy never ran" 0
+
 # --- --repo: a read grant in agy's GLOBAL settings, for one run ----------------------
 # Every case runs with HOME pointed at a scratch directory: the real
 # ~/.gemini/antigravity-cli/settings.json is never read or written by this suite.
@@ -1398,6 +1508,16 @@ refuse_case "--repo refuses when allow-rules exist" \
 refuse_case "--repo refuses settings that are not JSON" '{"permissions": ' "not plain JSON"
 refuse_case "--repo refuses a non-object permissions" '{"permissions":[1]}' "is not an object"
 refuse_case "--repo refuses a non-list allow" '{"permissions":{"allow":"x"}}' "is not a list"
+
+# The cap applies to the prompt agy gets: the file under 170 KB, plus the --repo rules and
+# file list, is over it. Refused before the grant, so settings.json is never written.
+reset_repo_state
+HOME="$RH" expect_fail "--repo: the cap counts the rules and the file list" 2 \
+  "the prompt is " --agy "$STUB" --out "$TMP/repo-size" --repo "$REPO" "$TMP/size-repo.txt"
+expect_stderr "--repo over the cap is pointed at a smaller subdirectory" \
+  "With --repo the prompt also carries the list of tracked files"
+expect_calls "--repo over the cap: agy never ran" 0
+expect_after "--repo over the cap: no grant was written" absent
 
 reset_repo_state
 printf '{}' > "$TMP/elsewhere.json"

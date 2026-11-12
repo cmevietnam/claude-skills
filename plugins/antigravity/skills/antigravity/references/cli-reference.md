@@ -88,8 +88,15 @@ now-defunct Gemini CLI path):
 asking for the token returned `NONE` with `status: SUCCESS`. Anything the model must see
 goes in the prompt argument, or through `--input-format stream-json`.
 
-Prompt size is bounded by `ARG_MAX` (1 MB on macOS), so a 47 KB review bundle passes
-comfortably as an argument.
+As an argument, a prompt is bounded by `ARG_MAX` (1 MB on macOS), but **`agy` keeps only
+the first 192000 bytes of a message**, whatever the input path. It wraps the message
+(`<USER_REQUEST>` tags, the local time, on the first one a note naming the model), cuts
+the wrapped text at 192000 bytes (191998 once, to end on a whole UTF-8 character),
+appends `\n<truncated N bytes>`, and reports SUCCESS. Read on 2026-11-12 from the
+requests agy records in `~/.gemini/antigravity-cli/conversations/<id>.db` (table
+`gen_metadata`): 40 of 501 conversations had a message cut, `-p` prompts and stream-json
+turns alike, from 2026-09-09 to agy 1.5.7; the longest wrapped message sent whole was
+191568 bytes. `agy-review` holds every message to 170 KB.
 
 ## Flags
 
@@ -185,6 +192,7 @@ without `event` fails the run (`missing the "event" field`, exit 1); an unknown 
 is skipped with a warning (`ignoring unsupported stream input message event`), and a run
 of only those exits 0 having answered nothing. `--print-timeout` bounds each turn, not
 the session: three turns of about 3 s each finished under a 6 s timeout, 9 s in total.
+Each turn is a message of its own, cut past 192000 bytes like a `-p` prompt (above).
 
 ### `--output-format text`
 
