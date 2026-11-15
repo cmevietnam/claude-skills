@@ -48,19 +48,33 @@ build; a consumer Gemini Pro subscription does not change it. Full record in
 (`--effort low|medium|high`) and serves Claude and GPT-OSS models next to Gemini, so a
 two-reviewer diff is one flag.
 
-## The default model: `gemini-4-argon`, effort high
+## The default model: `gemini-4-argon`, effort medium
 
-With no `--model`, `agy-review` reviews with `gemini-4-argon` at `--effort high`. The
+With no `--model`, `agy-review` reviews with `gemini-4-argon` at `--effort medium` (the
+owner's decision of 2026-11-15; it was `high` before). A `claude-*` base id runs at
+`--effort high`. The
 default is pinned in `bin/agy-review` (`DEFAULT_MODEL`). A newer model is adopted by
 editing that line, never automatically. `--model <id>` picks a different reviewer.
 
-`agy` offers Argon to Google AI Ultra and eligible Gemini Enterprise accounts only. On any
-other account the default fails with `agy`'s `invalid model selection`; pass
-`--model gemini-3.8-flash`, the previous default, to review there.
+`agy` offers Argon by plan: paid Google AI Pro (or a trial on eligible premium devices),
+Ultra and Gemini Enterprise, per Google's models page on 2026-11-15. On any other account
+the default fails with `agy`'s `invalid model selection`; pass `--model gemini-3.8-flash`,
+the previous default, to review there.
 
 `gemini-3.1-pro` is banned. `--model gemini-3.1-pro[-high|-low]` exits 2 before `agy`
 runs, and no guidance in this plugin suggests it. For a harder review or a second opinion,
-use a Claude id such as `claude-opus-5-5`, which `agy-review` also runs at `--effort high`.
+use a Claude id such as `claude-opus-5-5`, which `agy-review` runs at `--effort high`.
+Its output budget is 128000 tokens a response (Argon high: about 70000), but on Google AI
+Pro its quota is small: read `agy -p /quota` first.
+
+## Diffs, not whole files
+
+By the owner's rule of 2026-11-15, `agy-review` appends a short "Output rules" block to
+every prompt it sends: never output an entire large file, and show a fix as a diff or as
+the one function or block that changes. An answer that reproduces whole files is what runs
+into the output token limit. The rule's other half, to split large edits into small tool
+calls, is for runs that may edit files; a review has every tool denied, so it is not sent
+there (`skills/antigravity/SKILL.md`, "Output & Editing Rules").
 
 ## A run that overruns the output budget is not thrown away
 

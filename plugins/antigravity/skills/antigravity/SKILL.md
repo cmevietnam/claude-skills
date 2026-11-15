@@ -1,6 +1,6 @@
 ---
 name: antigravity
-description: Use when the user asks to run Antigravity CLI or `agy` for code review, a second opinion, code analysis, or a headless agent run — "ask antigravity", "agy review this", "have gemini look at it", "second opinion on this diff". Google's Antigravity CLI, which replaced Gemini CLI for personal accounts; reviews with gemini-4-argon at effort high by default and never uses gemini-3.1-pro. Reports findings verbatim before any code changes.
+description: Use when the user asks to run Antigravity CLI or `agy` for code review, a second opinion, code analysis, or a headless agent run — "ask antigravity", "agy review this", "have gemini look at it", "second opinion on this diff". Google's Antigravity CLI, which replaced Gemini CLI for personal accounts; reviews with gemini-4-argon at effort medium by default, asks for diffs rather than whole files, and never uses gemini-3.1-pro. Reports findings verbatim before any code changes.
 ---
 
 # Antigravity CLI (`agy`)
@@ -155,7 +155,7 @@ git diff main...HEAD > "$S/diff.txt"   # or: git diff (unstaged) / --cached / <S
   cat "$S/diff.txt"
 } > "$S/prompt.txt"
 
-agy-review --out "$S/argon" "$S/prompt.txt"   # gemini-4-argon, effort high
+agy-review --out "$S/argon" "$S/prompt.txt"   # gemini-4-argon, effort medium
 ```
 
 `agy-review` adds `--disable-slash-commands`, `--output-format json` and
@@ -166,14 +166,14 @@ report that, do not report a clean result.
 It prints the model it chose, and where the id came from, before the run:
 
 ```
-model:      gemini-4-argon (default), effort high
+model:      gemini-4-argon (default), effort medium
 ```
 
 **That line is what you attribute the findings to** — not "the default", and not the id
 you expected. A fallback says so in the same place.
 
-Its **default** effort is applied only to an unsuffixed `gemini-*` or `claude-*` id: a
-suffixed id carries its own level and conflicts with the flag, and any other family is
+Its **default** effort is `medium` for an unsuffixed `gemini-*` id and `high` for an
+unsuffixed `claude-*` id, and applies to those alone: a suffixed id carries its own level and conflicts with the flag, and any other family is
 left for `agy` to pick the level. An **explicit** `--effort` is always forwarded, so
 `agy`'s own error surfaces instead of being silently dropped — meaning
 `agy-review --model gemini-3.8-flash-high --effort high` still fails, by design.
@@ -222,25 +222,53 @@ What changes for you:
 
 More prompts: `references/review-prompts.md`.
 
+## Output & Editing Rules
+
+The user's rules (2026-11-15) for every `agy` run:
+
+- Always break down large file edits into small, incremental tool calls.
+- Never output entire large files in a single response; use a diff where possible, and
+  modify specific functions or blocks step by step.
+
+`agy-review` applies the output half itself. It appends this block, after one blank line,
+to every single-turn prompt (`--repo` included) and to the instructions in turn 1 of a
+multi-turn review, and the 170 KB cap counts it:
+
+```
+## Output rules
+- Never output an entire large file in a single response.
+- When a finding needs a fix, show a diff where possible, or only the specific function or block that changes.
+```
+
+The edit half is left out of reviews on purpose: every tool is denied there, and a prompt
+that talks about tool calls invites one, which comes back as an empty response (see "The
+trap that matters most"). When you call `agy` directly for a run that may edit files, put
+both rules in the prompt as written above.
+
 ## Models
 
-### The default is `gemini-4-argon` at `--effort high`, pinned
+### The default is `gemini-4-argon` at `--effort medium`, pinned
 
-The user's decision (2026-10-14; it was `gemini-3.8-flash` from 2026-09-25): every review
-runs on `gemini-4-argon` with `--effort high` unless they name another model. It is pinned
-in `DEFAULT_MODEL` in `bin/agy-review`, not discovered. A newer model appearing in
-`agy models` changes nothing until someone edits that line. The base id is used, not
-`gemini-4-argon-high`, so the effort travels as a flag and the retry ladder can step it
-down (see Failure modes).
+The user's decisions: every review runs on `gemini-4-argon` (since 2026-10-14; it was
+`gemini-3.8-flash` from 2026-09-25) at `--effort medium` (since 2026-11-15; `high` before)
+unless they name another model or effort. A `claude-*` base id keeps `--effort high`: its
+output budget is 128000 tokens a response, against about 70000 for Argon. Both are pinned
+in `bin/agy-review` (`DEFAULT_MODEL`, `DEFAULT_EFFORT`, `CLAUDE_DEFAULT_EFFORT`), not
+discovered. A newer model appearing in `agy models` changes nothing until someone edits
+them. The base id is used, not `gemini-4-argon-high`, so the effort travels as a flag and
+the retry ladder can step it down (see Failure modes).
 
-`agy` offers Argon to Google AI Ultra and eligible Gemini Enterprise accounts only. On an
-account without it `agy` rejects the id with `invalid model selection` (seen on
-2026-10-14, before the account was upgraded) and `agy-review` exits 1: report that, and
-re-run with `--model gemini-3.8-flash` only if the user asks for it. Seeing Argon in the
-Gemini app does not mean `agy` has it; `agy models` decides.
+`agy` offers Argon by plan. Google's models page (read 2026-11-15) lists it for paid
+Google AI Pro plans (or a trial on eligible premium devices), Ultra and Enterprise, and on
+Pro it has a weekly counter of its own in `agy -p /quota`. The list changes without an agy
+update: on 2026-11-15 the Argon ids were missing from `agy models` for some hours on
+agy 1.5.9, then back. On an account without it `agy` rejects the id with `invalid model
+selection` (seen on 2026-10-14, before the account was upgraded) and `agy-review` exits 1:
+report that, and re-run with `--model gemini-3.8-flash` only if the user asks for it.
+Seeing Argon in the Gemini app does not mean `agy` has it; `agy models` decides.
 
 Through `agy-review` that failure probably reads `--effort is not supported for model
-"gemini-4-argon"`, not "not recognized", because the default sends `--effort high`. This
+"gemini-4-argon"`, not "not recognized", because the default sends `--effort medium`. This
 is inferred from an unknown id (`gemini-9-nope`) run on agy 1.3.4, not reproduced on an
 account without Argon. When the default fails with that message, run `agy models` before
 concluding anything about effort.
@@ -253,7 +281,9 @@ is the user's standing instruction. `agy-review` enforces it: `--model gemini-3.
 `-high`, `-low`, in any letter case, exits 2 before `agy` runs.
 
 When a harder review or a second opinion is wanted, use a Claude id
-(`--model claude-opus-5-5`, which runs at `--effort high`). When calling `agy` directly
+(`--model claude-opus-5-5`, which runs at `--effort high`). Its quota is small on Google
+AI Pro (two probes spent 60% of a week on 2026-11-15): read `agy -p /quota` first, and
+tell the user before a large run. When calling `agy` directly
 (the follow-ups under Sessions), do not choose a Pro model either.
 
 - `--model <id>` pins a different reviewer. Use it when a second opinion needs a specific
@@ -261,15 +291,17 @@ When a harder review or a second opinion is wanted, use a Claude id
 
 ### What `agy models` lists
 
-`agy models` is authoritative and needs auth. As of 2026-11-01 (agy 1.4.10, a Google AI
-Ultra account; the same ids as on agy 1.3.4 on 2026-10-14) it lists:
+`agy models` is authoritative and needs auth. As of 2026-11-15 (agy 1.5.9, a Google AI
+Pro account) it lists:
 
-| Model                                                   | Notes                                                               |
-| ------------------------------------------------------- | ------------------------------------------------------------------- |
-| `gemini-4-argon-high` / `-medium` / `-low`              | The default (base id + `--effort high`). Ultra / Enterprise only    |
-| `gemini-3.8-flash-high` / `-medium` / `-low`            | The previous default. Fast, cheap, good on diffs                    |
-| `claude-opus-5-5-*`, `claude-sonnet-5-5-*` (three each) | A genuinely different training run — best for a true second opinion |
-| `gpt-oss-120b-medium`                                   | Open-weights option                                                 |
+| Model                                                   | Notes                                                                  |
+| ------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `gemini-4-argon-high` / `-medium` / `-low`              | The default (base id + `--effort medium`). Paid Pro, Ultra, Enterprise |
+| `gemini-4-hydrogen-*` (low, medium, high, xhigh)        | New by 2026-11-15, on every plan. Not yet tried as a reviewer          |
+| `gemini-pro-orchestrator-g1-pro`                        | Orchestrator (Argon): plans with Argon, fixed configuration            |
+| `gemini-3.8-flash-high` / `-medium` / `-low`            | The previous default. Fast, cheap, good on diffs                       |
+| `claude-opus-5-5-*`, `claude-sonnet-5-5-*` (three each) | A genuinely different training run — best for a true second opinion    |
+| `gpt-oss-120b-medium`                                   | Open-weights option. Google removes it on 2026-11-18                   |
 
 The listing of 2026-09-25 (agy 1.2.11) also had `gemini-3.7-flash-*`, `gemini-3.6-flash-*`,
 `gemini-3.1-pro-high` / `-low` (**banned**: never use, `agy-review` refuses it) and
@@ -416,11 +448,17 @@ envelope does not carry the prompt.
 
 - **`Please sign in`** — headless cannot authenticate. The user runs `agy` in a **real
   terminal** (not `!` in Claude Code, which has no TTY: `bubbletea: could not open TTY`).
+- **`Individual quota reached`** — exit 3 and `RESOURCE_EXHAUSTED (code 429)`, with the
+  reset time. The Claude and GPT ids share one small counter on Google AI Pro; two Opus
+  probes spent its five-hour window and 60% of its week on 2026-11-15. Report the reset
+  time and stop: never retry, and never switch to `gemini-3.1-pro`.
 - **`exceeded the output token limit`** — `status: ERROR` with an empty response, and it
   arrives **after** the model has run, so the attempt is already spent. **Thinking tokens
   count against that budget and dominate it**: a successful 92 KB review reported
   `output_tokens: 55850` of which `thinking_tokens: 54977`. `agy --help` offers no flag
-  for the budget — only `--model` and `--effort` move it.
+  for the budget — only `--model` and `--effort` move it. The budget is per model:
+  128000 output tokens for `claude-opus-5-5-high` (measured 2026-11-15), about 70000
+  with thinking for Argon high (`references/cli-reference.md`).
 
   `agy-review` **retries one effort rung lower** (high → medium → low), keeps each
   attempt's raw report (`out.json`, `out-2.json`, …), and prints
