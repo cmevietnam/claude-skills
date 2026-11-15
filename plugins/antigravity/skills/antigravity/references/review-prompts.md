@@ -20,11 +20,16 @@ Quote only the single line you object to, never a block. No preamble, no closing
 If you cannot fit a finding in 6 lines, drop it and report a more serious one instead.
 ```
 
+`agy-review` appends its own "Output rules" block to every prompt as well (never a whole
+file; a fix as a diff or the one block that changes), so do not repeat it; the cap above
+is still yours to set.
+
 **And drop the effort as the bundle grows.** Thinking tokens are charged against the same
 output budget and dominate it — a successful 92 KB review used 55,850 output tokens of
 which 54,977 were thinking. On that bundle `--effort high` hit the limit twice while
 `--effort medium` succeeded on the identical prompt. Reach for `high` on a small diff, not
-on a whole subsystem.
+on a whole subsystem. Since 2026-11-15 the default is `medium` already; pass
+`--effort high` yourself for a small diff that deserves it.
 
 Two more things separate a useful review from a list of platitudes:
 
@@ -114,11 +119,11 @@ git diff main...HEAD > "$S/diff.txt"     # committed only — omits uncommitted 
 
 cat "$S/preamble.txt" "$S/instructions.txt" "$S/diff.txt" > "$S/prompt.txt"
 
-agy-review --out "$S/argon" "$S/prompt.txt"        # gemini-4-argon, effort high
+agy-review --out "$S/argon" "$S/prompt.txt"        # gemini-4-argon, effort medium
 ```
 
 With no `--model`, `agy-review` uses the pinned default, `gemini-4-argon` at
-`--effort high`, and prints it on its `model:` line. The effort on the summary line can be
+`--effort medium`, and prints it on its `model:` line. The effort on the summary line can be
 lower if the retry ladder stepped it down; attribute the findings to that one.
 
 Without `set -e` and the emptiness check, a missing base branch leaves `diff.txt` empty,
@@ -155,7 +160,9 @@ files. In the conversation every turn sees all of them, and on 2026-11-01 each o
 planted cross-file defects was found from both sides.
 
 The other way to keep the effort is a model with a different budget: a Claude id such as
-`claude-opus-5-5`. Never `gemini-3.1-pro`, which is banned and which
+`claude-opus-5-5` (128000 output tokens a response, measured on 2026-11-15, against about
+70000 for Argon high). Its quota on Google AI Pro is small, so read `agy -p /quota` first.
+Never `gemini-3.1-pro`, which is banned and which
 `agy-review` refuses. That changes the reviewer, so it is a
 second opinion rather than the same review — which on security-sensitive code you wanted
 anyway.
@@ -178,13 +185,13 @@ and exits 0, so a failed run is indistinguishable from a quiet one.
 
 ## Choosing the model
 
-Start with the default: `gemini-4-argon` at `--effort high`. **Never use
+Start with the default: `gemini-4-argon` at `--effort medium`. **Never use
 `gemini-3.1-pro`**, not even for subtle concurrency, cross-module invariants or
 cryptographic logic. It is banned, and `agy-review` refuses it. For those, add a Claude
 reviewer (below) instead.
 
 For a genuine second opinion — a different training run, different blind spots — use
-`--model claude-opus-5-5`, which `agy-review` runs at `--effort high` like the default.
+`--model claude-opus-5-5`, which `agy-review` runs at `--effort high`, its Claude default.
 On security-sensitive code run both and diff the findings instead of merging them.
 
 Say which model and effort produced which findings when reporting.

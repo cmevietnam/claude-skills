@@ -560,14 +560,34 @@ expect_pass "run path prints review" "$GOOD_STDOUT" \
 # stdin, so the prompt must arrive as the argument right after -p, with its trailing
 # newline intact — and no surprise flag such as --dangerously-skip-permissions may appear.
 # `$(cat)` would strip the trailing newline, so read the file in a way that keeps it.
-PROMPT_ARG="$(cat "$TMP/prompt.txt"; printf x)"; PROMPT_ARG="${PROMPT_ARG%x}"
-argv_equals "full argv: -p, the exact prompt, and nothing unexpected" \
+# The wrapper appends its output rules (the owner's rule of 2026-11-15) after one blank
+# line. They are pinned here byte for byte, so a change to them turns these cases red.
+OUTPUT_RULES=$'## Output rules\n- Never output an entire large file in a single response.\n- When a finding needs a fix, show a diff where possible, or only the specific function or block that changes.\n'
+export OUTPUT_RULES
+RULES_BYTES=$(( ${#OUTPUT_RULES} + 1 ))   # ASCII, and the blank line before it
+# sent_prompt FILE -- the message agy-review sends for FILE, then an x (keeps newlines).
+sent_prompt() {
+  cat "$1"
+  if [ -n "$(tail -c 1 "$1")" ]; then printf '\n'; fi
+  printf '\n%sx' "$OUTPUT_RULES"
+}
+PROMPT_ARG="$(sent_prompt "$TMP/prompt.txt")"; PROMPT_ARG="${PROMPT_ARG%x}"
+argv_equals "full argv: -p, the prompt and the output rules, and nothing unexpected" \
   "-p" "$PROMPT_ARG" \
   "--model" "gemini-4-argon" \
   "--disable-slash-commands" \
   "--output-format" "json" \
   "--print-timeout" "9m" \
-  "--effort" "high"
+  "--effort" "medium"
+
+# A gemini-* base id other than the default gets the gemini default effort too (medium,
+# the owner's decision of 2026-11-15); the claude base id below keeps high.
+expect_pass "a gemini base id runs" "$GOOD_STDOUT" \
+  --agy "$STUB" --model gemini-3.8-flash --out "$TMP/run2g" "$TMP/prompt.txt"
+argv_equals "gemini base id: full argv, with the gemini default effort" \
+  "-p" "$PROMPT_ARG" "--model" "gemini-3.8-flash" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
+  "--effort" "medium"
 
 # a suffixed id must NOT get --effort (agy: "conflicts with --effort=high"),
 # but the model itself must still be forwarded
@@ -660,13 +680,22 @@ expect_fail "NaN is not JSON" 1 "non-JSON constant" --check "$TMP/nan.json"
 # A CRLF prompt must reach agy with its CRLFs intact — universal-newline translation
 # would silently review different bytes than the file holds.
 printf 'line one\r\nline two\r\n' > "$TMP/crlf-prompt.txt"
-CRLF_ARG="$(cat "$TMP/crlf-prompt.txt"; printf x)"; CRLF_ARG="${CRLF_ARG%x}"
+CRLF_ARG="$(sent_prompt "$TMP/crlf-prompt.txt")"; CRLF_ARG="${CRLF_ARG%x}"
 expect_pass "CRLF prompt survives" "$GOOD_STDOUT" \
   --agy "$STUB" --out "$TMP/run-crlf" "$TMP/crlf-prompt.txt"
 argv_equals "CRLF prompt reaches agy byte-for-byte" \
   "-p" "$CRLF_ARG" "--model" "gemini-4-argon" \
   "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
-  "--effort" "high"
+  "--effort" "medium"
+
+# A prompt without a final newline gets one before the blank line and the rules.
+printf 'no final newline' > "$TMP/nonl-prompt.txt"
+expect_pass "a prompt without a final newline runs" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-nonl" "$TMP/nonl-prompt.txt"
+argv_equals "a prompt without a final newline: one newline, a blank line, the rules" \
+  "-p" "no final newline"$'\n\n'"$OUTPUT_RULES" "--model" "gemini-4-argon" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
+  "--effort" "medium"
 
 # A closed reader (`| head -1`) is not our error: exit conventionally, no traceback.
 python3 "$BIN" --check "$TMP/good.json" 2>"$TMP/.pipe-err" | head -1 >/dev/null
@@ -734,8 +763,8 @@ else
 fi
 
 # --- the default model: pinned, never discovered -------------------------------------
-# The owner pinned gemini-4-argon at --effort high on 2026-10-14 (it was gemini-3.8-flash
-# from 2026-09-25). A newer model in the listing must NOT move the default, and the
+# The owner pinned gemini-4-argon on 2026-10-14 (it was gemini-3.8-flash from 2026-09-25),
+# at --effort high until 2026-11-15 and at medium since. A newer model in the listing must NOT move the default, and the
 # default must not even ask for the listing.
 # Each case gets an empty XDG_CACHE_HOME: the old discovery code cached its answer there,
 # and a warm cache would let a reintroduced listing call hide behind "0 calls".
@@ -743,13 +772,13 @@ fi
 : > "$STUB_MODELS_CALLS"
 XDG_CACHE_HOME="$TMP/cold-cache-1" expect_pass "the default run" "$GOOD_STDOUT" \
   --agy "$STUB" --out "$TMP/run-default1" "$TMP/prompt.txt"
-argv_equals "the default is gemini-4-argon at --effort high" \
+argv_equals "the default is gemini-4-argon at --effort medium" \
   "-p" "$PROMPT_ARG" "--model" "gemini-4-argon" \
   "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
-  "--effort" "high"
+  "--effort" "medium"
 expect_models_calls "the default asks agy for no model listing" 0
 expect_stderr "the model line labels the pinned default" \
-  "model:      gemini-4-argon (default), effort high"
+  "model:      gemini-4-argon (default), effort medium"
 
 # A listing that offers a newer model changes nothing: the default is pinned by decision.
 cat > "$TMP/models-newer.txt" <<'EOF2'
@@ -793,7 +822,7 @@ expect_fail "a banned id with an explicit --effort is refused too" 2 "is banned"
   "$TMP/prompt.txt"
 expect_calls "a banned id with --effort never reaches agy" 0
 expect_fail "the refusal points at the default" 2 \
-  "Omit --model for the default (gemini-4-argon, effort high)" \
+  "Omit --model for the default (gemini-4-argon, effort medium)" \
   --agy "$STUB" --model gemini-3.1-pro-high --out "$TMP/run-ban-hint" "$TMP/prompt.txt"
 
 # The ban is exact: ids that merely share a prefix still run.
@@ -816,17 +845,17 @@ STUB_STDOUT="$TMP/token-limit.json" \
   --agy "$STUB" --out "$TMP/run-retry1" "$TMP/prompt.txt"
 expect_calls "the retry costs exactly one more run" 2
 expect_stderr "the retry is announced with both efforts" \
-  "exceeded the output token limit; retrying at --effort medium"
+  "exceeded the output token limit; retrying at --effort low"
 expect_stderr "the summary names the effort that produced the review" \
-  "effort=medium attempts=2"
+  "effort=low attempts=2"
 ARGV_FILE_OVERRIDE="$STUB_ARGV.1" argv_equals "attempt 1 runs at the default effort" \
   "-p" "$PROMPT_ARG" "--model" "gemini-4-argon" \
   "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
-  "--effort" "high"
+  "--effort" "medium"
 ARGV_FILE_OVERRIDE="$STUB_ARGV.2" argv_equals "attempt 2 differs only in the effort" \
   "-p" "$PROMPT_ARG" "--model" "gemini-4-argon" \
   "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
-  "--effort" "medium"
+  "--effort" "low"
 
 # The failed attempt is the evidence that the retry was warranted, so it is kept.
 if [ -f "$TMP/run-retry1/out.json" ] && [ -f "$TMP/run-retry1/out-2.json" ]; then
@@ -846,12 +875,12 @@ else
   note_fail "the retry did not keep one report per attempt"
 fi
 
-# The ladder is finite: high, medium, low, then stop.
+# The ladder is finite: from an explicit high, medium, low, then stop.
 : > "$STUB_CALLS"
 STUB_STDOUT="$TMP/token-limit.json" \
   expect_fail "an exhausted ladder fails rather than looping" 1 \
   "effort tried: high, medium, low" \
-  --agy "$STUB" --out "$TMP/run-retry2" "$TMP/prompt.txt"
+  --agy "$STUB" --effort high --out "$TMP/run-retry2" "$TMP/prompt.txt"
 expect_calls "the ladder stops at low" 3
 expect_stderr "the exhausted ladder leads with the keep-the-effort lever" \
   "split the bundle and review it in parts"
@@ -863,6 +892,13 @@ expect_stderr "the exhausted ladder offers a claude id as the other model" \
   "a claude id (claude-opus-5-5)"
 expect_stderr_absent "the exhausted ladder never suggests running 3.1 Pro" \
   "--model gemini-3.1-pro"
+
+# From the default (medium) the ladder has two rungs.
+: > "$STUB_CALLS"
+STUB_STDOUT="$TMP/token-limit.json" \
+  expect_fail "the default's ladder is medium, then low" 1 "effort tried: medium, low" \
+  --agy "$STUB" --out "$TMP/run-retry2d" "$TMP/prompt.txt"
+expect_calls "the default's ladder runs twice" 2
 
 # --no-retry is for a caller who wants the effort they asked for, or nothing.
 : > "$STUB_CALLS"
@@ -956,9 +992,12 @@ python3 -c 'import sys; open(sys.argv[1], "w").write("Review this:\n" + "x\n" * 
   "$TMP/big-prompt.txt"
 : > "$STUB_CALLS"
 expect_pass "a large prompt still runs" "$GOOD_STDOUT" \
-  --agy "$STUB" --out "$TMP/run-big" "$TMP/big-prompt.txt"
+  --agy "$STUB" --effort high --out "$TMP/run-big" "$TMP/big-prompt.txt"
 expect_stderr "a large prompt at high effort is flagged before the run" \
   "KB of prompt at --effort high"
+expect_pass "a large prompt at the default effort runs" "$GOOD_STDOUT" \
+  --agy "$STUB" --out "$TMP/run-big-default" "$TMP/big-prompt.txt"
+expect_stderr_absent "a large prompt at the default medium is not flagged" "KB of prompt at"
 expect_pass "an ordinary prompt runs unremarked" \
   "$GOOD_STDOUT" --agy "$STUB" --out "$TMP/run-small" "$TMP/prompt.txt"
 expect_stderr_absent "an ordinary prompt is not flagged" "KB of prompt at --effort high"
@@ -1046,7 +1085,7 @@ expect_calls "the whole multi-turn review is one agy run" 1
 argv_equals "multi-turn argv: the turns on stdin, no -p, nothing unexpected" \
   "--model" "gemini-4-argon" "--disable-slash-commands" \
   "--input-format" "stream-json" "--output-format" "stream-json" \
-  "--print-timeout" "9m" "--effort" "high"
+  "--print-timeout" "9m" "--effort" "medium"
 stdin_check "turn 1 carries the instructions and the whole diff, then one turn per part" '
 import json, os
 raw = open(os.environ["STDIN_FILE"], encoding="utf-8", newline="").read()
@@ -1062,6 +1101,9 @@ d = os.environ["TMPD"]
 instr = open(d + "/mt-instr.txt", encoding="utf-8", newline="").read()
 diff = open(d + "/mt-diff.txt", encoding="utf-8", newline="").read()
 assert t[0].startswith(instr), "turn 1 lost the instructions"
+assert t[0][len(instr):].startswith(os.environ["OUTPUT_RULES"] + "\n[agy-review] This review runs"), \
+    "turn 1 lacks the output rules right after the instructions"
+assert t[0].count("## Output rules") == 1, "the output rules are not in turn 1 exactly once"
 assert t[0].endswith(diff), "turn 1 does not end with the whole diff, byte for byte"
 assert "Do NOT review anything in this turn" in t[0] and "Reply with exactly: READY" in t[0]
 for k, files in ((1, ["a.py", "b.py"]), (2, ["c.py"]), (3, ["d.py"])):
@@ -1085,7 +1127,7 @@ fi
 expect_stderr "the turn plan is announced" \
   "turns:      4: one loads the whole diff, 3 review it in parts of up to 1 KB"
 expect_stderr "the summary names parts and turns" \
-  "model=gemini-4-argon effort=high attempts=1 parts=3 turns=4 conversation=stub-conv tokens=400"
+  "model=gemini-4-argon effort=medium attempts=1 parts=3 turns=4 conversation=stub-conv tokens=400"
 
 # The default part size: a small diff stays one turn, a big one is split by default.
 expect_pass "a diff within one default part is one turn" "$GOOD_STDOUT" \
@@ -1094,27 +1136,27 @@ argv_has "one-turn diff: -p carries it" "-p"
 argv_lacks "one-turn diff: no stream input" "--input-format"
 expect_pass "a 61 KB two-file diff is split by default" \
   $'## Part 1/2: big1.py\n\nREVIEW-PART-1\n\n## Part 2/2: big2.py\n\nREVIEW-PART-2\n' \
-  --agy "$STUB" --out "$TMP/run-mt-big" "$TMP/mt-big.txt"
+  --agy "$STUB" --effort high --out "$TMP/run-mt-big" "$TMP/mt-big.txt"
 argv_has "default split: the turns go on stdin" "--input-format" "stream-json"
 expect_stderr_absent "parts under 50 KB carry no size warning" "at --effort high"
 expect_pass "--single-turn keeps a big diff in one turn" "$GOOD_STDOUT" \
-  --agy "$STUB" --single-turn --out "$TMP/run-mt-single" "$TMP/mt-big.txt"
+  --agy "$STUB" --single-turn --effort high --out "$TMP/run-mt-single" "$TMP/mt-big.txt"
 argv_has "--single-turn: -p carries the prompt" "-p"
 argv_lacks "--single-turn: no stream input" "--input-format"
 expect_stderr "--single-turn: the whole-prompt size warning still applies" \
   "KB of prompt at --effort high"
 expect_pass "a part over 50 KB still runs" \
   $'## Part 1/2: huge.py\n\nREVIEW-PART-1\n\n## Part 2/2: z.py\n\nREVIEW-PART-2\n' \
-  --agy "$STUB" --out "$TMP/run-mt-huge" "$TMP/mt-huge.txt"
+  --agy "$STUB" --effort high --out "$TMP/run-mt-huge" "$TMP/mt-huge.txt"
 expect_stderr "a part over 50 KB is flagged before the run" "warning: part 1 is 60 KB at --effort high"
 
 # A prompt that IS the diff, and a CRLF diff, split the same way.
 expect_pass "a prompt that is only a diff" "$MT_STDOUT" \
   --agy "$STUB" --part-kb 1 --out "$TMP/run-mt-bare" "$TMP/mt-diff.txt"
-stdin_check "a bare diff: turn 1 starts with the conversation note" '
+stdin_check "a bare diff: turn 1 starts with the output rules, then the conversation note" '
 import json, os
 t = [json.loads(l)["message"]["content"] for l in open(os.environ["STDIN_FILE"], encoding="utf-8").read().split("\n") if l]
-assert t[0].startswith("[agy-review] This review runs as one conversation"), t[0][:80]
+assert t[0].startswith(os.environ["OUTPUT_RULES"] + "\n[agy-review] This review runs as one conversation"), t[0][:80]
 '
 expect_pass "a CRLF diff splits on its file headers" \
   $'## Part 1/2: x.py\n\nREVIEW-PART-1\n\n## Part 2/2: y.py\n\nREVIEW-PART-2\n' \
@@ -1213,10 +1255,10 @@ STUB_STREAM_1="$TMP/s-limit.ndjson" expect_pass "a limit failure in one turn is 
   "$MT_STDOUT" --agy "$STUB" --part-kb 1 --out "$TMP/run-ml1" "$TMP/mt-prompt.txt"
 expect_calls "the multi-turn retry costs one more run" 2
 expect_stderr "the multi-turn retry is announced" \
-  "exceeded the output token limit; retrying at --effort medium"
+  "exceeded the output token limit; retrying at --effort low"
 expect_stderr "the multi-turn summary names the effort that produced it" \
-  "effort=medium attempts=2 parts=3 turns=4"
-ARGV_FILE_OVERRIDE="$STUB_ARGV.2" argv_has "the multi-turn retry runs at medium" "--effort" "medium"
+  "effort=low attempts=2 parts=3 turns=4"
+ARGV_FILE_OVERRIDE="$STUB_ARGV.2" argv_has "the multi-turn retry runs at low" "--effort" "low"
 if [ -f "$TMP/run-ml1/out.ndjson" ] && [ -f "$TMP/run-ml1/out-2.ndjson" ] \
    && [ -f "$TMP/run-ml1/in.ndjson" ] && [ -f "$TMP/run-ml1/in-2.ndjson" ] \
    && grep -q "output token limit" "$TMP/run-ml1/out.ndjson"; then
@@ -1249,10 +1291,11 @@ STUB_STDOUT="$TMP/finished-timeout.json" expect_fail "run: finished_reason fails
 # Every message the wrapper would send is held to 170 KB (174080 bytes), counted in UTF-8
 # bytes. A bigger one exits 2 before agy runs, and leaves no output directory behind.
 
-python3 - "$TMP" <<'PY'
+python3 - "$TMP" "$RULES_BYTES" <<'PY'
 import sys
 tmp = sys.argv[1]
 CAP = 170 * 1024
+RULES = int(sys.argv[2])   # what the wrapper appends to a single-turn prompt
 def write(name, text):
     with open(f"{tmp}/{name}", "w", encoding="utf-8", newline="") as f:
         f.write(text)
@@ -1268,9 +1311,9 @@ def section(name, size):
         body += f"+line {len(body)} of {name}\n"
     return head + body
 instr = "Review the diff below. Report file:line for each defect.\n\n"
-write("size-cap.txt", filler(CAP))
-write("size-over.txt", filler(CAP + 1))
-write("size-repo.txt", filler(CAP - 100))   # under the cap until --repo adds its text
+write("size-cap.txt", filler(CAP - RULES))       # exactly the cap once the rules are added
+write("size-over.txt", filler(CAP - RULES + 1))
+write("size-repo.txt", filler(CAP - RULES - 100))   # under the cap until --repo adds its text
 write("size-utf8.txt", chr(0x2713) * 60000 + "\n")   # 60001 characters, 180001 bytes
 write("size-mt-ok.txt", instr + "".join(section(f"s{i}.py", 45 * 1024) for i in (1, 2, 3)))
 write("size-mt-over.txt", instr + "".join(section(f"s{i}.py", 45 * 1024) for i in (1, 2, 3, 4)))
@@ -1278,19 +1321,22 @@ write("size-mt-over.txt", instr + "".join(section(f"s{i}.py", 45 * 1024) for i i
 edge = "".join(section(f"e{i}.py", 56 * 1024) for i in (1, 2, 3))
 write("size-mt-edge.txt", filler(CAP - 50 - len(edge.encode())) + edge)
 PY
-for f in size-cap:174080 size-over:174081 size-repo:173980 size-utf8:180001 size-mt-edge:174030; do
+for f in size-cap:$((174080 - RULES_BYTES)) size-over:$((174081 - RULES_BYTES)) \
+  size-repo:$((173980 - RULES_BYTES)) size-utf8:180001 size-mt-edge:174030; do
   if [ "$(wc -c < "$TMP/${f%%:*}.txt" | tr -d ' ')" != "${f##*:}" ]; then
     echo "FATAL: fixture ${f%%:*}.txt is not ${f##*:} bytes"; exit 1
   fi
 done
 
 : > "$STUB_CALLS"
-expect_pass "a prompt of exactly 170 KB runs" "$GOOD_STDOUT" \
+expect_pass "a prompt of exactly 170 KB with the output rules runs" "$GOOD_STDOUT" \
   --agy "$STUB" --out "$TMP/run-size-cap" "$TMP/size-cap.txt"
 if argv_capture_ok "a 170 KB prompt reaches agy whole" && ARGV_FILE="$(argv_file)" python3 -c '
 import os, sys
 a = open(os.environ["ARGV_FILE"], "rb").read().split(b"\0")
-sys.exit(0 if a[a.index(b"-p") + 1] == open(sys.argv[1], "rb").read() else 1)' "$TMP/size-cap.txt"
+sent = a[a.index(b"-p") + 1]
+want = open(sys.argv[1], "rb").read() + b"\n" + os.environ["OUTPUT_RULES"].encode()
+sys.exit(0 if sent == want and len(sent) == 170 * 1024 else 1)' "$TMP/size-cap.txt"
 then
   note_pass "a 170 KB prompt reaches agy whole"
 else
@@ -1298,9 +1344,11 @@ else
 fi
 
 : > "$STUB_CALLS"
-expect_fail "a prompt one byte over 170 KB is refused" 2 \
+expect_fail "a prompt one byte over 170 KB with the rules is refused" 2 \
   "the prompt is 174081 bytes, over the 170 KB (174080 bytes)" \
   --agy "$STUB" --out "$TMP/run-size-over" "$TMP/size-over.txt"
+expect_stderr "the refusal says the count includes the rules" \
+  "The count includes the $RULES_BYTES bytes of output rules this wrapper adds."
 expect_stderr "the refusal says what agy would do" \
   "agy keeps only the first 192000 bytes of a message"
 expect_stderr "the refusal names agy's marker" "<truncated N bytes>"
@@ -1313,7 +1361,7 @@ else
 fi
 
 : > "$STUB_CALLS"
-expect_fail "the cap counts UTF-8 bytes, not characters" 2 "the prompt is 180001 bytes" \
+expect_fail "the cap counts UTF-8 bytes, not characters" 2 "the prompt is $((180001 + RULES_BYTES)) bytes" \
   --agy "$STUB" --out "$TMP/run-size-utf8" "$TMP/size-utf8.txt"
 expect_calls "an oversized UTF-8 prompt never reaches agy" 0
 

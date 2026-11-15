@@ -81,7 +81,7 @@ reach the user intact, and must reach them _before_ the diff does.
 ## Shape of a good report
 
 ```
-## Antigravity findings (gemini-4-argon, effort=high)
+## Antigravity findings (gemini-4-argon, effort=medium)
 
 Raw output: /tmp/agy-review/out.json
 

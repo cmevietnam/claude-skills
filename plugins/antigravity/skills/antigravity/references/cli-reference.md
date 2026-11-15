@@ -98,6 +98,12 @@ requests agy records in `~/.gemini/antigravity-cli/conversations/<id>.db` (table
 turns alike, from 2026-09-09 to agy 1.5.7; the longest wrapped message sent whole was
 191568 bytes. `agy-review` holds every message to 170 KB.
 
+The cut is agy's, not the model's. On 2026-11-15 (agy 1.5.9) a 260058-byte `-p` message
+to `claude-opus-5-5-high`, with a random marker at its start, middle and end, was recorded
+with `<truncated 68477 bytes>` in place of its tail and no end marker; the model saw the
+filler up to line 2306 of 3126 and said the message was cut. The 170 KB refusal applies
+to every model.
+
 ## Flags
 
 | Flag                             | Purpose                                                                            |
@@ -119,6 +125,7 @@ turns alike, from 2026-09-09 to agy 1.5.7; the longest wrapped message sent whol
 | `--sandbox`                      | Terminal restrictions                                                              |
 | `--new-project`, `--project`     | Project selection                                                                  |
 | `--log-file`                     | Override the log path                                                              |
+| `--settings`                     | Settings for this run only, never saved: settings.json keys as JSON (agy 1.5.9)    |
 
 Subcommands: `models`, `agents`, `mcp`, `plugin`, `install`, `update`, `changelog`,
 `remote-control`, `mic-serve`.
@@ -127,6 +134,29 @@ Subcommands: `models`, `agents`, `mcp`, `plugin`, `install`, `update`, `changelo
 the table above; nothing in it raises the limit that produces
 `exceeded the output token limit`. Only `--model` and `--effort` move that budget, which
 is why the remaining lever is to shrink the input.
+
+**The budget differs by model.** What one response may spend, as agy reported it:
+
+- `claude-opus-5-5-high`: **128000 output tokens**, `thinking_tokens: 0`. Measured on
+  2026-11-15 (agy 1.5.9) with a prompt asking for numbered lines until cut off: 5818
+  lines, `output_tokens: 128000`, then agy's own `error_message` step ("exceeded the
+  output token limit. Please continue from where you left off, keeping your response
+  shorter. Retries remaining: 3") and a continue request in the same run.
+- `gemini-4-argon-high`: about **70000**, thinking included. Not measured the same way:
+  Argon refused the filler prompt twice, and a list of the numbers 1 to 10000 in words
+  stopped at line 216 with `status: ERROR`, blocked by Google's filter ("may contain
+  material that resembles existing copyrighted works"). The figure is the 2026-10-15
+  `--repo` overrun, `output_tokens: 69998` of which 63058 thinking (SKILL.md).
+
+So a Claude id has close to twice Argon's room, but a run that reaches it is expensive:
+see Quota below.
+
+**There is no long-output setting to turn on.** agy 1.5.9's settings page
+(`antigravity.google/docs/settings`, read 2026-11-15) lists no key for output length or
+thinking, and the binary holds no such setting. Its changelog (1.5.7) says the built-in
+Gemini models run at a **65,535-token output limit**, which custom models behind an
+enterprise gateway now share; only an admin `maxOutputTokens` for such a model overrides
+it. On a Google sign-in account the budget is fixed per model.
 
 `agy models` prints the listing on **stdout**, one `<id>\t<label>` per line, and its
 `Fetching available models...` progress note on **stderr** — so the listing can be parsed
@@ -208,32 +238,76 @@ discards the explanation of any failure.
 | 1    | `ERROR` — bad flags, unknown model, not signed in, a stream-json line without `event`  |
 | 3    | `ERROR` — a model or agent API failure (a spent quota); stderr has `AGY_ERROR: {...}`  |
 
+## Quota
+
+`agy -p /quota` costs nothing and prints one counter per line: group, counter, percent
+remaining, reset time (UTC). On a Google AI Pro account on 2026-11-15 (agy 1.5.9):
+
+```
+Gemini Models          Weekly Limit Remaining       100%  2026-11-22T06:55:40Z
+Gemini Models          Five Hour Limit Remaining    100%  2026-11-15T11:55:40Z
+Claude and GPT models  Weekly Limit Remaining       100%  2026-11-22T06:55:40Z
+Claude and GPT models  Five Hour Limit Remaining    100%  2026-11-15T11:55:40Z
+Gemini 4 Argon         Gemini 4 Argon Weekly Limit  100%  2026-11-22T06:55:40Z
+```
+
+Every Claude and GPT id draws on one pair of counters, separate from Gemini's. Argon has
+its own weekly counter and no five-hour one. Google publishes no sizes. Its plans page
+(`antigravity.google/docs/plans`, read 2026-11-15) says Pro gets "a high, generous quota,
+refreshed every five hours until the weekly limit is reached", Ultra "the highest", and
+that the baseline limits "are primarily determined by available capacity". The percentages
+are the only measure there is.
+
+**The Claude counters are small.** On 2026-11-15 two probes on `claude-opus-5-5-high`
+took them from 100% to **40% weekly and 0% five-hour**: one 260 KB message (83838 input
+tokens, 64 output), and one answer cut at the 128000-token budget (7411 input). agy's
+continue request after that cut failed with exit 3 and
+`RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription
+to increase your limits. Resets in 4h44m41s.` Over the same hour four short Argon runs
+moved its counter from 100% to 98%, and the Gemini counters stayed at 100%. Read `/quota`
+before a large Claude run: one answer near its output budget can spend a whole five-hour
+window and more than half a week.
+
 ## Models
 
-`agy models` prints `id<TAB>label`. Live list on 2026-11-01 (agy 1.4.10, a Google AI Ultra
-account), in the order printed. agy 1.3.4 listed the same ids on 2026-10-14, with the
-three Flash lines first:
+`agy models` prints `id<TAB>label`. Live list on 2026-11-15 (agy 1.5.9, a Google AI Pro
+account), in the order printed:
 
 ```
-gemini-4-argon-medium      Gemini 4 Argon (Medium)
-gemini-4-argon-high        Gemini 4 Argon (High)
-gemini-4-argon-low         Gemini 4 Argon (Low)
-gemini-3.8-flash-high      Gemini 3.8 Flash (High)
-gemini-3.8-flash-medium    Gemini 3.8 Flash (Medium)
-gemini-3.8-flash-low       Gemini 3.8 Flash (Low)
+gemini-4-argon-medium           Gemini 4 Argon (Medium)
+gemini-4-argon-high             Gemini 4 Argon (High)
+gemini-4-argon-low              Gemini 4 Argon (Low)
+gemini-4-hydrogen-high          Gemini 4 Hydrogen (High)
+gemini-4-hydrogen-xhigh         Gemini 4 Hydrogen (XHigh)
+gemini-4-hydrogen-medium        Gemini 4 Hydrogen (Medium)
+gemini-4-hydrogen-low           Gemini 4 Hydrogen (Low)
+gemini-pro-orchestrator-g1-pro  Orchestrator (Argon)
+gemini-3.8-flash-high           Gemini 3.8 Flash (High)
+gemini-3.8-flash-medium         Gemini 3.8 Flash (Medium)
+gemini-3.8-flash-low            Gemini 3.8 Flash (Low)
 claude-opus-5-5-low/medium/high
 claude-sonnet-5-5-low/medium/high
-gpt-oss-120b-medium        GPT-OSS 120B (Medium)
+gpt-oss-120b-medium             GPT-OSS 120B (Medium)
 ```
 
-`agy-review`'s default is none of these lines as printed: it is the base id
-`gemini-4-argon` with `--effort high`, which selects the same model and level as
-`gemini-4-argon-high`.
+The lists of 2026-11-01 (agy 1.4.10, then recorded as a Google AI Ultra account) and
+2026-10-14 (agy 1.3.4) had the same ids without the four Hydrogen lines and the
+Orchestrator line.
 
-The three `gemini-4-argon-*` lines are per account: the same CLI on the same day listed
-everything else but them until the account moved to Google AI Ultra, and
-`--model gemini-4-argon` answered `model gemini-4-argon is not recognized as a known model
-or custom model in settings`.
+`agy-review`'s default is none of these lines as printed: it is the base id
+`gemini-4-argon` with `--effort medium`, which selects the same model and level as
+`gemini-4-argon-medium`.
+
+The lines depend on the account's plan, and they change without an agy update. Google's
+models page (`antigravity.google/docs/models`, read 2026-11-15) lists Gemini 4 Argon and
+Orchestrator (Argon) for paid Google AI Pro plans (or a trial on eligible premium
+devices), Ultra and Enterprise; Claude Sonnet 5.5 and Opus 5.5 for Pro "for non-trial
+subscriptions only", Ultra and Enterprise; Gemini 4 Carbon for Ultra and Enterprise only;
+Hydrogen and 3.8 Flash on every plan. Claude Sonnet 4.6, Claude Opus 4.6 and GPT-OSS-120b
+"will be removed on November 18, 2026". On 2026-10-14 the Argon lines were missing until
+the account was upgraded, and `--model gemini-4-argon` answered `model gemini-4-argon is
+not recognized as a known model or custom model in settings`. On 2026-11-15 they were
+missing for some hours on agy 1.5.9 and back by 13:56 on the same version.
 
 The list of 2026-09-25 (agy 1.2.11, unchanged from 2026-09-05) was different, and the
 transcripts below were recorded against it:
@@ -317,8 +391,8 @@ An unknown model is **never silently substituted**: exit 1 and `"status":"ERROR"
 
 - without `--effort`: `model gemini-9-nope is not recognized as a known model or custom
   model in settings`, followed by `Available models:` and the full list of labels;
-- with `--effort high`, which is how `agy-review` runs an unsuffixed `gemini-*` or
-  `claude-*` id: only
+- with `--effort high` (and so with any `--effort`, which `agy-review` sends with every
+  unsuffixed `gemini-*` or `claude-*` id): only
   `--effort is not supported for model "gemini-9-nope"`, and no list.
 
 ## Sessions
