@@ -574,20 +574,21 @@ sent_prompt() {
 PROMPT_ARG="$(sent_prompt "$TMP/prompt.txt")"; PROMPT_ARG="${PROMPT_ARG%x}"
 argv_equals "full argv: -p, the prompt and the output rules, and nothing unexpected" \
   "-p" "$PROMPT_ARG" \
-  "--model" "gemini-4-argon" \
+  "--model" "gemini-4-neon" \
   "--disable-slash-commands" \
   "--output-format" "json" \
-  "--print-timeout" "9m" \
-  "--effort" "medium"
+  "--print-timeout" "20m" \
+  "--effort" "high"
 
-# A gemini-* base id other than the default gets the gemini default effort too (medium,
-# the owner's decision of 2026-11-15); the claude base id below keeps high.
+# A gemini-* base id other than the default gets the gemini default effort too (high,
+# the owner's decision of 2026-11-19; medium from 2026-11-15); the claude base id below
+# gets high as well.
 expect_pass "a gemini base id runs" "$GOOD_STDOUT" \
   --agy "$STUB" --model gemini-3.8-flash --out "$TMP/run2g" "$TMP/prompt.txt"
 argv_equals "gemini base id: full argv, with the gemini default effort" \
   "-p" "$PROMPT_ARG" "--model" "gemini-3.8-flash" \
-  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
-  "--effort" "medium"
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "20m" \
+  "--effort" "high"
 
 # a suffixed id must NOT get --effort (agy: "conflicts with --effort=high"),
 # but the model itself must still be forwarded
@@ -595,7 +596,7 @@ expect_pass "suffixed model runs" "$GOOD_STDOUT" \
   --agy "$STUB" --model gemini-3.8-flash-high --out "$TMP/run2" "$TMP/prompt.txt"
 argv_equals "suffixed id: full argv, no --effort anywhere" \
   "-p" "$PROMPT_ARG" "--model" "gemini-3.8-flash-high" \
-  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m"
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "20m"
 
 # A Claude base id takes --effort exactly like a Gemini one (agy 1.3.4:
 # `--model claude-opus-5-5 --effort high` runs), so it gets the default effort too.
@@ -603,7 +604,7 @@ expect_pass "claude base id runs" "$GOOD_STDOUT" \
   --agy "$STUB" --model claude-opus-5-5 --out "$TMP/run3" "$TMP/prompt.txt"
 argv_equals "claude base id: full argv, with the default effort" \
   "-p" "$PROMPT_ARG" "--model" "claude-opus-5-5" \
-  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "20m" \
   "--effort" "high"
 expect_stderr "claude base id: the model line names the effort" \
   "model:      claude-opus-5-5 (explicit --model), effort high"
@@ -613,7 +614,18 @@ expect_pass "suffixed claude id runs" "$GOOD_STDOUT" \
   --agy "$STUB" --model claude-opus-5-5-high --out "$TMP/run3b" "$TMP/prompt.txt"
 argv_equals "suffixed claude id: full argv, no --effort anywhere" \
   "-p" "$PROMPT_ARG" "--model" "claude-opus-5-5-high" \
-  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m"
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "20m"
+
+# An -xhigh id bakes its effort in as well. agy 1.5.12: `--model gemini-4-neon-xhigh
+# --effort high` failed with "conflicts with --effort=high"; without the flag it ran.
+expect_pass "an -xhigh id runs" "$GOOD_STDOUT" \
+  --agy "$STUB" --model gemini-4-neon-xhigh --out "$TMP/run3x" "$TMP/prompt.txt"
+argv_equals "an -xhigh id: full argv, no --effort anywhere" \
+  "-p" "$PROMPT_ARG" "--model" "gemini-4-neon-xhigh" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "20m"
+expect_pass "a -max id runs" "$GOOD_STDOUT" \
+  --agy "$STUB" --model gemini-4-neon-max --out "$TMP/run3m" "$TMP/prompt.txt"
+argv_lacks "a -max id gets no --effort either" "--effort"
 
 # An id from a family the wrapper has no rule for gets no --effort: agy picks the level,
 # and a model that takes none still runs.
@@ -621,7 +633,7 @@ expect_pass "an id from another family runs" "$GOOD_STDOUT" \
   --agy "$STUB" --model gpt-oss-120b --out "$TMP/run3c" "$TMP/prompt.txt"
 argv_equals "another family: full argv, no --effort anywhere" \
   "-p" "$PROMPT_ARG" "--model" "gpt-oss-120b" \
-  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m"
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "20m"
 
 # an explicit --effort is passed through even for an id that will reject it,
 # so agy's own error surfaces instead of being silently dropped
@@ -629,7 +641,7 @@ expect_pass "explicit --effort passed through" "$GOOD_STDOUT" \
   --agy "$STUB" --model claude-opus-5-5-low --effort high --out "$TMP/run4" "$TMP/prompt.txt"
 argv_equals "explicit --effort is forwarded even to an id that rejects it" \
   "-p" "$PROMPT_ARG" "--model" "claude-opus-5-5-low" \
-  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "20m" \
   "--effort" "high"
 
 # ...and when agy rejects that combination, the error reaches the user rather than
@@ -684,18 +696,18 @@ CRLF_ARG="$(sent_prompt "$TMP/crlf-prompt.txt")"; CRLF_ARG="${CRLF_ARG%x}"
 expect_pass "CRLF prompt survives" "$GOOD_STDOUT" \
   --agy "$STUB" --out "$TMP/run-crlf" "$TMP/crlf-prompt.txt"
 argv_equals "CRLF prompt reaches agy byte-for-byte" \
-  "-p" "$CRLF_ARG" "--model" "gemini-4-argon" \
-  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
-  "--effort" "medium"
+  "-p" "$CRLF_ARG" "--model" "gemini-4-neon" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "20m" \
+  "--effort" "high"
 
 # A prompt without a final newline gets one before the blank line and the rules.
 printf 'no final newline' > "$TMP/nonl-prompt.txt"
 expect_pass "a prompt without a final newline runs" "$GOOD_STDOUT" \
   --agy "$STUB" --out "$TMP/run-nonl" "$TMP/nonl-prompt.txt"
 argv_equals "a prompt without a final newline: one newline, a blank line, the rules" \
-  "-p" "no final newline"$'\n\n'"$OUTPUT_RULES" "--model" "gemini-4-argon" \
-  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
-  "--effort" "medium"
+  "-p" "no final newline"$'\n\n'"$OUTPUT_RULES" "--model" "gemini-4-neon" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "20m" \
+  "--effort" "high"
 
 # A closed reader (`| head -1`) is not our error: exit conventionally, no traceback.
 python3 "$BIN" --check "$TMP/good.json" 2>"$TMP/.pipe-err" | head -1 >/dev/null
@@ -763,27 +775,29 @@ else
 fi
 
 # --- the default model: pinned, never discovered -------------------------------------
-# The owner pinned gemini-4-argon on 2026-10-14 (it was gemini-3.8-flash from 2026-09-25),
-# at --effort high until 2026-11-15 and at medium since. A newer model in the listing must NOT move the default, and the
-# default must not even ask for the listing.
+# The owner pinned gemini-4-neon at --effort high on 2026-11-19. Before it: gemini-4-argon
+# from 2026-10-14 (at high, then at medium from 2026-11-15), gemini-3.8-flash from
+# 2026-09-25. A newer model in the listing must NOT move the default, and the default must
+# not even ask for the listing.
 # Each case gets an empty XDG_CACHE_HOME: the old discovery code cached its answer there,
 # and a warm cache would let a reintroduced listing call hide behind "0 calls".
 
 : > "$STUB_MODELS_CALLS"
 XDG_CACHE_HOME="$TMP/cold-cache-1" expect_pass "the default run" "$GOOD_STDOUT" \
   --agy "$STUB" --out "$TMP/run-default1" "$TMP/prompt.txt"
-argv_equals "the default is gemini-4-argon at --effort medium" \
-  "-p" "$PROMPT_ARG" "--model" "gemini-4-argon" \
-  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
-  "--effort" "medium"
+argv_equals "the default is gemini-4-neon at --effort high" \
+  "-p" "$PROMPT_ARG" "--model" "gemini-4-neon" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "20m" \
+  "--effort" "high"
 expect_models_calls "the default asks agy for no model listing" 0
 expect_stderr "the model line labels the pinned default" \
-  "model:      gemini-4-argon (default), effort medium"
+  "model:      gemini-4-neon (default), effort high"
 
 # A listing that offers a newer model changes nothing: the default is pinned by decision.
 cat > "$TMP/models-newer.txt" <<'EOF2'
-gemini-5-argon-high	Gemini 5 Argon (High)
-gemini-4.1-argon-high	Gemini 4.1 Argon (High)
+gemini-5-neon-high	Gemini 5 Neon (High)
+gemini-4.1-neon-high	Gemini 4.1 Neon (High)
+gemini-4-neon-high	Gemini 4 Neon (High)
 gemini-4-argon-high	Gemini 4 Argon (High)
 gemini-3.8-flash-high	Gemini 3.8 Flash (High)
 EOF2
@@ -791,7 +805,7 @@ EOF2
 XDG_CACHE_HOME="$TMP/cold-cache-2" STUB_MODELS="$TMP/models-newer.txt" \
   expect_pass "a newer model in the listing does not move the default" "$GOOD_STDOUT" \
   --agy "$STUB" --out "$TMP/run-default2" "$TMP/prompt.txt"
-argv_has "the default stays gemini-4-argon" "--model" "gemini-4-argon"
+argv_has "the default stays gemini-4-neon" "--model" "gemini-4-neon"
 expect_models_calls "a newer listing is never consulted" 0
 
 # An explicit --model is still used as given, and labelled as such.
@@ -822,7 +836,7 @@ expect_fail "a banned id with an explicit --effort is refused too" 2 "is banned"
   "$TMP/prompt.txt"
 expect_calls "a banned id with --effort never reaches agy" 0
 expect_fail "the refusal points at the default" 2 \
-  "Omit --model for the default (gemini-4-argon, effort medium)" \
+  "Omit --model for the default (gemini-4-neon, effort high)" \
   --agy "$STUB" --model gemini-3.1-pro-high --out "$TMP/run-ban-hint" "$TMP/prompt.txt"
 
 # The ban is exact: ids that merely share a prefix still run.
@@ -845,17 +859,17 @@ STUB_STDOUT="$TMP/token-limit.json" \
   --agy "$STUB" --out "$TMP/run-retry1" "$TMP/prompt.txt"
 expect_calls "the retry costs exactly one more run" 2
 expect_stderr "the retry is announced with both efforts" \
-  "exceeded the output token limit; retrying at --effort low"
+  "exceeded the output token limit; retrying at --effort medium"
 expect_stderr "the summary names the effort that produced the review" \
-  "effort=low attempts=2"
+  "effort=medium attempts=2"
 ARGV_FILE_OVERRIDE="$STUB_ARGV.1" argv_equals "attempt 1 runs at the default effort" \
-  "-p" "$PROMPT_ARG" "--model" "gemini-4-argon" \
-  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
-  "--effort" "medium"
+  "-p" "$PROMPT_ARG" "--model" "gemini-4-neon" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "20m" \
+  "--effort" "high"
 ARGV_FILE_OVERRIDE="$STUB_ARGV.2" argv_equals "attempt 2 differs only in the effort" \
-  "-p" "$PROMPT_ARG" "--model" "gemini-4-argon" \
-  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
-  "--effort" "low"
+  "-p" "$PROMPT_ARG" "--model" "gemini-4-neon" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "20m" \
+  "--effort" "medium"
 
 # The failed attempt is the evidence that the retry was warranted, so it is kept.
 if [ -f "$TMP/run-retry1/out.json" ] && [ -f "$TMP/run-retry1/out-2.json" ]; then
@@ -888,17 +902,50 @@ expect_stderr "the exhausted ladder says agy has no budget flag" \
   "agy has no budget flag"
 expect_stderr "the exhausted ladder puts the thinking numbers on the record" \
   "54977 of its 55850"
-expect_stderr "the exhausted ladder offers a claude id as the other model" \
-  "a claude id (claude-opus-5-5)"
+expect_stderr_absent "the exhausted default ladder offers no model switch" \
+  "switch to"
+expect_stderr_absent "the exhausted default ladder does not offer a claude id" \
+  "claude-opus-5-5),"
 expect_stderr_absent "the exhausted ladder never suggests running 3.1 Pro" \
   "--model gemini-3.1-pro"
 
-# From the default (medium) the ladder has two rungs.
+# Any other model is pointed at the widest budget measured, Neon's.
 : > "$STUB_CALLS"
 STUB_STDOUT="$TMP/token-limit.json" \
-  expect_fail "the default's ladder is medium, then low" 1 "effort tried: medium, low" \
+  expect_fail "an exhausted argon ladder fails" 1 "effort tried: high, medium, low" \
+  --agy "$STUB" --model gemini-4-argon --out "$TMP/run-retry2a" "$TMP/prompt.txt"
+expect_stderr "the exhausted argon ladder offers gemini-4-neon" \
+  "switch to gemini-4-neon at the same effort"
+expect_stderr "the switch names the measured budgets" \
+  "more than 170000 output tokens"
+
+# An explicit xhigh, agy's rung above high, is stepped down too.
+: > "$STUB_CALLS"
+STUB_STDOUT="$TMP/token-limit.json" \
+  STUB_STDOUT_2="$TMP/good.json" \
+  expect_pass "a limit failure at xhigh is retried at high" "$GOOD_STDOUT" \
+  --agy "$STUB" --effort xhigh --out "$TMP/run-retry2x" "$TMP/prompt.txt"
+expect_calls "the xhigh retry costs exactly one more run" 2
+expect_stderr "the xhigh retry is announced" \
+  "exceeded the output token limit; retrying at --effort high"
+ARGV_FILE_OVERRIDE="$STUB_ARGV.2" argv_equals "the xhigh retry differs only in the effort" \
+  "-p" "$PROMPT_ARG" "--model" "gemini-4-neon" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "20m" \
+  "--effort" "high"
+: > "$STUB_CALLS"
+STUB_STDOUT="$TMP/token-limit.json" \
+  expect_fail "the ladder from max has five rungs" 1 \
+  "effort tried: max, xhigh, high, medium, low" \
+  --agy "$STUB" --effort max --out "$TMP/run-retry2m" "$TMP/prompt.txt"
+expect_calls "the ladder from max runs five times" 5
+
+# From the default (high) the ladder has all three rungs.
+: > "$STUB_CALLS"
+STUB_STDOUT="$TMP/token-limit.json" \
+  expect_fail "the default's ladder is high, medium, then low" 1 \
+  "effort tried: high, medium, low" \
   --agy "$STUB" --out "$TMP/run-retry2d" "$TMP/prompt.txt"
-expect_calls "the default's ladder runs twice" 2
+expect_calls "the default's ladder runs three times" 3
 
 # --no-retry is for a caller who wants the effort they asked for, or nothing.
 : > "$STUB_CALLS"
@@ -917,6 +964,20 @@ STUB_STDOUT="$TMP/token-limit.json" \
   --agy "$STUB" --model gemini-3.8-flash-high --out "$TMP/run-retry4" "$TMP/prompt.txt"
 expect_calls "a suffixed id runs once" 1
 argv_lacks "no sibling id is invented" "gemini-3.8-flash-medium" "--effort"
+
+# The rung handed back is the one below the id's own.
+: > "$STUB_CALLS"
+STUB_STDOUT="$TMP/token-limit.json" \
+  expect_fail "an -xhigh id is handed back one rung down" 1 \
+  "re-run as --model gemini-4-neon --effort high" \
+  --agy "$STUB" --model gemini-4-neon-xhigh --out "$TMP/run-retry4x" "$TMP/prompt.txt"
+expect_stderr_absent "a suffixed neon id is not told to switch to neon" "switch to"
+: > "$STUB_CALLS"
+STUB_STDOUT="$TMP/token-limit.json" \
+  expect_fail "a -low id is told it is at the bottom rung" 1 \
+  "already runs at low, the bottom rung" \
+  --agy "$STUB" --model gemini-3.8-flash-low --out "$TMP/run-retry4l" "$TMP/prompt.txt"
+expect_stderr_absent "a -low id is never told to raise its effort" "--effort medium"
 
 # An id the wrapper sent no effort for has no rung to step down from. It must not claim
 # the model has no effort setting: agy 1.3.4 accepted `--model gpt-oss-120b --effort medium`.
@@ -937,7 +998,7 @@ STUB_STDOUT="$TMP/token-limit.json" \
 expect_calls "the claude retry costs exactly one more run" 2
 ARGV_FILE_OVERRIDE="$STUB_ARGV.2" argv_equals "the claude retry differs only in the effort" \
   "-p" "$PROMPT_ARG" "--model" "claude-opus-5-5" \
-  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "9m" \
+  "--disable-slash-commands" "--output-format" "json" "--print-timeout" "20m" \
   "--effort" "medium"
 
 # When the reviewer already is a Claude model, "switch to a claude id" is no way out.
@@ -948,8 +1009,8 @@ STUB_STDOUT="$TMP/token-limit.json" \
 expect_calls "the claude ladder stops at low" 3
 expect_stderr "the exhausted claude ladder still offers the split" \
   "split the bundle and review it in parts"
-expect_stderr_absent "the exhausted claude ladder does not offer a claude id" \
-  "a claude id"
+expect_stderr "the exhausted claude ladder offers gemini-4-neon, the wider budget" \
+  "switch to gemini-4-neon at the same effort"
 
 # Only THIS error is retried. Anything else means a second run buys the same answer
 # twice — the exact waste this whole branch exists to avoid.
@@ -997,7 +1058,15 @@ expect_stderr "a large prompt at high effort is flagged before the run" \
   "KB of prompt at --effort high"
 expect_pass "a large prompt at the default effort runs" "$GOOD_STDOUT" \
   --agy "$STUB" --out "$TMP/run-big-default" "$TMP/big-prompt.txt"
-expect_stderr_absent "a large prompt at the default medium is not flagged" "KB of prompt at"
+expect_stderr "a large prompt at the default high is flagged too" \
+  "KB of prompt at --effort high"
+expect_pass "a large prompt at an explicit medium runs" "$GOOD_STDOUT" \
+  --agy "$STUB" --effort medium --out "$TMP/run-big-medium" "$TMP/big-prompt.txt"
+expect_stderr_absent "a large prompt at medium is not flagged" "KB of prompt at"
+expect_pass "a large prompt at xhigh runs" "$GOOD_STDOUT" \
+  --agy "$STUB" --effort xhigh --out "$TMP/run-big-xhigh" "$TMP/big-prompt.txt"
+expect_stderr "a large prompt at xhigh is flagged with its own effort" \
+  "KB of prompt at --effort xhigh"
 expect_pass "an ordinary prompt runs unremarked" \
   "$GOOD_STDOUT" --agy "$STUB" --out "$TMP/run-small" "$TMP/prompt.txt"
 expect_stderr_absent "an ordinary prompt is not flagged" "KB of prompt at --effort high"
@@ -1083,9 +1152,9 @@ expect_pass "a multi-file diff bigger than a part is one conversation" "$MT_STDO
   --agy "$STUB" --part-kb 1 --out "$TMP/run-mt1" "$TMP/mt-prompt.txt"
 expect_calls "the whole multi-turn review is one agy run" 1
 argv_equals "multi-turn argv: the turns on stdin, no -p, nothing unexpected" \
-  "--model" "gemini-4-argon" "--disable-slash-commands" \
+  "--model" "gemini-4-neon" "--disable-slash-commands" \
   "--input-format" "stream-json" "--output-format" "stream-json" \
-  "--print-timeout" "9m" "--effort" "medium"
+  "--print-timeout" "20m" "--effort" "high"
 stdin_check "turn 1 carries the instructions and the whole diff, then one turn per part" '
 import json, os
 raw = open(os.environ["STDIN_FILE"], encoding="utf-8", newline="").read()
@@ -1127,7 +1196,7 @@ fi
 expect_stderr "the turn plan is announced" \
   "turns:      4: one loads the whole diff, 3 review it in parts of up to 1 KB"
 expect_stderr "the summary names parts and turns" \
-  "model=gemini-4-argon effort=medium attempts=1 parts=3 turns=4 conversation=stub-conv tokens=400"
+  "model=gemini-4-neon effort=high attempts=1 parts=3 turns=4 conversation=stub-conv tokens=400"
 
 # The default part size: a small diff stays one turn, a big one is split by default.
 expect_pass "a diff within one default part is one turn" "$GOOD_STDOUT" \
@@ -1255,10 +1324,10 @@ STUB_STREAM_1="$TMP/s-limit.ndjson" expect_pass "a limit failure in one turn is 
   "$MT_STDOUT" --agy "$STUB" --part-kb 1 --out "$TMP/run-ml1" "$TMP/mt-prompt.txt"
 expect_calls "the multi-turn retry costs one more run" 2
 expect_stderr "the multi-turn retry is announced" \
-  "exceeded the output token limit; retrying at --effort low"
+  "exceeded the output token limit; retrying at --effort medium"
 expect_stderr "the multi-turn summary names the effort that produced it" \
-  "effort=low attempts=2 parts=3 turns=4"
-ARGV_FILE_OVERRIDE="$STUB_ARGV.2" argv_has "the multi-turn retry runs at low" "--effort" "low"
+  "effort=medium attempts=2 parts=3 turns=4"
+ARGV_FILE_OVERRIDE="$STUB_ARGV.2" argv_has "the multi-turn retry runs at medium" "--effort" "medium"
 if [ -f "$TMP/run-ml1/out.ndjson" ] && [ -f "$TMP/run-ml1/out-2.ndjson" ] \
    && [ -f "$TMP/run-ml1/in.ndjson" ] && [ -f "$TMP/run-ml1/in-2.ndjson" ] \
    && grep -q "output token limit" "$TMP/run-ml1/out.ndjson"; then

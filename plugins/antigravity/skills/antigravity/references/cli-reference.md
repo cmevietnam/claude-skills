@@ -110,7 +110,7 @@ to every model.
 | -------------------------------- | ---------------------------------------------------------------------------------- |
 | `-p`, `--print`, `--prompt`      | Headless run                                                                       |
 | `--model`                        | Model id; `agy models` lists them                                                  |
-| `--effort`                       | `low`, `medium`, `high` — only unsuffixed `gemini-*` ids accept it                 |
+| `--effort`                       | `low`, `medium`, `high`, `xhigh`, `max` — base `gemini-*`, `claude-*` ids          |
 | `--agent`                        | Select a named agent (`agy agents`)                                                |
 | `--output-format`                | `text` (default), `json`, `stream-json`                                            |
 | `--input-format`                 | `text` (default), `stream-json`; the latter requires `--output-format stream-json` |
@@ -148,8 +148,21 @@ is why the remaining lever is to shrink the input.
   material that resembles existing copyrighted works"). The figure is the 2026-10-15
   `--repo` overrun, `output_tokens: 69998` of which 63058 thinking (SKILL.md).
 
+- `gemini-4-neon-high`: **more than 170000**, not reached. Measured on 2026-11-19 (agy
+  1.5.12) with a prompt asking for "n: n squared" lines until cut off: one response (one
+  `gen_metadata` row in agy's record, no continue step) ran until `--print-timeout 22m`
+  ended it at 11570 lines, 170961 bytes, with `finished_reason: print_timeout` and no
+  token counts. The same format, completed at 3000 lines, was 39436 bytes for
+  `output_tokens: 40351` of which `thinking_tokens: 915`: one token a byte, so the cut
+  answer was about 171000 visible tokens. A first wording, which named 60000 lines,
+  was declined by the model itself as longer than one response can be.
+
 So a Claude id has close to twice Argon's room, but a run that reaches it is expensive:
-see Quota below.
+see Quota below. Neon has more room than either, and at the rate that probe wrote, about
+7800 tokens a minute, a 9-minute `--print-timeout` ends a Neon answer near 70000 tokens:
+for Neon the wall clock comes before the budget. So `agy-review`'s default `--timeout`
+went from 9m to 20m on 2026-11-20, about 156000 tokens at that rate. Whether thinking
+streams at the same rate was not measured.
 
 **There is no long-output setting to turn on.** agy 1.5.9's settings page
 (`antigravity.google/docs/settings`, read 2026-11-15) lists no key for output length or
@@ -270,10 +283,14 @@ window and more than half a week.
 
 ## Models
 
-`agy models` prints `id<TAB>label`. Live list on 2026-11-15 (agy 1.5.9, a Google AI Pro
-account), in the order printed:
+`agy models` prints `id<TAB>label`. Live list on 2026-11-19 (agy 1.5.12, a Google AI Pro
+sign-in), in the order printed:
 
 ```
+gemini-4-neon-high              Gemini 4 Neon (High)
+gemini-4-neon-xhigh             Gemini 4 Neon (XHigh)
+gemini-4-neon-medium            Gemini 4 Neon (Medium)
+gemini-4-neon-low               Gemini 4 Neon (Low)
 gemini-4-argon-medium           Gemini 4 Argon (Medium)
 gemini-4-argon-high             Gemini 4 Argon (High)
 gemini-4-argon-low              Gemini 4 Argon (Low)
@@ -281,6 +298,7 @@ gemini-4-hydrogen-high          Gemini 4 Hydrogen (High)
 gemini-4-hydrogen-xhigh         Gemini 4 Hydrogen (XHigh)
 gemini-4-hydrogen-medium        Gemini 4 Hydrogen (Medium)
 gemini-4-hydrogen-low           Gemini 4 Hydrogen (Low)
+gemini-pro-orchestrator-neon    Orchestrator (Neon)
 gemini-pro-orchestrator-g1-pro  Orchestrator (Argon)
 gemini-3.8-flash-high           Gemini 3.8 Flash (High)
 gemini-3.8-flash-medium         Gemini 3.8 Flash (Medium)
@@ -290,13 +308,16 @@ claude-sonnet-5-5-low/medium/high
 gpt-oss-120b-medium             GPT-OSS 120B (Medium)
 ```
 
-The lists of 2026-11-01 (agy 1.4.10, then recorded as a Google AI Ultra account) and
-2026-10-14 (agy 1.3.4) had the same ids without the four Hydrogen lines and the
-Orchestrator line.
+The list of 2026-11-15 (agy 1.5.9) had the same ids without the four Neon lines and
+Orchestrator (Neon). agy 1.5.12's changelog adds Neon only "when you connect with a
+`GEMINI_API_KEY`", yet a Google sign-in listed it, as it listed Hydrogen on 2026-11-15,
+which 1.5.8's changelog names only for an API key and Application Default Credentials. The lists of 2026-11-01 (agy 1.4.10, then recorded as a Google AI Ultra account)
+and 2026-10-14 (agy 1.3.4) also lacked the four Hydrogen lines and Orchestrator (Argon).
 
 `agy-review`'s default is none of these lines as printed: it is the base id
-`gemini-4-argon` with `--effort medium`, which selects the same model and level as
-`gemini-4-argon-medium`.
+`gemini-4-neon` with `--effort high`, which selects the same model and level as
+`gemini-4-neon-high`. agy's own record of a probe run that way on 2026-11-19 (table
+`gen_metadata` of the conversation's `.db`) names `gemini-4-neon-high`.
 
 The lines depend on the account's plan, and they change without an agy update. Google's
 models page (`antigravity.google/docs/models`, read 2026-11-15) lists Gemini 4 Argon and
@@ -337,7 +358,13 @@ $ agy -p "..." --model gemini-3.8-flash-low --effort high
 `--model gemini-3.8-flash --effort high` works, as does `--effort low` with no `--model`.
 Argon follows the same rule (agy 1.3.4): `--model gemini-4-argon --effort high` and
 `--effort medium` both returned `SUCCESS`, and `--model gemini-4-argon-low --effort high`
-failed with `--model gemini-4-argon-low conflicts with --effort=high`.
+failed with `--model gemini-4-argon-low conflicts with --effort=high`. Neon takes it on
+the base id too: `--model gemini-4-neon --effort high` returned `SUCCESS` (agy 1.5.12,
+2026-11-19). The `-xhigh` ids follow the rule as well (agy 1.5.12, 2026-11-20):
+`--model gemini-4-neon-xhigh --effort high` failed with `--model gemini-4-neon-xhigh
+conflicts with --effort=high`, while `--model gemini-4-neon-xhigh` alone and
+`--model gemini-4-neon --effort xhigh` returned `SUCCESS`. agy 1.5.12's `--help` lists
+`--effort low|medium|high|xhigh|max`; no `-max` id was listed.
 
 The Claude and GPT-OSS ids follow it as well (agy 1.3.4):
 
@@ -366,14 +393,14 @@ $ agy -p "..." --model claude-sonnet-4-6 --effort high
 Those ids are gone from the listing, and the same wording is now what an unknown id gets
 when `--effort` is passed (see the end of this section).
 
-`agy-review` applies its **default** effort to an unsuffixed `gemini-*` or `claude-*` id
-only. Any other family gets no flag and `agy` picks the level, so a model that takes no
-effort still runs. It forwards an **explicit** `--effort` unconditionally, including to
-ids that will reject it, so `agy`'s own error reaches you instead of being silently
-dropped.
+`agy-review` applies its **default** effort to a `gemini-*` or `claude-*` id without an
+effort suffix (`-low`, `-medium`, `-high`, `-xhigh`, `-max`) only. Any other family gets
+no flag and `agy` picks the level, so a model that takes no effort still runs. It
+forwards an **explicit** `--effort` unconditionally, including to ids that will reject
+it, so `agy`'s own error reaches you instead of being silently dropped.
 
-It is also why its pinned default is the **unsuffixed** `gemini-4-argon`: every id the
-listing offers carries a suffix, and pinning `gemini-4-argon-high` would turn the default
+It is also why its pinned default is the **unsuffixed** `gemini-4-neon`: every id the
+listing offers carries a suffix, and pinning `gemini-4-neon-high` would turn the default
 `--effort high` into the conflict above.
 
 A long prompt that invites a long answer can also fail after the model has run:
@@ -390,7 +417,7 @@ An unknown model is **never silently substituted**: exit 1 and `"status":"ERROR"
 `.error` holds depends on `--effort` (agy 1.3.4, `--model gemini-9-nope`):
 
 - without `--effort`: `model gemini-9-nope is not recognized as a known model or custom
-  model in settings`, followed by `Available models:` and the full list of labels;
+model in settings`, followed by `Available models:` and the full list of labels;
 - with `--effort high` (and so with any `--effort`, which `agy-review` sends with every
   unsuffixed `gemini-*` or `claude-*` id): only
   `--effort is not supported for model "gemini-9-nope"`, and no list.

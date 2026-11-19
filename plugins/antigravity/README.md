@@ -45,27 +45,33 @@ build; a consumer Gemini Pro subscription does not change it. Full record in
 `skills/antigravity/references/why-not-gemini-cli.md`.
 
 `agy` is also the better tool for this job: it has a real effort ladder
-(`--effort low|medium|high`) and serves Claude and GPT-OSS models next to Gemini, so a
-two-reviewer diff is one flag.
+(`--effort low|medium|high|xhigh|max`) and serves Claude and GPT-OSS models next to
+Gemini, so a two-reviewer diff is one flag.
 
-## The default model: `gemini-4-argon`, effort medium
+## The default model: `gemini-4-neon`, effort high
 
-With no `--model`, `agy-review` reviews with `gemini-4-argon` at `--effort medium` (the
-owner's decision of 2026-11-15; it was `high` before). A `claude-*` base id runs at
-`--effort high`. The
-default is pinned in `bin/agy-review` (`DEFAULT_MODEL`). A newer model is adopted by
-editing that line, never automatically. `--model <id>` picks a different reviewer.
+With no `--model`, `agy-review` reviews with `gemini-4-neon` at `--effort high` (the
+owner's decision of 2026-11-19; before it, `gemini-4-argon`, at `medium` from 2026-11-15).
+Any other unsuffixed `gemini-*` or `claude-*` id runs at `--effort high` too. The default
+is pinned in `bin/agy-review` (`DEFAULT_MODEL`, `DEFAULT_EFFORT`). A newer model is
+adopted by editing that line, never automatically. `--model <id>` picks a different
+reviewer.
 
-`agy` offers Argon by plan: paid Google AI Pro (or a trial on eligible premium devices),
-Ultra and Gemini Enterprise, per Google's models page on 2026-11-15. On any other account
-the default fails with `agy`'s `invalid model selection`; pass `--model gemini-3.8-flash`,
-the previous default, to review there.
+`agy` 1.5.12 listed Neon on a Google AI Pro sign-in on 2026-11-19; which plans offer it
+was not checked, and the model list changes without an agy update. On an account without
+it the default fails with `agy`'s `invalid model selection`; pass
+`--model gemini-3.8-flash` to review there.
 
 `gemini-3.1-pro` is banned. `--model gemini-3.1-pro[-high|-low]` exits 2 before `agy`
 runs, and no guidance in this plugin suggests it. For a harder review or a second opinion,
 use a Claude id such as `claude-opus-5-5`, which `agy-review` runs at `--effort high`.
-Its output budget is 128000 tokens a response (Argon high: about 70000), but on Google AI
-Pro its quota is small: read `agy -p /quota` first.
+Its output budget is 128000 tokens a response (Argon high: about 70000; Neon high: more
+than 170000, measured 2026-11-19), but on Google AI Pro its quota is small: read
+`agy -p /quota` first.
+
+Neon writes about 7800 tokens a minute, so a 9-minute `--print-timeout` ended a long
+Neon answer near 70000 tokens, well before its budget. The default `--timeout` is
+20m since 2026-11-20 (9m before).
 
 ## Diffs, not whole files
 
@@ -83,7 +89,8 @@ attempt is already paid for — and thinking tokens dominate that budget (a succ
 92 KB review spent 54977 of its 55850 output tokens thinking). `agy --help` has no flag
 that raises it: only `--model` and `--effort` move it.
 
-So `agy-review` steps the effort one rung down and runs again (high → medium → low),
+So `agy-review` steps the effort one rung down and runs again (max → xhigh → high →
+medium → low; from the default, high → medium → low),
 keeps every attempt's raw report, and prints which effort actually produced the review —
 findings are attributed to that, not to the effort you asked for.
 
@@ -93,7 +100,8 @@ whole diff, then one turn per part reviews that part's files with the rest as co
 so each part gets the whole budget and cross-file findings survive. `--part-kb N` sizes
 the parts, `--single-turn` keeps the one-prompt run, and `--no-retry` turns the ladder
 off. The turn that loads the diff carries all of it, so a diff over 170 KB is refused
-before it runs: `agy` would cut that turn.
+before it runs: `agy` would cut that turn. On any model but Neon the failure names
+`gemini-4-neon` as the wider budget; from Neon no measured model has more room.
 
 ## Letting the reviewer read the repo, for one run
 

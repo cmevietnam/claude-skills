@@ -55,7 +55,8 @@ Four attempts, four identical rejections:
 ## One structural advantage worth keeping in mind
 
 `gemini-cli` had no reasoning-effort control at all; depth came only from the model choice.
-`agy` exposes `--effort low|medium|high` and serves Claude and GPT-OSS models alongside
+`agy` exposes `--effort` (low, medium, high; xhigh and max too by agy 1.5.12) and serves
+Claude and GPT-OSS models alongside
 Gemini from the same binary, which makes a genuine two-reviewer diff a one-flag change.
 
 ## Findings from that work that still apply
