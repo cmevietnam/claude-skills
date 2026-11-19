@@ -28,8 +28,9 @@ is still yours to set.
 output budget and dominate it — a successful 92 KB review used 55,850 output tokens of
 which 54,977 were thinking. On that bundle `--effort high` hit the limit twice while
 `--effort medium` succeeded on the identical prompt. Reach for `high` on a small diff, not
-on a whole subsystem. Since 2026-11-15 the default is `medium` already; pass
-`--effort high` yourself for a small diff that deserves it.
+on a whole subsystem. The default is `high` (since 2026-11-19; `medium` from 2026-11-15),
+and the retry ladder steps it down after a limit failure, which costs the failed run:
+pass `--effort medium` yourself for a large bundle.
 
 Two more things separate a useful review from a list of platitudes:
 
@@ -119,11 +120,11 @@ git diff main...HEAD > "$S/diff.txt"     # committed only — omits uncommitted 
 
 cat "$S/preamble.txt" "$S/instructions.txt" "$S/diff.txt" > "$S/prompt.txt"
 
-agy-review --out "$S/argon" "$S/prompt.txt"        # gemini-4-argon, effort medium
+agy-review --out "$S/neon" "$S/prompt.txt"        # gemini-4-neon, effort high
 ```
 
-With no `--model`, `agy-review` uses the pinned default, `gemini-4-argon` at
-`--effort medium`, and prints it on its `model:` line. The effort on the summary line can be
+With no `--model`, `agy-review` uses the pinned default, `gemini-4-neon` at
+`--effort high`, and prints it on its `model:` line. The effort on the summary line can be
 lower if the retry ladder stepped it down; attribute the findings to that one.
 
 Without `set -e` and the emptiness check, a missing base branch leaves `diff.txt` empty,
@@ -159,13 +160,14 @@ longer needed below 170 KB, and it cost cross-file findings: each run saw only i
 files. In the conversation every turn sees all of them, and on 2026-11-01 each of two
 planted cross-file defects was found from both sides.
 
-The other way to keep the effort is a model with a different budget: a Claude id such as
-`claude-opus-5-5` (128000 output tokens a response, measured on 2026-11-15, against about
-70000 for Argon high). Its quota on Google AI Pro is small, so read `agy -p /quota` first.
-Never `gemini-3.1-pro`, which is banned and which
-`agy-review` refuses. That changes the reviewer, so it is a
-second opinion rather than the same review — which on security-sensitive code you wanted
-anyway.
+The other way to keep the effort is a model with a bigger budget. From the default there
+is none: Neon high wrote more than 170000 tokens in one response on 2026-11-19 without
+reaching its budget, against 128000 for a Claude id such as `claude-opus-5-5` (measured
+2026-11-15) and about 70000 for Argon high. From any other model, switch to
+`gemini-4-neon`; `agy-review` names it when a run fails at the limit. Never
+`gemini-3.1-pro`, which is banned and which `agy-review` refuses. That changes the
+reviewer, so it is a second opinion rather than the same review — which on
+security-sensitive code you wanted anyway.
 
 ## Reading the result
 
@@ -185,7 +187,7 @@ and exits 0, so a failed run is indistinguishable from a quiet one.
 
 ## Choosing the model
 
-Start with the default: `gemini-4-argon` at `--effort medium`. **Never use
+Start with the default: `gemini-4-neon` at `--effort high`. **Never use
 `gemini-3.1-pro`**, not even for subtle concurrency, cross-module invariants or
 cryptographic logic. It is banned, and `agy-review` refuses it. For those, add a Claude
 reviewer (below) instead.

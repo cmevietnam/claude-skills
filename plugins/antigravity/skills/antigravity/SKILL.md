@@ -1,6 +1,6 @@
 ---
 name: antigravity
-description: Use when the user asks to run Antigravity CLI or `agy` for code review, a second opinion, code analysis, or a headless agent run — "ask antigravity", "agy review this", "have gemini look at it", "second opinion on this diff". Google's Antigravity CLI, which replaced Gemini CLI for personal accounts; reviews with gemini-4-argon at effort medium by default, asks for diffs rather than whole files, and never uses gemini-3.1-pro. Reports findings verbatim before any code changes.
+description: Use when the user asks to run Antigravity CLI or `agy` for code review, a second opinion, code analysis, or a headless agent run — "ask antigravity", "agy review this", "have gemini look at it", "second opinion on this diff". Google's Antigravity CLI, which replaced Gemini CLI for personal accounts; reviews with gemini-4-neon at effort high by default, asks for diffs rather than whole files, and never uses gemini-3.1-pro. Reports findings verbatim before any code changes.
 ---
 
 # Antigravity CLI (`agy`)
@@ -155,27 +155,29 @@ git diff main...HEAD > "$S/diff.txt"   # or: git diff (unstaged) / --cached / <S
   cat "$S/diff.txt"
 } > "$S/prompt.txt"
 
-agy-review --out "$S/argon" "$S/prompt.txt"   # gemini-4-argon, effort medium
+agy-review --out "$S/neon" "$S/prompt.txt"   # gemini-4-neon, effort high
 ```
 
 `agy-review` adds `--disable-slash-commands`, `--output-format json` and
-`--print-timeout 9m`, keeps `out.json` and `err.txt` in `--out`, validates the envelope,
-and prints the review only if there is one. A non-zero exit means no review happened —
+`--print-timeout 20m` (9m until 2026-11-20, which ended long Neon answers early), keeps
+`out.json` and `err.txt` in `--out`, validates the envelope, and prints the review only
+if there is one. A non-zero exit means no review happened —
 report that, do not report a clean result.
 
 It prints the model it chose, and where the id came from, before the run:
 
 ```
-model:      gemini-4-argon (default), effort medium
+model:      gemini-4-neon (default), effort high
 ```
 
 **That line is what you attribute the findings to** — not "the default", and not the id
 you expected. A fallback says so in the same place.
 
-Its **default** effort is `medium` for an unsuffixed `gemini-*` id and `high` for an
-unsuffixed `claude-*` id, and applies to those alone: a suffixed id carries its own level and conflicts with the flag, and any other family is
-left for `agy` to pick the level. An **explicit** `--effort` is always forwarded, so
-`agy`'s own error surfaces instead of being silently dropped — meaning
+Its **default** effort is `high` for an unsuffixed `gemini-*` or `claude-*` id, and
+applies to those alone: a suffixed id (`-low`, `-medium`, `-high`, `-xhigh`, `-max`)
+carries its own level and conflicts with the flag,
+and any other family is left for `agy` to pick the level. An **explicit** `--effort` is
+always forwarded, so `agy`'s own error surfaces instead of being silently dropped — meaning
 `agy-review --model gemini-3.8-flash-high --effort high` still fails, by design.
 
 `--disable-slash-commands` matters: a diff containing a line that starts with `/` would
@@ -247,31 +249,32 @@ both rules in the prompt as written above.
 
 ## Models
 
-### The default is `gemini-4-argon` at `--effort medium`, pinned
+### The default is `gemini-4-neon` at `--effort high`, pinned
 
-The user's decisions: every review runs on `gemini-4-argon` (since 2026-10-14; it was
-`gemini-3.8-flash` from 2026-09-25) at `--effort medium` (since 2026-11-15; `high` before)
-unless they name another model or effort. A `claude-*` base id keeps `--effort high`: its
-output budget is 128000 tokens a response, against about 70000 for Argon. Both are pinned
-in `bin/agy-review` (`DEFAULT_MODEL`, `DEFAULT_EFFORT`, `CLAUDE_DEFAULT_EFFORT`), not
-discovered. A newer model appearing in `agy models` changes nothing until someone edits
-them. The base id is used, not `gemini-4-argon-high`, so the effort travels as a flag and
-the retry ladder can step it down (see Failure modes).
+The user's decision of 2026-11-19: every review runs on `gemini-4-neon` at `--effort high`
+unless they name another model or effort. Before it: `gemini-4-argon` from 2026-10-14 (at
+`high`, then at `medium` from 2026-11-15), and `gemini-3.8-flash` from 2026-09-25. A
+`claude-*` base id runs at `--effort high` too. Both are pinned in `bin/agy-review`
+(`DEFAULT_MODEL`, `DEFAULT_EFFORT`, `CLAUDE_DEFAULT_EFFORT`), not discovered. A newer
+model appearing in `agy models` changes nothing until someone edits them. The base id is
+used, not `gemini-4-neon-high`, so the effort travels as a flag and the retry ladder can
+step it down (see Failure modes): from the default it runs high, then medium, then low.
 
-`agy` offers Argon by plan. Google's models page (read 2026-11-15) lists it for paid
-Google AI Pro plans (or a trial on eligible premium devices), Ultra and Enterprise, and on
-Pro it has a weekly counter of its own in `agy -p /quota`. The list changes without an agy
-update: on 2026-11-15 the Argon ids were missing from `agy models` for some hours on
-agy 1.5.9, then back. On an account without it `agy` rejects the id with `invalid model
-selection` (seen on 2026-10-14, before the account was upgraded) and `agy-review` exits 1:
-report that, and re-run with `--model gemini-3.8-flash` only if the user asks for it.
-Seeing Argon in the Gemini app does not mean `agy` has it; `agy models` decides.
+`agy` offers models by plan, and the list changes without an agy update. On 2026-11-19
+agy 1.5.12 listed `gemini-4-neon` (low, medium, high, xhigh) on this Google AI Pro
+sign-in, although its changelog names Neon only for `GEMINI_API_KEY` connections; which
+plans offer it was not checked. Argon flipped the same way: on 2026-11-15 its ids were
+missing from `agy models` for some hours on agy 1.5.9, then back. On an account without
+the default `agy` rejects the id with `invalid model selection` (seen for Argon on
+2026-10-14, before the account was upgraded) and `agy-review` exits 1: report that, and
+re-run with `--model gemini-3.8-flash` only if the user asks for it. Seeing a model in the
+Gemini app does not mean `agy` has it; `agy models` decides.
 
 Through `agy-review` that failure probably reads `--effort is not supported for model
-"gemini-4-argon"`, not "not recognized", because the default sends `--effort medium`. This
+"gemini-4-neon"`, not "not recognized", because the default sends `--effort high`. This
 is inferred from an unknown id (`gemini-9-nope`) run on agy 1.3.4, not reproduced on an
-account without Argon. When the default fails with that message, run `agy models` before
-concluding anything about effort.
+account without the model. When the default fails with that message, run `agy models`
+before concluding anything about effort.
 
 ### Never use `gemini-3.1-pro`
 
@@ -291,17 +294,18 @@ tell the user before a large run. When calling `agy` directly
 
 ### What `agy models` lists
 
-`agy models` is authoritative and needs auth. As of 2026-11-15 (agy 1.5.9, a Google AI
+`agy models` is authoritative and needs auth. As of 2026-11-19 (agy 1.5.12, a Google AI
 Pro account) it lists:
 
-| Model                                                   | Notes                                                                  |
-| ------------------------------------------------------- | ---------------------------------------------------------------------- |
-| `gemini-4-argon-high` / `-medium` / `-low`              | The default (base id + `--effort medium`). Paid Pro, Ultra, Enterprise |
-| `gemini-4-hydrogen-*` (low, medium, high, xhigh)        | New by 2026-11-15, on every plan. Not yet tried as a reviewer          |
-| `gemini-pro-orchestrator-g1-pro`                        | Orchestrator (Argon): plans with Argon, fixed configuration            |
-| `gemini-3.8-flash-high` / `-medium` / `-low`            | The previous default. Fast, cheap, good on diffs                       |
-| `claude-opus-5-5-*`, `claude-sonnet-5-5-*` (three each) | A genuinely different training run — best for a true second opinion    |
-| `gpt-oss-120b-medium`                                   | Open-weights option. Google removes it on 2026-11-18                   |
+| Model                                                   | Notes                                                                 |
+| ------------------------------------------------------- | --------------------------------------------------------------------- |
+| `gemini-4-neon-*` (low, medium, high, xhigh)            | The default (base id + `--effort high`). New by 2026-11-19            |
+| `gemini-4-argon-high` / `-medium` / `-low`              | The previous default. Paid Pro, Ultra, Enterprise                     |
+| `gemini-4-hydrogen-*` (low, medium, high, xhigh)        | New by 2026-11-15, on every plan. Not yet tried as a reviewer         |
+| `gemini-pro-orchestrator-neon` / `-g1-pro`              | Orchestrator (Neon) / (Argon): plans with it, fixed configuration     |
+| `gemini-3.8-flash-high` / `-medium` / `-low`            | The default before Argon. Fast, cheap, good on diffs                  |
+| `claude-opus-5-5-*`, `claude-sonnet-5-5-*` (three each) | A genuinely different training run — best for a true second opinion   |
+| `gpt-oss-120b-medium`                                   | Open-weights. Removal was set for 2026-11-18; still listed 2026-11-19 |
 
 The listing of 2026-09-25 (agy 1.2.11) also had `gemini-3.7-flash-*`, `gemini-3.6-flash-*`,
 `gemini-3.1-pro-high` / `-low` (**banned**: never use, `agy-review` refuses it) and
@@ -328,7 +332,7 @@ model "claude-sonnet-4-6"`); the 5.5 ids take it like a Gemini id does.
 `agy-review` handles this: given no explicit `--effort` it applies the default only to an
 unsuffixed `gemini-*` or `claude-*` id, and passes an explicit one straight through so
 `agy`'s own error surfaces rather than being swallowed. It is also why the pinned default
-is the base id: `gemini-4-argon-high` would make the default effort an error. So
+is the base id: `gemini-4-neon-high` would make the default effort an error. So
 `--model claude-opus-5-5` runs at `--effort high` and is stepped down on an output-limit
 failure, while `--model claude-opus-5-5-high` runs once at the level in its id and reports
 `effort=n/a`.
@@ -373,7 +377,8 @@ explore runs `find`, which is denied and empties the review; with the list it re
 `view_file` alone.
 
 **Give it a longer `--timeout`.** Reading files first makes the run slower: one Argon
-high `--repo` review was still working at the default 9 minutes, and agy then printed
+high `--repo` review was still working at the then-default 9 minutes (20 since
+2026-11-20), and agy then printed
 `print timeout ... returning partial output` and reported SUCCESS. `agy-review` refuses
 that run (exit 1). The same review with `--timeout 30m` finished in 377 s.
 
@@ -458,9 +463,13 @@ envelope does not carry the prompt.
   `output_tokens: 55850` of which `thinking_tokens: 54977`. `agy --help` offers no flag
   for the budget — only `--model` and `--effort` move it. The budget is per model:
   128000 output tokens for `claude-opus-5-5-high` (measured 2026-11-15), about 70000
-  with thinking for Argon high (`references/cli-reference.md`).
+  with thinking for Argon high, and more than 170000 for Neon high, which a 22-minute
+  answer did not reach (2026-11-19; `references/cli-reference.md`). With Neon the wall
+  clock comes first: at about 7800 tokens a minute, 9 minutes ended a long answer near
+  70000 tokens, so the default `--timeout` is 20m since 2026-11-20.
 
-  `agy-review` **retries one effort rung lower** (high → medium → low), keeps each
+  `agy-review` **retries one effort rung lower** (max → xhigh → high → medium → low;
+  from the default, high → medium → low), keeps each
   attempt's raw report (`out.json`, `out-2.json`, …), and prints
   `effort=… attempts=…` — the effort on that line is the one the findings are attributed
   to, not the one you asked for.
@@ -468,9 +477,10 @@ envelope does not carry the prompt.
   **To keep the effort, give each turn less.** The budget is per turn, so a git diff is
   reviewed as one conversation in parts by default (see "A diff bigger than one part"
   above), and `--part-kb` makes the parts smaller. `--no-retry` turns the ladder off so
-  a run either answers at the effort you asked for or fails. A Claude id has a different
-  budget, also at full effort (never `gemini-3.1-pro`). Bounding the answer in the
-  prompt buys little — the visible answer was ~2% of that budget.
+  a run either answers at the effort you asked for or fails. On any other model,
+  `gemini-4-neon` has the widest budget measured and the failure message names it;
+  from Neon, no model has more room (never `gemini-3.1-pro`). Bounding the answer in
+  the prompt buys little — the visible answer was ~2% of that budget.
 
   Invisible to anything that reads `.response` without checking `.error`; `agy-review`
   catches it.
