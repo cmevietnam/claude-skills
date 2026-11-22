@@ -1,6 +1,6 @@
 ---
 name: codex
-description: Use when the user asks to run Codex CLI (codex exec, codex resume, codex fork, codex review) or references OpenAI Codex for code analysis, code review, refactoring, or automated editing. Runs OpenAI's Codex agent non-interactively on gpt-6.1-sol at effort xhigh by default, pinned on every call rather than taken from ~/.codex/config.toml.
+description: Run, resume, or fork Codex CLI sessions non-interactively for code analysis, review, refactoring, or editing. Defaults to GPT-6.2 Sol at xhigh reasoning effort.
 ---
 
 # Codex
@@ -9,9 +9,7 @@ Codex is consulted precisely because its verdict may differ from mine. Everythin
 this skill follows from that: the run is the cheap part, and **getting Codex's words to
 the user intact, before any diff, is the whole point**.
 
-Verified against Codex CLI **v0.162.1** (2026-10-20). Flags and models move between
-releases — after `brew upgrade --cask codex` or `codex update`, re-verify with
-`codex exec --help` and re-read `~/.codex/models_cache.json`.
+The default model and effort were tested on Codex CLI **0.171.0** (2026-11-22).
 
 ## Hard rule: present, then stop
 
@@ -37,18 +35,10 @@ Full protocol and the incident behind it: `references/reporting-findings.md`.
 
 ## Running a task
 
-- **Model**: always pass `-m gpt-6.1-sol` — OpenAI's latest workhorse, first in the
-  `/model` list as of 2026-10-20 — unless the user names another model. Never omit `-m`:
-  an omitted `-m` takes `model =` from `~/.codex/config.toml`, which does not follow new
-  releases (it said `gpt-5.6-sol` until 2026-10-20) and differs between machines. Use
-  `-m gpt-6-astra` (frontier model) or `-m gpt-6-luna` (fast and cheap) only when the
-  user asks for them. If a run is rejected for the model, `codex update`: 0.162.1 runs
-  `gpt-6.1-sol`; older builds were not tried.
-- **Effort**: always pass `-c model_reasoning_effort="xhigh"` unless the user names
-  another effort; don't ask. Never omit it: the model's own default is `low`, and
-  `model_reasoning_effort` in `~/.codex/config.toml` (`medium` until 2026-10-20) overrides
-  that. On the Sol, Terra and Astra lines the ladder is `ultra`, `max`, `xhigh`, `high`,
-  `medium`, `low`; the Luna line stops at `max`.
+- Pass `-m gpt-6.2-sol` and `-c 'model_reasoning_effort="xhigh"'` on every run,
+  including resumes, forks, and reviews. These flags override `~/.codex/config.toml`.
+  When the user specifies a model or effort, use that value for the corresponding flag.
+  For reviews, also set `review_model` to the selected model.
 - **Check the banner**: stderr opens with `model:`, `sandbox:` and `reasoning effort:`
   lines. When a run fails or an answer looks off, rerun with `2>&1` and report those
   three lines as they were.
@@ -66,87 +56,68 @@ Full protocol and the incident behind it: `references/reporting-findings.md`.
 ```bash
 # Read-only review or analysis (safe default)
 codex exec --skip-git-repo-check --sandbox read-only \
-  -m gpt-6.1-sol -c model_reasoning_effort="xhigh" -o /tmp/codex-out.md \
+  -m gpt-6.2-sol -c 'model_reasoning_effort="xhigh"' -o /tmp/codex-out.md \
   "your prompt" </dev/null 2>/dev/null
 
 # Apply local edits
 codex exec --skip-git-repo-check --sandbox workspace-write \
-  -m gpt-6.1-sol -c model_reasoning_effort="xhigh" \
+  -m gpt-6.2-sol -c 'model_reasoning_effort="xhigh"' -o /tmp/codex-out.md \
   "your prompt" </dev/null 2>/dev/null
 
 # Another directory + a cheaper model, when the user asks for one
-codex exec --skip-git-repo-check -C /path/to/repo -m gpt-6-luna \
-  -c model_reasoning_effort="xhigh" \
+codex exec --skip-git-repo-check --sandbox read-only -C /path/to/repo -m gpt-6-luna \
+  -c 'model_reasoning_effort="xhigh"' -o /tmp/codex-out.md \
   "your prompt" </dev/null 2>/dev/null
 ```
 
 ## Continuing a session
 
 ```bash
-codex exec resume --skip-git-repo-check <SESSION_ID> \
-  -m gpt-6.1-sol -c model_reasoning_effort="xhigh" -c sandbox_mode="read-only" \
+codex exec resume --skip-git-repo-check \
+  -m gpt-6.2-sol -c 'model_reasoning_effort="xhigh"' -c 'sandbox_mode="read-only"' \
+  -o /tmp/codex-resume.md "$session_id" \
   "follow-up prompt" </dev/null 2>/dev/null
 codex exec resume --skip-git-repo-check --last \
-  -m gpt-6.1-sol -c model_reasoning_effort="xhigh" -c sandbox_mode="read-only" \
+  -m gpt-6.2-sol -c 'model_reasoning_effort="xhigh"' -c 'sandbox_mode="read-only"' \
+  -o /tmp/codex-resume.md \
   "follow-up prompt" </dev/null 2>/dev/null
-codex exec fork --skip-git-repo-check --last \
-  -m gpt-6.1-sol -c model_reasoning_effort="xhigh" -s read-only \
+codex exec fork --skip-git-repo-check \
+  -m gpt-6.2-sol -c 'model_reasoning_effort="xhigh"' -c 'sandbox_mode="read-only"' \
+  -o /tmp/codex-fork.md "$session_id" \
   "branch the session here" </dev/null 2>/dev/null
 ```
 
-**A resume does not inherit the first run's model or effort.** On 0.162.1 a session
-started on `gpt-6.1-sol` at `xhigh` resumed without flags as `gpt-5.6-sol` at `medium`,
-the config values at the time. Repeat `-m` and `-c model_reasoning_effort` on every
-resume, and pass the sandbox the first run had: `resume` has no `-s`, so use
-`-c sandbox_mode="..."`. Without `--skip-git-repo-check`, a resume outside a trusted
-directory exits 1 with "Not inside a trusted directory". Sessions are filtered by cwd;
-`--all` disables that. `--last` cannot find a run made with `--ephemeral`.
+Set `session_id` to the ID from a saved run's banner. `resume --last` selects the
+latest saved session in the current directory. Add `--all` to search across directories.
+For resumes and forks, pass the original sandbox via `sandbox_mode`.
 
 After a run finishes, tell the user they can resume it at any time.
 
 ## Reviewing a repository
 
-`codex review` has no `-m`, so the model goes in as `-c model="..."`:
+Use `codex exec review` to pin the model and save the final output. Choose
+`--uncommitted`, `--base <branch>`, `--commit <sha>`, or a custom prompt that names the
+review scope.
 
 ```bash
 # staged + unstaged + untracked
-codex review --uncommitted -c model="gpt-6.1-sol" -c model_reasoning_effort="xhigh" 2>/dev/null
+codex exec review --skip-git-repo-check --uncommitted \
+  -m gpt-6.2-sol -c 'review_model="gpt-6.2-sol"' -c 'model_reasoning_effort="xhigh"' \
+  -c 'sandbox_mode="read-only"' -o /tmp/codex-review.md </dev/null 2>/dev/null
+
 # against a base branch, with custom instructions
-codex review --base main -c model="gpt-6.1-sol" -c model_reasoning_effort="xhigh" \
-  "focus on security" 2>/dev/null
-# one commit
-codex review --commit <SHA> -c model="gpt-6.1-sol" -c model_reasoning_effort="xhigh" 2>/dev/null
+codex exec review --skip-git-repo-check \
+  -m gpt-6.2-sol -c 'review_model="gpt-6.2-sol"' -c 'model_reasoning_effort="xhigh"' \
+  -c 'sandbox_mode="read-only"' -o /tmp/codex-review.md \
+  "Review the diff against main and focus on security." </dev/null 2>/dev/null
 ```
 
 The same reporting rule applies: the review's findings reach the user before any fix does.
 
-## Models
+## Model availability
 
-Snapshot from `~/.codex/models_cache.json` (fetched 2026-10-20 by 0.162.0) — that file
-and `/model` in an interactive session are authoritative. The cache only refreshes on a
-real run, not from `codex doctor`, so a model can be missing simply because nothing has
-run since the upgrade. Prices drift; do not hardcode them.
-
-| Model              | Notes                                                                | Efforts     |
-| ------------------ | -------------------------------------------------------------------- | ----------- |
-| `gpt-6.1-sol`      | **Skill default** (pinned with `-m`); latest workhorse, 500k context | low → ultra |
-| `gpt-6-astra`      | Frontier model for the most demanding work, 272k context             | low → ultra |
-| `gpt-6-sol`        | Previous workhorse                                                   | low → ultra |
-| `gpt-6-luna`       | Fast and affordable, for easier tasks                                | low → max   |
-| `gpt-5.6-sol`      | Older workhorse; the `model =` in `~/.codex/config.toml` until 10-20 | low → ultra |
-| `gpt-5.6-terra`    | Older balanced model                                                 | low → ultra |
-| `gpt-5.6-luna`     | Older fast model                                                     | low → max   |
-| `gpt-oss-120b/20b` | Local, via `--oss` + `--local-provider`                              | low → high  |
-
-Every listed model has an 872k max context. `gpt-6.1-sol` and `gpt-6-astra` ship `low`
-as their own default effort, which the skill's `-c model_reasoning_effort="xhigh"`
-overrides. `gpt-5.5` and `gpt-5.4-mini` are gone from the list, like plain `gpt-5.4` and
-the `gpt-5.x-codex` line — don't reach for them.
-
-**Effort guide**: `ultra` hardest problems, auto-delegates subtasks (Sol, Terra, Astra) ·
-`max` maximum depth, no delegation · `xhigh` deep analysis (the skill default) · `high`
-refactoring, architecture, security · `medium` everyday work · `low` quick fixes and docs.
-Go below `xhigh` only when the user asks for a faster or cheaper run.
+Use `/model` in an interactive session or inspect `~/.codex/models_cache.json` to check
+whether a user-requested model is available and what reasoning efforts it supports.
 
 ## Production changes
 

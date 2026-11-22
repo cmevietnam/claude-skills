@@ -1,10 +1,7 @@
 # Codex CLI reference
 
-Flag inventory verified against **codex-cli 0.153.4** on 2026-09-05 by reading
-`codex --help`, `codex exec --help`, `codex exec resume --help`, `codex exec review --help`,
-`codex features list`, and `~/.codex/models_cache.json`. The model, effort, resume and
-`codex review` notes were re-checked with real runs on **0.162.1** on 2026-10-20.
-Re-verify after every upgrade — flags move between releases.
+The default `gpt-6.2-sol` at `xhigh` was tested on **codex-cli 0.171.0** on 2026-11-22.
+Use `--help` on the exact subcommand to check its flags after an upgrade.
 
 ## Subcommands worth knowing
 
@@ -26,7 +23,7 @@ Re-verify after every upgrade — flags move between releases.
 
 | Flag                               | Purpose                                                                  |
 | ---------------------------------- | ------------------------------------------------------------------------ |
-| `-m, --model <MODEL>`              | Override the config default; the skill always passes `gpt-6.1-sol`       |
+| `-m, --model <MODEL>`              | Override the configured model. The skill defaults to `gpt-6.2-sol`       |
 | `-c, --config <key=value>`         | TOML override; dotted paths for nested values                            |
 | `-s, --sandbox <MODE>`             | `read-only`, `workspace-write`, `danger-full-access`                     |
 | `-C, --cd <DIR>`                   | Working root for the agent                                               |
@@ -56,25 +53,27 @@ sandboxed environment, and treat `--dangerously-bypass-hook-trust` the same way.
 
 ## `codex review` flags
 
-`--uncommitted`, `--base <BRANCH>`, `--commit <SHA>`, `--title <TITLE>`, plus a positional
-prompt for custom review instructions (`-` reads it from stdin).
+Choose a single review target (`--uncommitted`, `--base <BRANCH>`, `--commit <SHA>`,
+or a positional custom prompt). Include the scope in the custom prompt if you also
+need to give specific instructions. Use `-` to read the prompt from stdin.
 
-`codex review` has no `-m` or `-s`; pass the model as `-c model="gpt-6.1-sol"` next to
-`-c model_reasoning_effort="xhigh"`. On 0.162.1 the banner then reads
-`model: gpt-6.1-sol`, `sandbox: read-only`, `reasoning effort: xhigh`.
-`codex exec review` does take `-m` and `-s`.
+`codex exec review` accepts `-m` and `-o`. Pin the skill defaults with `-m gpt-6.2-sol`,
+`-c 'review_model="gpt-6.2-sol"'`, and `-c 'model_reasoning_effort="xhigh"'`. Set the
+sandbox with `-c 'sandbox_mode="read-only"'`. The review thread reads `review_model`
+before falling back to the parent model. [Codex CLI source](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/core/src/session/review.rs)
+
+For standalone `codex review`, use `-c 'model="gpt-6.2-sol"'` in place of `-m`.
+Use `codex exec review` when you need `-o` to capture the final message.
 
 ## `codex exec resume` and `fork`
 
-`resume` takes `-m`, `-c`, `--skip-git-repo-check`, `--last`, `--all`, `--ephemeral`,
-but no `-s`: set the sandbox with `-c sandbox_mode="..."`. `fork` also takes `-s`.
+Both subcommands take `-m`, `-c`, `-o`, and `--skip-git-repo-check`. Pass
+`-c 'sandbox_mode="..."'` to set the sandbox. `resume` accepts `--last` and `--all`.
+`fork` requires the saved session ID.
 
-A resume does **not** keep the first run's model or effort. On 0.162.1 a session started
-with `-m gpt-6.1-sol -c model_reasoning_effort="xhigh"` resumed without flags as
-`model: gpt-5.6-sol`, `reasoning effort: medium` (the config values at the time); with
-both repeated it stayed on `gpt-6.1-sol` at `xhigh`. On 0.160.0 a session started
-`--sandbox read-only` resumed as `workspace-write`. Repeat all three on every resume and
-read the banner.
+Pass the model, reasoning effort, and sandbox explicitly on every resume. Earlier
+CLI versions applied current config defaults to resumed sessions when flags were
+omitted. Check the banner for the settings used.
 
 Without `--skip-git-repo-check`, a resume outside a trusted directory exits 1 with
 `Not inside a trusted directory and --skip-git-repo-check was not specified.`
@@ -98,10 +97,8 @@ Without `--skip-git-repo-check`, a resume outside a trusted directory exits 1 wi
   signing certificate was revoked (seen on cask 0.107.0). Fix:
   `brew upgrade --cask codex`, then
   `xattr -d com.apple.quarantine "$(readlink -f /opt/homebrew/bin/codex)"`.
-- **400 "requires a newer version of Codex"** → the build is too old for the model.
-  5.6-class models are rejected below 0.144; `gpt-6-astra` was absent from 0.149.1 and
-  present in 0.153.4; `gpt-6.1-sol` runs on 0.162.1 (older builds not tried). Fix with
-  `codex update` (or `brew upgrade --cask codex`).
+- **400 "requires a newer version of Codex"** → update with `codex update` or
+  `brew upgrade --cask codex`.
 - **A model the release notes announced is missing from the list** → the cache is stale.
   It refreshes on a real `codex exec` run, not from `codex doctor`, so run something
   trivial first and re-read the file.
@@ -126,11 +123,6 @@ for m in d['models']:
 "
 ```
 
-Note that a model's own `default_reasoning_level` (`gpt-6.1-sol` and Astra ship `low`)
-is overridden by `model_reasoning_effort` in `~/.codex/config.toml`, and both are
-overridden by `-c model_reasoning_effort=...` on the command line. The same file's
-`model =` line decides which model an omitted `-m` selects — it was `gpt-5.6-sol`
-(effort `medium`) until 2026-10-20, when it was set to `gpt-6.1-sol` / `xhigh` by hand; it
-does not follow new releases on its own, and other machines have their own. That is why
-the skill pins `-m gpt-6.1-sol -c model_reasoning_effort="xhigh"` on every call
-instead of relying on the config.
+The CLI flags override the corresponding defaults in `~/.codex/config.toml`.
+The skill passes `-m gpt-6.2-sol -c 'model_reasoning_effort="xhigh"'` each time,
+with `review_model` set explicitly for reviews.
