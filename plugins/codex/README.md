@@ -30,11 +30,10 @@ is the intended shape — each reviewer's blind spot tends to be another's headl
 ## Requires
 
 Codex CLI on `PATH` (`brew install --cask codex`), authenticated via `codex login`.
-Every run uses **`gpt-6.1-sol` at effort `xhigh`** unless the user names another model or
-effort. The skill passes both on every call (`-m`, `-c model_reasoning_effort=...`), resumes
-included, so `model =` in `~/.codex/config.toml` no longer decides the model. Verified on
-**0.162.1** (2026-10-20); the skill says which flags were checked and when. Older builds
-were not tried with `gpt-6.1-sol`; `codex update` if a run is rejected for the model.
+The skill defaults to **`gpt-6.2-sol` at effort `xhigh`**. It passes both settings
+explicitly for new runs, resumes, forks, and reviews. Reviews also set `review_model`
+to the selected model. An explicit user choice overrides the corresponding default.
+The default was tested on Codex CLI **0.171.0** (2026-11-22).
 
 ```bash
 codex --version
